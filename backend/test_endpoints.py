@@ -221,8 +221,6 @@ def main():
     print_info("✓ GET /api/v1/chat/{workspace_id} — Get workspace chat")
     print_info("✓ POST /api/v1/chat/{workspace_id}/message — Send chat message")
     print_info("✓ GET /api/v1/chat/workspace/{workspace_id} — Get workspace chat (v2)")
-    print_info("✓ GET /api/v1/chat/repo/{repo_id} — Get repo chat")
-    print_info("✓ POST /api/v1/chat/message — Send dual-context chat message")
     print_info("✓ POST /api/v1/commands/execute — Execute SSH command (requires auth)")
     print_info("✓ POST /api/v1/deployments/{workspace_id} — Create deployment")
     print_info("✓ GET /api/v1/deployments/{workspace_id} — Get deployment")

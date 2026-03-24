@@ -22,10 +22,10 @@ class AIService:
         return cleaned
 
     @staticmethod
-    def process_message(context: dict[str, Any], message: str, context_type: str = "workspace") -> str:
+    def process_message(workspace: dict[str, Any], message: str) -> str:
         # CRITICAL: Always use path, NEVER use name or domain
-        context_path = AIService._validate_workspace_path(str(context.get("path", "")))
-        context_name = context.get("name", context_type)
+        workspace_path = AIService._validate_workspace_path(str(workspace.get("path", "")))
+        workspace_name = workspace.get("name", "workspace")
 
         cleaned_message = message.strip()
         if not cleaned_message:
@@ -38,15 +38,15 @@ class AIService:
             if pattern.search(cleaned_message):
                 return (
                     "I cannot run that request. Restricted actions include cloning repositories "
-                    "and changing directories outside the context."
+                    "and changing directories outside the workspace."
                 )
 
         # CRITICAL: Scoped execution with ABSOLUTE PATH only
-        safe_prefix = f"cd {shlex.quote(context_path)} &&"
+        safe_prefix = f"cd {shlex.quote(workspace_path)} &&"
 
         return (
-            f"Simulated assistant response for {context_type} '{context_name}'. "
-            f"Your message was received in the {context_type} context and is ready for next-step tooling. "
+            f"Simulated assistant response for workspace '{workspace_name}'. "
+            f"Your message was received and is ready for next-step tooling. "
             f"Scoped execution: {safe_prefix} <command>. "
             f"Input: {cleaned_message}"
         )

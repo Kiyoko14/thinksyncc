@@ -5,8 +5,6 @@ from postgrest.exceptions import APIError
 
 from core.config import get_settings
 from routers import auth, chat, commands, deployments, health, servers, workspaces
-# NOTE: GitHub integration temporarily disabled — focus on core product (AI → workspace → deploy)
-# from routers import git
 
 settings = get_settings()
 
@@ -36,7 +34,6 @@ app.include_router(commands.router, prefix="/api/v1")
 app.include_router(workspaces.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(deployments.router, prefix="/api/v1")
-# Git router disabled: focusing on core product first
 
 
 def _api_error_code(exc: APIError) -> str:

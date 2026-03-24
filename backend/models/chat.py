@@ -14,12 +14,6 @@ class ChatMessageRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=20000)
 
 
-class ChatMessageDualRequest(BaseModel):
-    workspace_id: str | None = Field(default=None)
-    git_repo_id: str | None = Field(default=None)
-    message: str = Field(..., min_length=1, max_length=20000)
-
-
 class StoredMessageResponse(BaseModel):
     id: str
     chat_id: str
@@ -43,11 +37,4 @@ class ChatResponse(BaseModel):
 class ChatSendMessageResponse(BaseModel):
     chat_id: str
     workspace_id: str
-    response: str
-
-
-class ChatSendMessageDualResponse(BaseModel):
-    chat_id: str
-    workspace_id: str | None = None
-    git_repo_id: str | None = None
     response: str
