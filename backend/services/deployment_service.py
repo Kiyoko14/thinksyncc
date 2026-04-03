@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import shlex
 from typing import Any
 from uuid import UUID
 
@@ -6,6 +7,8 @@ from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
 from core.database import get_supabase
+from services.server_service import ServerService
+from services.ssh_service import SSHService
 
 
 class DeploymentService:
@@ -63,7 +66,7 @@ class DeploymentService:
         return DeploymentService._MIN_PORT
 
     @staticmethod
-    def create_deployment(workspace_id: str, user_id: str) -> dict[str, Any]:
+    async def create_deployment(workspace_id: str, user_id: str) -> dict[str, Any]:
         """Create a deployment for a workspace."""
         DeploymentService._validate_uuid(workspace_id, "workspace_id")
         DeploymentService._validate_uuid(user_id, "user_id")
@@ -71,6 +74,7 @@ class DeploymentService:
         from services.workspace_service import WorkspaceService
 
         workspace = WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
+        server = ServerService.get_server(server_id=workspace["server_id"], user_id=user_id)
 
         port = DeploymentService.get_next_available_port()
 
@@ -105,6 +109,35 @@ class DeploymentService:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create deployment",
+            )
+
+        process_name = f"app-{workspace_id}"
+        workspace_path = str(workspace.get("path", ""))
+        if not workspace_path:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Workspace path is missing",
+            )
+
+        quoted_path = shlex.quote(workspace_path)
+        start_command = (
+            f'pm2 start "cd {quoted_path} && python3 -m http.server {port}" '
+            f"--name {process_name}"
+        )
+        start_result = await SSHService.execute(server=server, command=start_command)
+        if start_result.exit_code != 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to start deployment process",
+            )
+
+        verify_command = f"curl -fsS http://localhost:{port}"
+        verify_result = await SSHService.execute(server=server, command=verify_command)
+        if verify_result.exit_code != 0:
+            await SSHService.execute(server=server, command=f"pm2 delete {process_name}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Deployment started but app health check failed",
             )
 
         return {
@@ -148,7 +181,7 @@ class DeploymentService:
         }
 
     @staticmethod
-    def deactivate_deployment(workspace_id: str, user_id: str) -> None:
+    async def deactivate_deployment(workspace_id: str, user_id: str) -> None:
         """Deactivate workspace deployment."""
         DeploymentService._validate_uuid(workspace_id, "workspace_id")
         DeploymentService._validate_uuid(user_id, "user_id")
@@ -156,6 +189,15 @@ class DeploymentService:
         from services.workspace_service import WorkspaceService
 
         workspace = WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
+        server = ServerService.get_server(server_id=workspace["server_id"], user_id=user_id)
+
+        process_name = f"app-{workspace_id}"
+        stop_result = await SSHService.execute(server=server, command=f"pm2 delete {process_name}")
+        if stop_result.exit_code != 0 and "process or namespace" not in stop_result.output.lower():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to stop deployment process",
+            )
 
         supabase = get_supabase()
         try:

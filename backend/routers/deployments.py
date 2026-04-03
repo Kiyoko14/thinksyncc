@@ -14,7 +14,7 @@ async def create_workspace_deployment(
     workspace_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> DeploymentResponse:
-    return DeploymentService.create_deployment(
+    return await DeploymentService.create_deployment(
         workspace_id=workspace_id,
         user_id=current_user["sub"],
     )
@@ -30,7 +30,7 @@ async def get_workspace_deployment(
         user_id=current_user["sub"],
     )
     if not deployment:
-        deployment = DeploymentService.create_deployment(
+        deployment = await DeploymentService.create_deployment(
             workspace_id=workspace_id,
             user_id=current_user["sub"],
         )
@@ -42,7 +42,7 @@ async def deactivate_workspace_deployment(
     workspace_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, str]:
-    DeploymentService.deactivate_deployment(
+    await DeploymentService.deactivate_deployment(
         workspace_id=workspace_id,
         user_id=current_user["sub"],
     )
