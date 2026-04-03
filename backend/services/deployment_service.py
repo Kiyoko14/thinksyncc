@@ -18,6 +18,10 @@ class DeploymentService:
     _MAX_PORT = 65535
 
     @staticmethod
+    def _process_name(workspace_id: str) -> str:
+        return f"ws-{workspace_id}"
+
+    @staticmethod
     def _api_error_code(exc: APIError) -> str:
         code = getattr(exc, "code", None)
         if isinstance(code, str) and code:
@@ -42,28 +46,102 @@ class DeploymentService:
             )
 
     @staticmethod
+    def _safe_workspace_path(path: str) -> str:
+        cleaned = path.strip()
+        if not cleaned:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Workspace path is missing",
+            )
+        if ".." in cleaned or "\n" in cleaned or "\r" in cleaned or not cleaned.startswith("/"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid workspace path",
+            )
+        return cleaned
+
+    @staticmethod
+    def _deployment_command(workspace_path: str, port: int) -> str:
+        quoted_path = shlex.quote(workspace_path)
+        return f"cd {quoted_path} && python3 -m http.server {port}"
+
+    @staticmethod
+    def _structured_command_error(step: str, output: str, exit_code: int) -> HTTPException:
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "message": "Remote command failed",
+                "step": step,
+                "exit_code": exit_code,
+                "output": (output or "")[:2000],
+            },
+        )
+
+    @staticmethod
+    async def _execute_remote(server: dict[str, Any], command: str, step: str) -> Any:
+        try:
+            return await SSHService.execute(server=server, command=command)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "message": "SSH command execution failed",
+                    "step": step,
+                    "error": str(exc.detail),
+                },
+            )
+
+    @staticmethod
+    def _get_existing_deployment(supabase, workspace_id: str) -> dict[str, Any] | None:
+        try:
+            existing = (
+                supabase.table("workspace_deployments")
+                .select("*")
+                .eq("workspace_id", workspace_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+        except APIError:
+            return None
+
+        if not existing or not existing.data:
+            return None
+        return existing.data[0]
+
+    @staticmethod
     def get_next_available_port() -> int:
         """Allocate next available port from pool."""
         supabase = get_supabase()
         try:
-            # Find max port currently used
             result = (
                 supabase.table("workspace_deployments")
                 .select("port")
-                .is_("is_active", "true")
-                .order("port", desc=True)
-                .limit(1)
+                .eq("is_active", True)
                 .execute()
             )
-            if result.data:
-                last_port = result.data[0]["port"]
-                next_port = last_port + 1
-                if next_port <= DeploymentService._MAX_PORT:
-                    return next_port
-        except APIError:
-            pass
 
-        return DeploymentService._MIN_PORT
+            used_ports = {
+                row.get("port")
+                for row in (result.data or [])
+                if isinstance(row.get("port"), int)
+            }
+            for port in range(DeploymentService._MIN_PORT, DeploymentService._MAX_PORT + 1):
+                if port not in used_ports:
+                    return port
+        except APIError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "message": "Failed to allocate deployment port",
+                    "error": str(exc),
+                },
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No ports available for deployment",
+        )
 
     @staticmethod
     async def create_deployment(workspace_id: str, user_id: str) -> dict[str, Any]:
@@ -75,19 +153,74 @@ class DeploymentService:
 
         workspace = WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
         server = ServerService.get_server(server_id=workspace["server_id"], user_id=user_id)
-
-        port = DeploymentService.get_next_available_port()
+        workspace_path = DeploymentService._safe_workspace_path(str(workspace.get("path", "")))
+        process_name = DeploymentService._process_name(workspace_id)
 
         supabase = get_supabase()
-        payload = {
-            "workspace_id": workspace_id,
-            "port": port,
-            "is_active": True,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        existing = DeploymentService._get_existing_deployment(supabase=supabase, workspace_id=workspace_id)
+
+        if existing and isinstance(existing.get("port"), int):
+            port = existing["port"]
+        else:
+            port = DeploymentService.get_next_available_port()
+
+        run_command = DeploymentService._deployment_command(workspace_path=workspace_path, port=port)
+
+        # If the PM2 process already exists, restart it; otherwise create it.
+        pm2_command = (
+            f'pm2 describe {shlex.quote(process_name)} >/dev/null 2>&1 && '
+            f'pm2 restart {shlex.quote(process_name)} --update-env || '
+            f'pm2 start "{run_command}" --name {shlex.quote(process_name)}'
+        )
+        pm2_result = await DeploymentService._execute_remote(
+            server=server,
+            command=pm2_command,
+            step="pm2_start_or_restart",
+        )
+        if pm2_result.exit_code != 0:
+            raise DeploymentService._structured_command_error(
+                step="pm2_start_or_restart",
+                output=pm2_result.output,
+                exit_code=pm2_result.exit_code,
+            )
+
+        verify_command = DeploymentService._deployment_command(
+            workspace_path=workspace_path,
+            port=port,
+        ).replace(f"python3 -m http.server {port}", f"curl -fsS http://127.0.0.1:{port}")
+        verify_result = await DeploymentService._execute_remote(
+            server=server,
+            command=verify_command,
+            step="verify_http_server",
+        )
+        if verify_result.exit_code != 0:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "message": "Deployment process started but HTTP server is not reachable",
+                    "step": "verify_http_server",
+                    "exit_code": verify_result.exit_code,
+                    "output": (verify_result.output or "")[:2000],
+                },
+            )
+
+        if existing:
+            payload = {
+                "port": port,
+                "is_active": True,
+            }
+            query = supabase.table("workspace_deployments").update(payload).eq("id", existing["id"])
+        else:
+            payload = {
+                "workspace_id": workspace_id,
+                "port": port,
+                "is_active": True,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            query = supabase.table("workspace_deployments").insert(payload)
 
         try:
-            result = supabase.table("workspace_deployments").insert(payload).execute()
+            result = query.execute()
         except APIError as exc:
             code = DeploymentService._api_error_code(exc)
             if code in {"23503", "42501"}:
@@ -105,39 +238,10 @@ class DeploymentService:
                 detail="Failed to create deployment",
             )
 
-        if not result or not result.data:
+        if not result:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create deployment",
-            )
-
-        process_name = f"app-{workspace_id}"
-        workspace_path = str(workspace.get("path", ""))
-        if not workspace_path:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Workspace path is missing",
-            )
-
-        quoted_path = shlex.quote(workspace_path)
-        start_command = (
-            f'pm2 start "cd {quoted_path} && python3 -m http.server {port}" '
-            f"--name {process_name}"
-        )
-        start_result = await SSHService.execute(server=server, command=start_command)
-        if start_result.exit_code != 0:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to start deployment process",
-            )
-
-        verify_command = f"curl -fsS http://localhost:{port}"
-        verify_result = await SSHService.execute(server=server, command=verify_command)
-        if verify_result.exit_code != 0:
-            await SSHService.execute(server=server, command=f"pm2 delete {process_name}")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Deployment started but app health check failed",
+                detail="Failed to persist deployment state",
             )
 
         return {
@@ -191,12 +295,17 @@ class DeploymentService:
         workspace = WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
         server = ServerService.get_server(server_id=workspace["server_id"], user_id=user_id)
 
-        process_name = f"app-{workspace_id}"
-        stop_result = await SSHService.execute(server=server, command=f"pm2 delete {process_name}")
+        process_name = DeploymentService._process_name(workspace_id)
+        stop_result = await DeploymentService._execute_remote(
+            server=server,
+            command=f"pm2 delete {shlex.quote(process_name)}",
+            step="pm2_delete",
+        )
         if stop_result.exit_code != 0 and "process or namespace" not in stop_result.output.lower():
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to stop deployment process",
+            raise DeploymentService._structured_command_error(
+                step="pm2_delete",
+                output=stop_result.output,
+                exit_code=stop_result.exit_code,
             )
 
         supabase = get_supabase()
