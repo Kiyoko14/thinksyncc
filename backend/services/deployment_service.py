@@ -66,6 +66,40 @@ class DeploymentService:
         return f"cd {quoted_path} && python3 -m http.server {port}"
 
     @staticmethod
+    async def _ensure_pm2_installed(server: dict[str, Any]) -> None:
+        # Install PM2 only when missing; keep this idempotent and distro-aware.
+        ensure_command = (
+            "command -v pm2 >/dev/null 2>&1 || "
+            "("
+            "if command -v npm >/dev/null 2>&1; then "
+            "npm install -g pm2; "
+            "elif command -v apt-get >/dev/null 2>&1; then "
+            "export DEBIAN_FRONTEND=noninteractive; "
+            "apt-get update -y && apt-get install -y nodejs npm && npm install -g pm2; "
+            "elif command -v dnf >/dev/null 2>&1; then "
+            "dnf install -y nodejs npm && npm install -g pm2; "
+            "elif command -v yum >/dev/null 2>&1; then "
+            "yum install -y nodejs npm && npm install -g pm2; "
+            "else "
+            "echo 'No supported package manager found to install pm2' >&2; "
+            "exit 127; "
+            "fi"
+            ") && command -v pm2 >/dev/null 2>&1"
+        )
+
+        result = await DeploymentService._execute_remote(
+            server=server,
+            command=ensure_command,
+            step="ensure_pm2_installed",
+        )
+        if result.exit_code != 0:
+            raise DeploymentService._structured_command_error(
+                step="ensure_pm2_installed",
+                output=result.output,
+                exit_code=result.exit_code,
+            )
+
+    @staticmethod
     def _structured_command_error(step: str, output: str, exit_code: int) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -155,6 +189,8 @@ class DeploymentService:
         server = ServerService.get_server(server_id=workspace["server_id"], user_id=user_id)
         workspace_path = DeploymentService._safe_workspace_path(str(workspace.get("path", "")))
         process_name = DeploymentService._process_name(workspace_id)
+
+        await DeploymentService._ensure_pm2_installed(server=server)
 
         supabase = get_supabase()
         existing = DeploymentService._get_existing_deployment(supabase=supabase, workspace_id=workspace_id)
