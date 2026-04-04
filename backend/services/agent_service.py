@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 _TABLE = "jobs"
 
+# Maximum events buffered per job queue before new events are dropped.
+_WS_QUEUE_MAXSIZE = 500
+
 # Per-job WebSocket event queues.  Keyed by job UUID.
 _queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 
@@ -305,7 +308,7 @@ class AgentService:
                 detail="Failed to create job",
             )
 
-        _queues[job_id] = asyncio.Queue(maxsize=500)
+        _queues[job_id] = asyncio.Queue(maxsize=_WS_QUEUE_MAXSIZE)
         return JobAccepted(id=job_id)
 
     @staticmethod
