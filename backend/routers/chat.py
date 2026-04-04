@@ -43,7 +43,7 @@ async def send_workspace_message(
         chat = ChatService.create_chat(workspace_id=workspace_id, user_id=current_user["sub"])
 
     ChatService.save_message(chat_id=chat["id"], role="user", content=payload.message)
-    ai_response = AIService.process_message(workspace=workspace, message=payload.message)
+    ai_response = await AIService.process_message(workspace=workspace, message=payload.message)
     ChatService.save_message(chat_id=chat["id"], role="assistant", content=ai_response)
 
     return ChatSendMessageResponse(

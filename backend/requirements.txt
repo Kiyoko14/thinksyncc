@@ -20,3 +20,6 @@ cryptography>=42.0.0
 
 # Form / multipart support (required by FastAPI for file uploads, future use)
 python-multipart>=0.0.9
+
+# LLM provider
+openai>=1.40.0

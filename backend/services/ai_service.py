@@ -3,6 +3,9 @@ import shlex
 from typing import Any
 
 from fastapi import HTTPException, status
+from openai import AsyncOpenAI
+
+from core.config import get_settings
 
 
 class AIService:
@@ -22,7 +25,7 @@ class AIService:
         return cleaned
 
     @staticmethod
-    def process_message(workspace: dict[str, Any], message: str) -> str:
+    async def process_message(workspace: dict[str, Any], message: str) -> str:
         # CRITICAL: Always use path, NEVER use name or domain
         workspace_path = AIService._validate_workspace_path(str(workspace.get("path", "")))
         workspace_name = workspace.get("name", "workspace")
@@ -44,9 +47,42 @@ class AIService:
         # CRITICAL: Scoped execution with ABSOLUTE PATH only
         safe_prefix = f"cd {shlex.quote(workspace_path)} &&"
 
-        return (
-            f"Simulated assistant response for workspace '{workspace_name}'. "
-            f"Your message was received and is ready for next-step tooling. "
-            f"Scoped execution: {safe_prefix} <command>. "
-            f"Input: {cleaned_message}"
+        settings = get_settings()
+        if not settings.OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OPENAI_API_KEY is not configured",
+            )
+
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+        system_prompt = (
+            "You are ThinkSync agent assistant for Linux server workspaces. "
+            "Give concise, practical guidance. "
+            "Never suggest destructive commands (rm -rf, mkfs, dd if=, reboot, shutdown). "
+            f"Current workspace name: {workspace_name}. "
+            f"All commands must be scoped with: {safe_prefix}"
         )
+
+        try:
+            response = await client.responses.create(
+                model=settings.OPENAI_MODEL,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": cleaned_message},
+                ],
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to generate AI response",
+            )
+
+        output_text = getattr(response, "output_text", "")
+        if not output_text:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Empty AI response",
+            )
+
+        return output_text.strip()

@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     AGENT_AUDIT_LOGGING_ENABLED: bool = True
     AGENT_AUDIT_TABLE: str = "agent_runs"
 
+    # OpenAI
+    OPENAI_API_KEY: str | None = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
