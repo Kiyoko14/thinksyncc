@@ -1,13 +1,5 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-
-export function getAuthHeaders(): Record<string, string> {
-  const token =
-    typeof window !== "undefined" ? localStorage.getItem("thinksync_token") : null;
-  return {
-    "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
-}
+// All requests go to relative paths — Next.js rewrites proxy them to the backend.
+// See next.config.js → rewrites() for the INTERNAL_API_URL mapping.
 
 function getAuthHeaders(): Record<string, string> {
   const token =
@@ -19,7 +11,7 @@ function getAuthHeaders(): Record<string, string> {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
+  const response = await fetch(path, {
     ...options,
     headers: {
       ...getAuthHeaders(),
@@ -59,6 +51,33 @@ export interface ServerCreatePayload {
   ssh_key?: string;
 }
 
+export interface Workspace {
+  id: string;
+  user_id: string;
+  server_id: string;
+  name: string;
+  path: string;
+  slug: string;
+  domain: string;
+  created_at: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  chat_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+}
+
+export interface ChatHistory {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  created_at: string;
+  messages: ChatMessage[];
+}
+
 export interface CommandResult {
   server_id: string;
   command: string;
@@ -80,7 +99,32 @@ export const addServer = (data: ServerCreatePayload) =>
 export const deleteServer = (id: string) =>
   request<void>(`/api/v1/servers/${id}`, { method: "DELETE" });
 
-// ── Commands ─────────────────────────────────────────────────────────────────
+// ── Workspaces ────────────────────────────────────────────────────────────────
+
+export const createWorkspace = (server_id: string, name: string) =>
+  request<Workspace>("/api/v1/workspaces/", {
+    method: "POST",
+    body: JSON.stringify({ server_id, name }),
+  });
+
+export const getWorkspacesByServer = (server_id: string) =>
+  request<Workspace[]>(`/api/v1/workspaces/?server_id=${server_id}`);
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+
+export const getChatHistory = (workspace_id: string) =>
+  request<ChatHistory>(`/api/v1/chat/${workspace_id}`);
+
+export const sendChatMessage = (workspace_id: string, message: string) =>
+  request<{ chat_id: string; workspace_id: string; response: string }>(
+    `/api/v1/chat/${workspace_id}/message`,
+    {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    }
+  );
+
+// ── Commands ──────────────────────────────────────────────────────────────────
 
 export const executeCommand = (server_id: string, command: string) =>
   request<CommandResult>("/api/v1/commands/execute", {

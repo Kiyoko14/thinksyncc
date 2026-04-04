@@ -20,6 +20,10 @@ services:
       dockerfile: Dockerfile
     env_file:
       - ../.env
+    environment:
+      # INTERNAL_API_URL is read at Next.js server startup (not baked at build time).
+      # It routes /api/v1/* rewrites to the backend container over the docker network.
+      - INTERNAL_API_URL=http://backend:8000
     expose:
       - "3000"
     restart: unless-stopped
