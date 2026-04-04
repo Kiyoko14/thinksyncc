@@ -1,5 +1,14 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+export function getAuthHeaders(): Record<string, string> {
+  const token =
+    typeof window !== "undefined" ? localStorage.getItem("thinksync_token") : null;
+  return {
+    "Content-Type": "application/json",
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
 function getAuthHeaders(): Record<string, string> {
   const token =
     typeof window !== "undefined" ? localStorage.getItem("thinksync_token") : null;
