@@ -469,7 +469,7 @@ OUTPUT FORMAT  (strict JSON — no markdown, no extra keys)
   "objective": "Report disk usage on storage server",
   "context_summary": "allow_write is false — no cleanup actions will be taken. Reporting usage and identifying large directories.",
   "steps": [
-    { "step": 1, "tool": "check_disk",  "args": {}, "rationale": "Get current disk utilisation across all mount points." },
+    { "step": 1, "tool": "check_disk",  "args": {}, "rationale": "Get current disk utilization across all mount points." },
     { "step": 2, "tool": "run_command", "args": { "command": "du -sh /var/log /tmp /home" }, "rationale": "Identify which directories consume the most space." }
   ]
 }

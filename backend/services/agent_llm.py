@@ -384,7 +384,7 @@ Expected output:
       "step": 1,
       "tool": "check_disk",
       "args": {},
-      "rationale": "Get current disk utilisation across all mount points."
+      "rationale": "Get current disk utilization across all mount points."
     },
     {
       "step": 2,
