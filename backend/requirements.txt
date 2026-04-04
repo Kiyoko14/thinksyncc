@@ -16,6 +16,7 @@ supabase>=2.4.0
 
 # Authentication
 PyJWT>=2.8.0
+cryptography>=42.0.0
 
 # Form / multipart support (required by FastAPI for file uploads, future use)
 python-multipart>=0.0.9

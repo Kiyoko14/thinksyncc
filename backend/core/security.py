@@ -8,7 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from core.config import get_settings
 
-_bearer = HTTPBearer()
+_bearer = HTTPBearer(auto_error=False)
 
 
 def create_access_token(subject: str, extra_data: dict[str, Any] | None = None) -> str:
@@ -40,8 +40,14 @@ def decode_token(token: str) -> dict[str, Any]:
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Security(_bearer),
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
 ) -> dict[str, Any]:
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+
     payload = decode_token(credentials.credentials)
     sub = payload.get("sub")
     if not isinstance(sub, str):

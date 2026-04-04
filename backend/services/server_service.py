@@ -5,8 +5,10 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
+from core.crypto import decrypt_secret, encrypt_secret
 from core.database import get_supabase
 from models.server import ServerCreate, ServerResponse
+from services.ssh_service import SSHService
 
 
 class ServerService:
@@ -71,11 +73,22 @@ class ServerService:
                 detail="Server not found",
             )
 
-        return result.data
+        server = dict(result.data)
+        server["ssh_key"] = decrypt_secret(server.get("ssh_key"))
+        server["ssh_password"] = decrypt_secret(server.get("ssh_password"))
+        return server
 
     @staticmethod
-    def create_server(user_id: str, data: ServerCreate) -> ServerResponse:
+    async def create_server(user_id: str, data: ServerCreate) -> ServerResponse:
         ServerService._validate_uuid(user_id, "user_id")
+        await SSHService.validate_server_connection(
+            host=data.host,
+            port=data.ssh_port,
+            username=data.ssh_user,
+            auth_method=data.ssh_auth_method.value,
+            ssh_password=data.ssh_password,
+            ssh_key=data.ssh_key,
+        )
         supabase = get_supabase()
         record = {
             "user_id": user_id,
@@ -84,8 +97,8 @@ class ServerService:
             "ssh_user": data.ssh_user,
             "ssh_port": data.ssh_port,
             "ssh_auth_method": data.ssh_auth_method.value,
-            "ssh_key": data.ssh_key,
-            "ssh_password": data.ssh_password,
+            "ssh_key": encrypt_secret(data.ssh_key),
+            "ssh_password": encrypt_secret(data.ssh_password),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -118,14 +131,33 @@ class ServerService:
 
     @staticmethod
     def delete_server(server_id: str, user_id: str) -> None:
+        ServerService._validate_uuid(server_id, "server_id")
+        ServerService._validate_uuid(user_id, "user_id")
         supabase = get_supabase()
-        result = (
-            supabase.table("servers")
-            .delete()
-            .eq("id", server_id)
-            .eq("user_id", user_id)
-            .execute()
-        )
+        try:
+            result = (
+                supabase.table("servers")
+                .delete()
+                .eq("id", server_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+        except APIError as exc:
+            code = ServerService._api_error_code(exc)
+            if code == "22P02":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid request data",
+                )
+            if code in {"42501", "23503"}:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not allowed to delete server",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete server",
+            )
         if not result.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

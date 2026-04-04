@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from postgrest.exceptions import APIError
 
 from core.config import get_settings
-from routers import auth, chat, commands, deployments, health, servers, workspaces
+from routers import agents, auth, chat, commands, deployments, health, servers, workspaces
 
 settings = get_settings()
 
@@ -34,6 +34,7 @@ app.include_router(commands.router, prefix="/api/v1")
 app.include_router(workspaces.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(deployments.router, prefix="/api/v1")
+app.include_router(agents.router, prefix="/api/v1")
 
 
 def _api_error_code(exc: APIError) -> str:

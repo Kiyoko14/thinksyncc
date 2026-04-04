@@ -63,7 +63,7 @@ class DeploymentService:
     @staticmethod
     def _deployment_command(workspace_path: str, port: int) -> str:
         quoted_path = shlex.quote(workspace_path)
-        return f"cd {quoted_path} && python3 -m http.server {port}"
+        return f"cd {quoted_path} && python3 -m http.server {port} --bind 127.0.0.1"
 
     @staticmethod
     async def _ensure_pm2_installed(server: dict[str, Any]) -> None:
@@ -337,7 +337,8 @@ class DeploymentService:
             command=f"pm2 delete {shlex.quote(process_name)}",
             step="pm2_delete",
         )
-        if stop_result.exit_code != 0 and "process or namespace" not in stop_result.output.lower():
+        stop_output = (stop_result.output or "").lower()
+        if stop_result.exit_code != 0 and "process or namespace" not in stop_output:
             raise DeploymentService._structured_command_error(
                 step="pm2_delete",
                 output=stop_result.output,

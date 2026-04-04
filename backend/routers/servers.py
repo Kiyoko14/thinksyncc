@@ -21,7 +21,7 @@ async def add_server(
     payload: ServerCreate,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> ServerResponse:
-    return ServerService.create_server(user_id=current_user["sub"], data=payload)
+    return await ServerService.create_server(user_id=current_user["sub"], data=payload)
 
 
 @router.delete("/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
