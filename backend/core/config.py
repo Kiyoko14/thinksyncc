@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     AGENT_AUDIT_LOGGING_ENABLED: bool = True
     AGENT_AUDIT_TABLE: str = "agent_runs"
 
+    # Agent (Forge v2)
+    AGENT_MAX_RETRIES: int = 3
+    AGENT_V2_WRITE_TOOLS: str = "restart_service,deploy_app"
+
+    # Redis (Upstash) — optional; used by Forge v2 for LLM response caching
+    REDIS_URL: str | None = None
+
     # OpenAI
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = "gpt-4o-mini"

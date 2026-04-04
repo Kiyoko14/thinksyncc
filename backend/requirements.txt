@@ -23,3 +23,6 @@ python-multipart>=0.0.9
 
 # LLM provider
 openai>=1.40.0
+
+# Redis client (optional — used by Forge v2 for LLM response caching)
+redis>=5.0.0
