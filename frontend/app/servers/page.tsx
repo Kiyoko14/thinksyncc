@@ -69,8 +69,14 @@ export default function ServersPage() {
     setFormError("");
     try {
       const server = await addServer(form);
-      // Automatically create a workspace for the new server
-      await createWorkspace(server.id, server.name);
+      // Automatically create a workspace for the new server.
+      // If workspace creation fails we still close the sheet — the user can
+      // open the workspace later by tapping the server card.
+      try {
+        await createWorkspace(server.id, server.name);
+      } catch {
+        // workspace creation failure is non-fatal; log only in dev
+      }
       setShowSheet(false);
       setForm(EMPTY_FORM);
       await loadServers();

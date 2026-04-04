@@ -28,7 +28,8 @@ class Settings(BaseSettings):
     DATA_ENCRYPTION_KEY: str | None = None
 
     # CORS — comma-separated list in .env, e.g. "http://localhost:3000,https://app.thinksync.art"
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "https://app.thinksync.art"]
+    # Production origins must be set explicitly via the CORS_ORIGINS env variable.
+    CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 
     # SSH
     SSH_TIMEOUT: int = 30
