@@ -50,7 +50,7 @@ async def forge_plan(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentPlanResponse:
     """Return an execution plan without connecting to any server (instant)."""
-    return EmergentE1Service.get_plan(payload=payload, current_user=current_user)
+    return await EmergentE1Service.get_plan(payload=payload, current_user=current_user)
 
 
 @router.post("/forge/run", response_model=AgentAsyncRunAccepted, status_code=202)

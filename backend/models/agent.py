@@ -25,6 +25,7 @@ class ToolName(str, Enum):
     RESTART_SERVICE = "restart_service"
     READ_LOGS = "read_logs"
     DEPLOY_APP = "deploy_app"
+    DEPLOY_NEXTJS_APP = "deploy_nextjs_app"
 
 
 class DecisionAction(str, Enum):
@@ -157,6 +158,15 @@ class AgentDecision(BaseModel):
     reason: str
     modified_step: AgentStep | None = None
     summary_so_far: str = ""
+
+
+class ToolCallingLoopResult(BaseModel):
+    """Result of the OpenAI tool-calling agent loop."""
+
+    steps: list[StepResult] = []
+    summary: str = ""
+    success: bool = True
+    steps_taken: int = 0
 
 
 class ForgeV2RunRequest(BaseModel):

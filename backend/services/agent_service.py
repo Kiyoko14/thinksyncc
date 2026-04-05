@@ -1,11 +1,11 @@
-"""ThinkSync v2 agent orchestrator.
+"""ThinkSync v2 Agent Service.
 
-Coordinates the full agent loop:
-  generate_plan → execute_tool → evaluate_step → persist → broadcast
-
-Job state is persisted to the Supabase ``jobs`` table after every step
-(steps column is JSONB, updated in place so one row = full audit trail).
-WebSocket events are broadcast via per-job asyncio.Queue.
+Orchestrates the real agent loop using OpenAI tool-calling:
+  1. User submits a job (objective + server_id)
+  2. agent_llm.run_tool_calling_loop() drives an LLM → tool → SSH → LLM cycle
+  3. Every tool result is a real SSH operation — nothing is simulated
+  4. Job state is persisted to Supabase after every step
+  5. WebSocket events are broadcast via per-job asyncio.Queue
 """
 
 from __future__ import annotations
@@ -21,10 +21,9 @@ from postgrest.exceptions import APIError
 
 from core.config import get_settings
 from core.database import get_supabase
-from models.agent import AgentDecision, DecisionAction, AgentStep
 from models.job import JobAccepted, JobCreate, JobResponse, JobStatus
-from services import llm_service
-from services.forge_v2 import _execute_tool  # reuse validated tool dispatch
+from models.agent import StepResult
+from services import agent_llm
 from services.server_service import ServerService
 
 logger = logging.getLogger(__name__)
@@ -72,6 +71,21 @@ def _db_update(job_id: str, patch: dict[str, Any]) -> None:
         logger.warning("jobs UPDATE failed (job=%s): %s", job_id, exc)
 
 
+def _step_to_record(result: StepResult) -> dict[str, Any]:
+    """Convert a StepResult to a serialisable dict stored in jobs.steps JSONB."""
+    return {
+        "step": result.step,
+        "tool": result.tool.value,
+        "args": result.args,
+        "stdout": result.stdout[:4000],
+        "stderr": result.stderr[:2000],
+        "exit_code": result.exit_code,
+        "duration_ms": result.duration_ms,
+        "success": result.success,
+        "executed_at": result.executed_at.isoformat(),
+    }
+
+
 def _row_to_response(row: dict[str, Any]) -> JobResponse:
     return JobResponse(
         id=row["id"],
@@ -87,7 +101,7 @@ def _row_to_response(row: dict[str, Any]) -> JobResponse:
 
 
 # ---------------------------------------------------------------------------
-# Core agent loop
+# Core agent loop  (real execution — no simulation)
 # ---------------------------------------------------------------------------
 
 
@@ -97,14 +111,24 @@ async def _run_agent_loop(
     payload: JobCreate,
     user_id: str,
 ) -> None:
+    """
+    Execute the tool-calling agent loop for a queued job.
+
+    Flow:
+      1. Fetch the server record (SSH credentials) from Supabase
+      2. Delegate to agent_llm.run_tool_calling_loop()
+         — LLM issues tool calls → real SSH execution → LLM sees results → repeat
+      3. After each tool call: persist step to Supabase + publish WebSocket event
+      4. On completion: write final status + summary to Supabase
+    """
     settings = get_settings()
-    max_retries = settings.AGENT_MAX_RETRIES
     step_timeout = payload.step_timeout_seconds or settings.AGENT_STEP_TIMEOUT
 
-    # ── Fetch server ────────────────────────────────────────────────────────
+    # --- Transition to RUNNING ---
     _db_update(job_id, {"status": JobStatus.RUNNING.value})
     _publish(job_id, {"type": "status", "status": JobStatus.RUNNING.value})
 
+    # --- Fetch server (real SSH credentials from DB) ---
     try:
         server = ServerService.get_server(server_id=payload.server_id, user_id=user_id)
     except HTTPException as exc:
@@ -112,160 +136,70 @@ async def _run_agent_loop(
         _publish(job_id, {"type": "error", "detail": exc.detail})
         return
 
-    # ── Generate plan ────────────────────────────────────────────────────────
-    _db_update(job_id, {"status": JobStatus.WAITING_FOR_LLM.value})
-    _publish(job_id, {"type": "status", "status": JobStatus.WAITING_FOR_LLM.value})
+    # Persist current steps list progressively
+    accumulated_steps: list[dict[str, Any]] = []
 
-    server_metadata = {
-        "host": server.get("host"),
-        "ssh_user": server.get("ssh_user"),
-        "name": server.get("name"),
-    }
-    context: dict[str, Any] = {
-        "server_metadata": server_metadata,
-        "failure_history": [],
-        "allow_write": payload.allow_write,
-        "objective": payload.objective,
-    }
+    # Callbacks invoked by the LLM loop so we can stream events in real time
+    async def on_step_start(step_num: int, tool_name: str, args: dict[str, Any]) -> None:
+        _db_update(job_id, {"status": JobStatus.WAITING_FOR_LLM.value})
+        _publish(job_id, {
+            "type": "step_start",
+            "step": step_num,
+            "tool": tool_name,
+            "args": args,
+        })
 
+    async def on_step_result(result: StepResult) -> None:
+        record = _step_to_record(result)
+        accumulated_steps.append(record)
+        _db_update(job_id, {
+            "status": JobStatus.RUNNING.value,
+            "steps": accumulated_steps,
+        })
+        _publish(job_id, {
+            "type": "step_result",
+            "step": result.step,
+            "tool": result.tool.value,
+            "success": result.success,
+            "exit_code": result.exit_code,
+            "stdout": result.stdout[:500],
+            "stderr": result.stderr[:200],
+        })
+
+    # --- Run the real tool-calling loop ---
     try:
-        plan = await llm_service.generate_plan(
+        loop_result = await agent_llm.run_tool_calling_loop(
             objective=payload.objective,
-            context=context,
+            server=server,
+            allow_write=payload.allow_write,
             max_steps=payload.max_steps,
+            step_timeout=step_timeout,
+            on_step_start=on_step_start,
+            on_step_result=on_step_result,
         )
     except HTTPException as exc:
         _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": exc.detail})
         _publish(job_id, {"type": "error", "detail": exc.detail})
         return
+    except Exception as exc:
+        logger.exception("Unhandled error in tool-calling loop (job=%s): %s", job_id, exc)
+        detail = f"Agent loop failed: {exc}"
+        _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": detail})
+        _publish(job_id, {"type": "error", "detail": detail})
+        return
 
-    _db_update(job_id, {"status": JobStatus.RUNNING.value})
-    _publish(job_id, {"type": "plan", "steps": [s.model_dump() for s in plan.steps]})
-
-    # ── Execute loop ─────────────────────────────────────────────────────────
-    persisted_steps: list[dict[str, Any]] = []
-    summary_parts: list[str] = []
-    final_success = True
-    remaining: list[AgentStep] = list(plan.steps)
-    step_index = 0
-
-    while step_index < len(remaining):
-        step = remaining[step_index]
-        retry_count = 0
-        step_done = False
-
-        while not step_done:
-            _publish(job_id, {"type": "step_start", "step": step.step, "tool": step.tool.value})
-
-            result = await _execute_tool(
-                step=step,
-                server=server,
-                allow_write=payload.allow_write,
-                timeout=step_timeout,
-            )
-
-            _publish(
-                job_id,
-                {
-                    "type": "step_result",
-                    "step": result.step,
-                    "success": result.success,
-                    "exit_code": result.exit_code,
-                },
-            )
-
-            # ── LLM evaluation ───────────────────────────────────────────────
-            _db_update(job_id, {"status": JobStatus.WAITING_FOR_LLM.value})
-            _publish(job_id, {"type": "status", "status": JobStatus.WAITING_FOR_LLM.value})
-
-            eval_context: dict[str, Any] = {
-                **context,
-                "previous_steps_summary": " | ".join(summary_parts),
-                "retry_count": retry_count,
-                "max_retries": max_retries,
-            }
-
-            try:
-                decision: AgentDecision = await llm_service.evaluate_step(
-                    step=step,
-                    result=result,
-                    context=eval_context,
-                )
-            except HTTPException as exc:
-                decision = AgentDecision(
-                    action=DecisionAction.ABORT,
-                    reason=str(exc.detail),
-                    summary_so_far="",
-                )
-
-            _db_update(job_id, {"status": JobStatus.RUNNING.value})
-            _publish(job_id, {"type": "decision", "step": step.step, "action": decision.action.value})
-
-            # ── Persist step to jobs.steps JSONB ─────────────────────────────
-            step_record: dict[str, Any] = {
-                "step": result.step,
-                "tool": result.tool.value,
-                "args": result.args,
-                "stdout": result.stdout[:4000],
-                "stderr": result.stderr[:2000],
-                "exit_code": result.exit_code,
-                "duration_ms": result.duration_ms,
-                "success": result.success,
-                "decision": decision.action.value,
-                "decision_reason": decision.reason[:500],
-                "executed_at": result.executed_at.isoformat(),
-            }
-            persisted_steps.append(step_record)
-            _db_update(job_id, {"steps": persisted_steps})
-
-            if decision.summary_so_far:
-                summary_parts.append(decision.summary_so_far)
-
-            if decision.action == DecisionAction.CONTINUE:
-                step_done = True
-                step_index += 1
-
-            elif decision.action == DecisionAction.RETRY:
-                if retry_count >= max_retries:
-                    final_success = False
-                    _publish(job_id, {"type": "abort", "step": step.step, "reason": "max retries exceeded"})
-                    step_index = len(remaining)
-                    step_done = True
-                else:
-                    retry_count += 1
-                    context["failure_history"].append(
-                        {"step": step.step, "exit_code": result.exit_code, "stderr": result.stderr[:200]}
-                    )
-
-            elif decision.action == DecisionAction.MODIFY:
-                if decision.modified_step:
-                    remaining[step_index] = decision.modified_step
-                    step = decision.modified_step
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        final_success = False
-                        step_index = len(remaining)
-                        step_done = True
-                else:
-                    final_success = False
-                    step_index = len(remaining)
-                    step_done = True
-
-            else:  # ABORT or unknown
-                final_success = False
-                _publish(job_id, {"type": "abort", "step": step.step, "reason": decision.reason})
-                step_index = len(remaining)
-                step_done = True
-
-    ok_count = sum(1 for s in persisted_steps if s.get("success"))
-    summary = (
-        f"Completed: {len(persisted_steps)} step(s) executed, {ok_count} successful."
-        + (" " + " | ".join(summary_parts) if summary_parts else "")
-    ).strip()
-
-    final_status = JobStatus.COMPLETED if final_success else JobStatus.FAILED
-    _db_update(job_id, {"status": final_status.value, "summary": summary, "steps": persisted_steps})
-    _publish(job_id, {"type": "completed", "success": final_success, "summary": summary})
+    final_status = JobStatus.COMPLETED if loop_result.success else JobStatus.FAILED
+    _db_update(job_id, {
+        "status": final_status.value,
+        "summary": loop_result.summary,
+        "steps": accumulated_steps,
+    })
+    _publish(job_id, {
+        "type": "completed",
+        "success": loop_result.success,
+        "summary": loop_result.summary,
+        "steps_taken": loop_result.steps_taken,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +212,7 @@ class AgentService:
 
     @staticmethod
     def create_job(user_id: str, payload: JobCreate) -> JobAccepted:
-        """Insert a job row in Supabase and register an event queue."""
+        """Insert a new job row in Supabase and register a WebSocket event queue."""
         job_id = str(uuid4())
         now = datetime.now(timezone.utc).isoformat()
         record: dict[str, Any] = {
@@ -313,7 +247,7 @@ class AgentService:
 
     @staticmethod
     def get_job(job_id: str, user_id: str) -> JobResponse:
-        """Fetch a single job owned by the user."""
+        """Fetch a single job owned by the authenticated user."""
         try:
             result = (
                 get_supabase()
@@ -353,7 +287,7 @@ class AgentService:
 
     @staticmethod
     def get_events_queue(job_id: str) -> asyncio.Queue[dict[str, Any]]:
-        """Return the in-memory event queue for a running job."""
+        """Return the in-memory WebSocket event queue for a running job."""
         q = _queues.get(job_id)
         if q is None:
             raise HTTPException(
@@ -368,7 +302,7 @@ class AgentService:
         payload: JobCreate,
         user_id: str,
     ) -> None:
-        """Background coroutine: acquire semaphore, run agent loop."""
+        """Background coroutine: acquire concurrency semaphore, then run the agent loop."""
         sem = _get_semaphore()
         async with sem:
             try:

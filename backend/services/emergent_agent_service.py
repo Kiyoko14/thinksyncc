@@ -9,17 +9,23 @@ from postgrest.exceptions import APIError
 from core.config import get_settings
 from core.database import get_supabase
 from models.agent import (
+    AgentDecision,
     AgentExecutionResult,
     AgentJobResponse,
     AgentJobStatus,
     AgentOrchestrationRequest,
     AgentOrchestrationResponse,
+    AgentPlan,
     AgentPlanResponse,
     AgentPlanStep,
     AgentRunRequest,
     AgentRunResponse,
+    AgentStep,
+    AgentTier,
     ArchitectureHistoryItem,
+    ToolName,
 )
+from services import agent_llm
 from services.chat_service import ChatService
 from services.server_service import ServerService
 from services.ssh_service import SSHService
@@ -107,48 +113,55 @@ class EmergentE1Service:
         return any(lowered.startswith(prefix) for prefix in EmergentE1Service._READ_ONLY_PREFIXES)
 
     @staticmethod
-    def _build_plan(objective: str, max_steps: int, allow_write: bool) -> list[AgentPlanStep]:
-        lowered = objective.lower()
-        commands: list[tuple[str, str]] = []
-
-        if "health" in lowered or "audit" in lowered or "monitor" in lowered:
-            commands.extend(
-                [
-                    ("uptime", "Server uptime va load holatini tekshirish"),
-                    ("df -h", "Disk sig'im va to'lish holatini tekshirish"),
-                    ("free -m", "RAM holatini tekshirish"),
-                ]
-            )
-
-        if "docker" in lowered or "container" in lowered:
-            commands.extend(
-                [
-                    ("docker ps", "Ishlayotgan containerlarni ko'rish"),
-                    ("docker images | head -n 20", "Asosiy image'larni ko'rish"),
-                ]
-            )
-
-        if "log" in lowered:
-            commands.append(("journalctl -n 100 --no-pager", "Oxirgi log yozuvlarini tahlil qilish"))
-
-        if not commands:
-            commands = [
-                ("uname -a", "Server platformasi va kernel versiyasini aniqlash"),
-                ("uptime", "Umumiy ishlash holatini ko'rish"),
-                ("df -h", "Disk holatini ko'rish"),
-            ]
-
+    @staticmethod
+    async def _build_plan_from_llm(
+        objective: str,
+        max_steps: int,
+        allow_write: bool,
+        server_metadata: dict[str, Any],
+    ) -> list[AgentPlanStep]:
+        """Generate an execution plan via LLM (real planning, no keyword matching)."""
+        context: dict[str, Any] = {
+            "server_metadata": server_metadata,
+            "failure_history": [],
+            "allow_write": allow_write,
+            "objective": objective,
+        }
+        llm_plan: AgentPlan = await agent_llm.generate_plan(
+            objective=objective,
+            context=context,
+            max_steps=max_steps,
+        )
         plan: list[AgentPlanStep] = []
-        for index, (command, rationale) in enumerate(commands[:max_steps], start=1):
-            approved = EmergentE1Service._is_safe_command(command=command, allow_write=allow_write)
-            plan.append(
-                AgentPlanStep(
-                    step=index,
-                    command=command,
-                    rationale=rationale,
-                    approved=approved,
-                )
+        for step in llm_plan.steps:
+            # Convert AgentStep → AgentPlanStep (v1 response format)
+            if step.tool == ToolName.RUN_COMMAND:
+                command = step.args.get("command", "")
+            elif step.tool == ToolName.CHECK_DISK:
+                command = "df -h"
+            elif step.tool == ToolName.CHECK_MEMORY:
+                command = "free -m"
+            elif step.tool == ToolName.READ_LOGS:
+                svc = step.args.get("service_name", "")
+                lines = step.args.get("lines", 100)
+                command = f"journalctl -u {svc} -n {lines} --no-pager" if svc else "journalctl -n 100 --no-pager"
+            elif step.tool == ToolName.RESTART_SERVICE:
+                command = f"systemctl restart {step.args.get('service_name', '')}"
+            elif step.tool in (ToolName.DEPLOY_APP, ToolName.DEPLOY_NEXTJS_APP):
+                command = step.args.get("deploy_command", "")
+            else:
+                command = step.args.get("command", "")
+
+            approved = (
+                bool(command)
+                and EmergentE1Service._is_safe_command(command=command, allow_write=allow_write)
             )
+            plan.append(AgentPlanStep(
+                step=step.step,
+                command=command,
+                rationale=step.rationale,
+                approved=approved,
+            ))
         return plan
 
     @staticmethod
@@ -224,10 +237,16 @@ class EmergentE1Service:
             )
 
         server = ServerService.get_server(server_id=payload.server_id, user_id=user_id)
-        plan = EmergentE1Service._build_plan(
+        server_metadata = {
+            "host": server.get("host"),
+            "ssh_user": server.get("ssh_user"),
+            "name": server.get("name"),
+        }
+        plan = await EmergentE1Service._build_plan_from_llm(
             objective=payload.objective,
             max_steps=payload.max_steps,
             allow_write=payload.allow_write,
+            server_metadata=server_metadata,
         )
 
         rejected = [step for step in plan if not step.approved]
@@ -368,9 +387,11 @@ class EmergentE1Service:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def get_plan(payload: AgentRunRequest, current_user: dict[str, Any]) -> AgentPlanResponse:
-        """Return a plan without executing any commands (instant, no SSH)."""
+    @staticmethod
+    async def get_plan(payload: AgentRunRequest, current_user: dict[str, Any]) -> AgentPlanResponse:
+        """Return a plan generated by the LLM without executing any commands."""
         settings = get_settings()
+        user_id = current_user["sub"]
         user_email = str(current_user.get("email", ""))
 
         if payload.allow_write and not EmergentE1Service._is_write_allowed(user_email=user_email):
@@ -379,10 +400,17 @@ class EmergentE1Service:
                 detail="Write-mode is restricted to agent admins",
             )
 
-        plan = EmergentE1Service._build_plan(
+        server = ServerService.get_server(server_id=payload.server_id, user_id=user_id)
+        server_metadata = {
+            "host": server.get("host"),
+            "ssh_user": server.get("ssh_user"),
+            "name": server.get("name"),
+        }
+        plan = await EmergentE1Service._build_plan_from_llm(
             objective=payload.objective,
             max_steps=payload.max_steps,
             allow_write=payload.allow_write,
+            server_metadata=server_metadata,
         )
 
         step_timeout_seconds = payload.step_timeout_seconds or settings.AGENT_STEP_TIMEOUT
@@ -390,9 +418,9 @@ class EmergentE1Service:
 
         blocked = [s for s in plan if not s.approved]
         summary = (
-            f"Plan ready: {len(plan)} ta qadam. {len(blocked)} ta bloklangan."
+            f"Plan ready: {len(plan)} steps, {len(blocked)} blocked."
             if blocked
-            else f"Plan ready: {len(plan)} ta qadam, hammasi tasdiqlangan."
+            else f"Plan ready: {len(plan)} steps, all approved."
         )
 
         policy = {

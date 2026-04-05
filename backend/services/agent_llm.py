@@ -1,7 +1,10 @@
-"""LLM integration for Forge v2 agent.
+"""LLM integration for the ThinkSync agent.
 
-All public functions are fully async and return validated Pydantic models.
-Redis caching is applied to plan generation keyed on (objective, context hash).
+Public functions:
+  generate_plan()        — two-phase plan generation (used by forge_v2)
+  evaluate_step()        — per-step LLM evaluation (used by forge_v2)
+  revise_plan()          — plan revision after partial execution
+  run_tool_calling_loop() — ReAct-style tool-calling loop (primary agent loop)
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 try:
@@ -28,6 +32,7 @@ from models.agent import (
     AgentStep,
     DecisionAction,
     StepResult,
+    ToolCallingLoopResult,
     ToolName,
 )
 
@@ -722,4 +727,239 @@ async def revise_plan(
         objective=raw.get("objective", plan.objective),
         steps=steps,
         context_summary=raw.get("context_summary", plan.context_summary),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ReAct tool-calling loop  (PRIMARY AGENT LOOP)
+# ---------------------------------------------------------------------------
+
+_AGENT_SYSTEM_PROMPT = """\
+You are Forge, a production-grade AI DevOps execution agent running inside ThinkSync.
+
+═══════════════════════════════════════════════════════
+CRITICAL RULES — NEVER VIOLATE
+═══════════════════════════════════════════════════════
+1. You have NO local filesystem access. You CANNOT read or write files directly.
+2. You CANNOT execute commands yourself. You MUST call the provided tools.
+3. Every action on the server MUST go through a tool call. No exceptions.
+4. NEVER simulate, assume, or guess a command result. Always call the tool.
+5. NEVER use local paths like /home/root/workspaces, /tmp/local, or similar.
+6. All file paths must be paths on the REMOTE server.
+7. If the server_id is missing or the server is unreachable → stop immediately and explain.
+
+═══════════════════════════════════════════════════════
+EXECUTION STRATEGY
+═══════════════════════════════════════════════════════
+1. Start with read-only diagnostics (check resources, inspect services, read logs).
+2. Execute write operations only after confirming the environment is ready.
+3. Verify every action's result before proceeding to the next step.
+4. If a step fails, analyse the stderr carefully and either retry or try an alternative.
+5. Prefer specialized tools (check_disk, read_logs, deploy_nextjs_app) over raw run_command.
+6. After completing all necessary actions, output a clear plain-text summary — do NOT call any more tools.
+
+═══════════════════════════════════════════════════════
+SAFETY — ABSOLUTELY FORBIDDEN
+═══════════════════════════════════════════════════════
+Never issue commands or tool calls that:
+  ✗ Delete data: rm -rf, shred, wipefs
+  ✗ Destroy storage: mkfs, dd if=, > /dev/sd*
+  ✗ Shut down the system: shutdown, reboot, poweroff, halt, init 0/6
+  ✗ Modify credentials: passwd, chpasswd, usermod
+  ✗ Pipe untrusted data to a shell: curl ... | bash, wget ... | sh
+  ✗ Escalate privileges dangerously: chmod 777 on system dirs
+  ✗ Modify system auth files: /etc/passwd, /etc/shadow, /etc/sudoers
+
+If the objective requires any of the above → explain why you cannot proceed and stop.
+"""
+
+
+async def run_tool_calling_loop(
+    *,
+    objective: str,
+    server: dict[str, Any],
+    allow_write: bool,
+    max_steps: int,
+    step_timeout: int,
+    on_step_start: Callable[[int, str, dict[str, Any]], Awaitable[None]] | None = None,
+    on_step_result: Callable[[StepResult], Awaitable[None]] | None = None,
+) -> ToolCallingLoopResult:
+    """
+    Run the OpenAI tool-calling (ReAct) agent loop.
+
+    At each iteration the LLM either:
+      - calls one or more tools  → execute them on the server via SSH, feed results back
+      - returns a text response  → treated as the final summary; loop ends
+
+    All tool calls result in REAL SSH operations on the remote server.
+    Nothing is simulated.
+
+    Args:
+        objective:      User-supplied goal in natural language.
+        server:         Server dict (host, ssh_user, ssh_auth_method, etc.).
+        allow_write:    Whether write/destructive tools are permitted.
+        max_steps:      Maximum number of individual tool invocations.
+        step_timeout:   Per-tool SSH execution timeout in seconds.
+        on_step_start:  Optional async callback(step_num, tool_name, args).
+        on_step_result: Optional async callback(StepResult).
+
+    Returns:
+        ToolCallingLoopResult with all executed steps and a final summary.
+    """
+    # Import here to avoid circular dependency (tools.py imports models.agent)
+    from services.tools import execute_tool, get_tool_definitions
+
+    settings = get_settings()
+    if not settings.OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OPENAI_API_KEY is not configured on the server.",
+        )
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    tool_defs = get_tool_definitions(allow_write)
+
+    server_info = (
+        f"Server: {server.get('name', 'unknown')} "
+        f"(host={server.get('host', '?')}, user={server.get('ssh_user', '?')})"
+    )
+    user_message = (
+        f"Objective: {objective}\n\n"
+        f"{server_info}\n"
+        f"allow_write: {allow_write}\n"
+        f"max_steps: {max_steps}"
+    )
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    results: list[StepResult] = []
+    step_counter = 0
+    final_summary = ""
+
+    while step_counter < max_steps:
+        try:
+            response = await client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=messages,  # type: ignore[arg-type]
+                tools=tool_defs,  # type: ignore[arg-type]
+                tool_choice="auto",
+                temperature=0.1,
+            )
+        except Exception as exc:
+            logger.error("OpenAI tool-calling request failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"LLM request failed: {exc}",
+            )
+
+        msg = response.choices[0].message
+
+        # Append assistant message (may contain tool_calls and/or content)
+        messages.append(msg.model_dump(exclude_unset=True))
+
+        if not msg.tool_calls:
+            # LLM returned a plain text response → final summary, stop loop
+            final_summary = (msg.content or "").strip()
+            break
+
+        # Execute each tool call the LLM requested
+        tool_result_messages: list[dict[str, Any]] = []
+        for tc in msg.tool_calls:
+            if step_counter >= max_steps:
+                # Hard limit reached mid-batch: add a refusal message and stop
+                tool_result_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps({
+                        "error": f"max_steps ({max_steps}) reached — no more tool calls allowed."
+                    }),
+                })
+                continue
+
+            tool_name: str = tc.function.name
+            try:
+                tool_args: dict[str, Any] = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                tool_args = {}
+
+            step_counter += 1
+
+            if on_step_start:
+                try:
+                    await on_step_start(step_counter, tool_name, tool_args)
+                except Exception:
+                    pass
+
+            result = await execute_tool(
+                tool_name=tool_name,
+                args=tool_args,
+                server=server,
+                allow_write=allow_write,
+                timeout=step_timeout,
+                step_number=step_counter,
+            )
+            results.append(result)
+
+            if on_step_result:
+                try:
+                    await on_step_result(result)
+                except Exception:
+                    pass
+
+            # Format tool result as a JSON string for the conversation
+            tool_output = json.dumps({
+                "stdout": result.stdout[:4000] if result.stdout else "",
+                "stderr": result.stderr[:2000] if result.stderr else "",
+                "exit_code": result.exit_code,
+                "success": result.success,
+                "duration_ms": result.duration_ms,
+            })
+            tool_result_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_output,
+            })
+
+        # Add all tool results to the conversation before next LLM call
+        messages.extend(tool_result_messages)
+
+    else:
+        # Loop exhausted max_steps without a plain-text conclusion from the LLM.
+        # Ask LLM for a summary of what it accomplished.
+        messages.append({
+            "role": "user",
+            "content": (
+                f"You have reached the maximum of {max_steps} tool call(s). "
+                "Provide a concise summary of what was accomplished and what (if anything) remains."
+            ),
+        })
+        try:
+            summary_resp = await client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=0.1,
+            )
+            final_summary = (summary_resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning("Failed to get final summary from LLM: %s", exc)
+            final_summary = (
+                f"Agent stopped after reaching the {max_steps}-step limit. "
+                f"{sum(1 for r in results if r.success)} of {len(results)} step(s) succeeded."
+            )
+
+    overall_success = bool(results) and all(r.success for r in results)
+    if not final_summary:
+        ok = sum(1 for r in results if r.success)
+        final_summary = (
+            f"Completed: {len(results)} step(s) executed, {ok} successful."
+        )
+
+    return ToolCallingLoopResult(
+        steps=results,
+        summary=final_summary,
+        success=overall_success,
+        steps_taken=step_counter,
     )

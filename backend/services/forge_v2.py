@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-import time
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -40,54 +38,15 @@ from models.agent import (
 )
 from services import agent_llm
 from services.server_service import ServerService
-from services.ssh_service import SSHService
+from services.tools import execute_tool as _execute_tool_from_registry
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Safety constants
 # ---------------------------------------------------------------------------
-
-_BLOCKED_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\brm\s+-rf\b", flags=re.IGNORECASE),
-    re.compile(r"\bmkfs\b", flags=re.IGNORECASE),
-    re.compile(r"\bdd\s+if=", flags=re.IGNORECASE),
-    re.compile(r"\bshutdown\b", flags=re.IGNORECASE),
-    re.compile(r"\breboot\b", flags=re.IGNORECASE),
-    re.compile(r"\bpasswd\b", flags=re.IGNORECASE),
-    re.compile(r"\bchmod\s+777\b", flags=re.IGNORECASE),
-    re.compile(r">\s*/dev/sd", flags=re.IGNORECASE),
-]
-
-_READ_ONLY_COMMAND_PREFIXES: tuple[str, ...] = (
-    "uname",
-    "uptime",
-    "whoami",
-    "id",
-    "pwd",
-    "ls",
-    "df",
-    "free",
-    "cat",
-    "head",
-    "tail",
-    "ps",
-    "ss",
-    "netstat",
-    "docker ps",
-    "docker images",
-    "docker stats",
-    "systemctl status",
-    "journalctl",
-    "echo",
-    "hostname",
-    "date",
-    "top -bn1",
-    "vmstat",
-    "iostat",
-    "lscpu",
-    "lsblk",
-)
+# Safety constants
+# ---------------------------------------------------------------------------
 
 _WRITE_TOOLS: tuple[ToolName, ...] = (ToolName.RESTART_SERVICE, ToolName.DEPLOY_APP)
 
@@ -99,163 +58,8 @@ _jobs: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
-# Safety helpers
+# Tool execution — delegated to services.tools (single source of truth)
 # ---------------------------------------------------------------------------
-
-
-def _is_dangerous(command: str) -> bool:
-    for pattern in _BLOCKED_PATTERNS:
-        if pattern.search(command):
-            return True
-    return False
-
-
-def _is_allowed_prefix(command: str, allow_write: bool) -> bool:
-    settings = get_settings()
-    custom = [p.strip().lower() for p in settings.AGENT_ALLOWED_COMMAND_PREFIXES.split(",") if p.strip()]
-    allowed_prefixes: tuple[str, ...] = tuple(custom) if custom else _READ_ONLY_COMMAND_PREFIXES
-
-    if allow_write:
-        return True
-
-    lowered = command.strip().lower()
-    return any(lowered.startswith(prefix) for prefix in allowed_prefixes)
-
-
-def _validate_command(command: str, allow_write: bool) -> None:
-    if _is_dangerous(command):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Rejected dangerous command: {command!r}",
-        )
-    if not _is_allowed_prefix(command, allow_write=allow_write):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Command not in allowlist: {command!r}",
-        )
-
-
-def _validate_service_name(name: str) -> None:
-    if not re.match(r'^[a-zA-Z0-9_.\\-]+$', name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid service name: {name!r}",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Tool implementations
-# ---------------------------------------------------------------------------
-
-
-async def _tool_run_command(
-    args: dict[str, Any],
-    server: dict[str, Any],
-    allow_write: bool,
-    timeout: int,
-) -> tuple[str, str, int]:
-    command: str = args.get("command", "").strip()
-    if not command:
-        return "", "run_command: 'command' arg is required", 1
-    _validate_command(command, allow_write=allow_write)
-    resp = await SSHService.execute(server=server, command=command, command_timeout=timeout)
-    stdout = resp.output if resp.exit_code == 0 else ""
-    stderr = resp.output if resp.exit_code != 0 else ""
-    return stdout, stderr, resp.exit_code
-
-
-async def _tool_check_disk(
-    args: dict[str, Any],
-    server: dict[str, Any],
-    allow_write: bool,
-    timeout: int,
-) -> tuple[str, str, int]:
-    resp = await SSHService.execute(server=server, command="df -h", command_timeout=timeout)
-    return resp.output, "", resp.exit_code
-
-
-async def _tool_check_memory(
-    args: dict[str, Any],
-    server: dict[str, Any],
-    allow_write: bool,
-    timeout: int,
-) -> tuple[str, str, int]:
-    resp = await SSHService.execute(server=server, command="free -m", command_timeout=timeout)
-    return resp.output, "", resp.exit_code
-
-
-async def _tool_restart_service(
-    args: dict[str, Any],
-    server: dict[str, Any],
-    allow_write: bool,
-    timeout: int,
-) -> tuple[str, str, int]:
-    if not allow_write:
-        return "", "restart_service requires allow_write=true", 1
-    service_name: str = args.get("service_name", "").strip()
-    _validate_service_name(service_name)
-    command = f"systemctl restart {service_name}"
-    resp = await SSHService.execute(server=server, command=command, command_timeout=timeout)
-    stdout = resp.output if resp.exit_code == 0 else ""
-    stderr = resp.output if resp.exit_code != 0 else ""
-    return stdout, stderr, resp.exit_code
-
-
-async def _tool_read_logs(
-    args: dict[str, Any],
-    server: dict[str, Any],
-    allow_write: bool,
-    timeout: int,
-) -> tuple[str, str, int]:
-    service_name: str = args.get("service_name", "").strip()
-    lines: int = int(args.get("lines", 100))
-    lines = max(1, min(lines, 1000))
-
-    if service_name.startswith("/"):
-        # Reading a log file path
-        if _is_dangerous(f"tail -n {lines} {service_name}"):
-            return "", f"Rejected dangerous log path: {service_name!r}", 1
-        command = f"tail -n {lines} {service_name}"
-    else:
-        _validate_service_name(service_name)
-        command = f"journalctl -u {service_name} -n {lines} --no-pager"
-
-    resp = await SSHService.execute(server=server, command=command, command_timeout=timeout)
-    stdout = resp.output if resp.exit_code == 0 else ""
-    stderr = resp.output if resp.exit_code != 0 else ""
-    return stdout, stderr, resp.exit_code
-
-
-async def _tool_deploy_app(
-    args: dict[str, Any],
-    server: dict[str, Any],
-    allow_write: bool,
-    timeout: int,
-) -> tuple[str, str, int]:
-    if not allow_write:
-        return "", "deploy_app requires allow_write=true", 1
-    app_name: str = args.get("app_name", "").strip()
-    deploy_command: str = args.get("deploy_command", "").strip()
-
-    if not app_name or not deploy_command:
-        return "", "deploy_app requires 'app_name' and 'deploy_command'", 1
-
-    _validate_command(deploy_command, allow_write=True)
-
-    resp = await SSHService.execute(server=server, command=deploy_command, command_timeout=timeout)
-    stdout = resp.output if resp.exit_code == 0 else ""
-    stderr = resp.output if resp.exit_code != 0 else ""
-    return stdout, stderr, resp.exit_code
-
-
-_TOOL_DISPATCH: dict[ToolName, Any] = {
-    ToolName.RUN_COMMAND: _tool_run_command,
-    ToolName.CHECK_DISK: _tool_check_disk,
-    ToolName.CHECK_MEMORY: _tool_check_memory,
-    ToolName.RESTART_SERVICE: _tool_restart_service,
-    ToolName.READ_LOGS: _tool_read_logs,
-    ToolName.DEPLOY_APP: _tool_deploy_app,
-}
 
 
 async def _execute_tool(
@@ -264,51 +68,20 @@ async def _execute_tool(
     allow_write: bool,
     timeout: int,
 ) -> StepResult:
-    fn = _TOOL_DISPATCH.get(step.tool)
-    if fn is None:
-        return StepResult(
-            step=step.step,
-            tool=step.tool,
-            args=step.args,
-            stderr=f"Unknown tool: {step.tool}",
-            exit_code=1,
-            duration_ms=0,
-            executed_at=datetime.now(timezone.utc),
-            success=False,
-        )
-
-    start_ms = time.monotonic()
-    try:
-        stdout, stderr, exit_code = await asyncio.wait_for(
-            fn(step.args, server, allow_write, timeout),
-            timeout=timeout + 5,
-        )
-    except asyncio.TimeoutError:
-        stdout, stderr, exit_code = "", "Tool execution timed out", 124
-    except HTTPException as exc:
-        stdout, stderr, exit_code = "", str(exc.detail), 1
-    except Exception as exc:
-        logger.exception("Unexpected error in tool %s: %s", step.tool, exc)
-        stdout, stderr, exit_code = "", f"Internal tool error: {exc}", 1
-
-    duration_ms = int((time.monotonic() - start_ms) * 1000)
-    return StepResult(
-        step=step.step,
-        tool=step.tool,
+    """Execute a plan step via the centralised tool registry."""
+    return await _execute_tool_from_registry(
+        tool_name=step.tool.value,
         args=step.args,
-        stdout=stdout,
-        stderr=stderr,
-        exit_code=exit_code,
-        duration_ms=duration_ms,
-        executed_at=datetime.now(timezone.utc),
-        success=(exit_code == 0),
+        server=server,
+        allow_write=allow_write,
+        timeout=timeout,
+        step_number=step.step,
     )
 
 
 # ---------------------------------------------------------------------------
 # Audit logging
 # ---------------------------------------------------------------------------
-
 
 def _audit_step(
     *,
