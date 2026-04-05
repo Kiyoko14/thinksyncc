@@ -39,6 +39,10 @@ _TABLE = "jobs"
 # Maximum events buffered per job queue before new events are dropped.
 _WS_QUEUE_MAXSIZE = 500
 
+# Extra seconds added to SSH_COMMAND_TIMEOUT for the httpx request timeout in run_agent.
+# Gives the SSH channel time to finish before the outer HTTP connection gives up.
+_HTTP_TIMEOUT_BUFFER_SECONDS = 10
+
 # Per-job WebSocket event queues.  Keyed by job UUID.
 _queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 
@@ -453,7 +457,7 @@ async def run_agent(
         execute_url,
     )
     try:
-        async with httpx.AsyncClient(timeout=settings.SSH_COMMAND_TIMEOUT + 10) as http:
+        async with httpx.AsyncClient(timeout=settings.SSH_COMMAND_TIMEOUT + _HTTP_TIMEOUT_BUFFER_SECONDS) as http:
             resp = await http.post(
                 execute_url,
                 json=request_payload,
