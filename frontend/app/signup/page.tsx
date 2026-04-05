@@ -3,24 +3,33 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { login } from "@/services/auth";
+import { register } from "@/services/auth";
 
-export default function LoginPage() {
+export default function SignupPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (password !== confirmPassword) {
+      setError("Passwords do not match");
+      return;
+    }
+    if (password.length < 6) {
+      setError("Password must be at least 6 characters");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
-      await login(email, password);
+      await register(email, password);
       router.push("/servers");
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      setError(err instanceof Error ? err.message : "Registration failed");
     } finally {
       setLoading(false);
     }
@@ -43,7 +52,7 @@ export default function LoginPage() {
       {/* Form card */}
       <div className="flex-1 flex flex-col px-6 pb-8">
         <div className="bg-gray-900 border border-gray-800 rounded-2xl p-6 shadow-xl">
-          <h2 className="text-lg font-semibold text-white mb-6">Sign in</h2>
+          <h2 className="text-lg font-semibold text-white mb-6">Create account</h2>
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
@@ -68,9 +77,24 @@ export default function LoginPage() {
               </label>
               <input
                 type="password"
-                autoComplete="current-password"
+                autoComplete="new-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full bg-gray-800 text-white rounded-xl px-4 py-3.5 border border-gray-700 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-base placeholder:text-gray-600"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-gray-400 mb-1.5 uppercase tracking-wide">
+                Confirm Password
+              </label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
                 placeholder="••••••••"
                 className="w-full bg-gray-800 text-white rounded-xl px-4 py-3.5 border border-gray-700 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-base placeholder:text-gray-600"
                 required
@@ -94,19 +118,19 @@ export default function LoginPage() {
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
                   </svg>
-                  Signing in…
+                  Creating account…
                 </span>
               ) : (
-                "Sign in"
+                "Create account"
               )}
             </button>
           </form>
         </div>
 
         <p className="text-center text-gray-500 text-sm mt-5">
-          Don&apos;t have an account?{" "}
-          <Link href="/signup" className="text-blue-400 hover:text-blue-300 font-medium transition-colors">
-            Sign up
+          Already have an account?{" "}
+          <Link href="/login" className="text-blue-400 hover:text-blue-300 font-medium transition-colors">
+            Sign in
           </Link>
         </p>
 

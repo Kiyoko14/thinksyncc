@@ -65,9 +65,9 @@ class AIService:
         )
 
         try:
-            response = await client.responses.create(
+            response = await client.chat.completions.create(
                 model=settings.OPENAI_MODEL,
-                input=[
+                messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": cleaned_message},
                 ],
@@ -78,7 +78,9 @@ class AIService:
                 detail="Failed to generate AI response",
             )
 
-        output_text = getattr(response, "output_text", "")
+        output_text = ""
+        if response.choices:
+            output_text = response.choices[0].message.content or ""
         if not output_text:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,

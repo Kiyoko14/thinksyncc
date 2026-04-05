@@ -131,3 +131,82 @@ export const executeCommand = (server_id: string, command: string) =>
     method: "POST",
     body: JSON.stringify({ server_id, command }),
   });
+
+// ── Agents (Forge v2) ────────────────────────────────────────────────────────
+
+export type AgentJobStatus =
+  | "queued"
+  | "running"
+  | "waiting_for_llm"
+  | "completed"
+  | "failed";
+
+export interface ForgeV2RunRequest {
+  server_id: string;
+  objective: string;
+  max_steps?: number;
+  max_retries?: number;
+  allow_write?: boolean;
+  dry_run?: boolean;
+  step_timeout_seconds?: number;
+}
+
+export interface AgentStep {
+  step: number;
+  tool: string;
+  args: Record<string, unknown>;
+  rationale: string;
+}
+
+export interface StepResult {
+  step: number;
+  tool: string;
+  args: Record<string, unknown>;
+  stdout: string;
+  stderr: string;
+  exit_code: number;
+  duration_ms: number;
+  executed_at: string;
+  success: boolean;
+}
+
+export interface AgentDecision {
+  action: "continue" | "retry" | "modify" | "abort";
+  reason: string;
+  modified_step: AgentStep | null;
+  summary_so_far: string;
+}
+
+export interface ForgeV2RunResponse {
+  agent: string;
+  job_id: string;
+  objective: string;
+  dry_run: boolean;
+  plan: AgentStep[];
+  results: StepResult[];
+  decisions: AgentDecision[];
+  summary: string;
+  success: boolean;
+}
+
+export interface ForgeV2JobResponse {
+  job_id: string;
+  status: AgentJobStatus;
+  run: ForgeV2RunResponse | null;
+  error: string | null;
+}
+
+export const runForgeV2 = (payload: ForgeV2RunRequest) =>
+  request<ForgeV2JobResponse>("/api/v1/agents/forge-v2/run", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+export const getForgeV2JobStatus = (job_id: string) =>
+  request<ForgeV2JobResponse>(`/api/v1/agents/forge-v2/jobs/${job_id}`);
+
+export const getForgeV2Plan = (payload: ForgeV2RunRequest) =>
+  request<{ plan: AgentStep[]; objective: string; context_summary: string }>(
+    "/api/v1/agents/forge-v2/plan",
+    { method: "POST", body: JSON.stringify(payload) }
+  );

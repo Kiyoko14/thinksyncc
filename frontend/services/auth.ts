@@ -16,6 +16,22 @@ export async function login(email: string, password: string): Promise<void> {
   localStorage.setItem(TOKEN_KEY, access_token);
 }
 
+export async function register(email: string, password: string): Promise<void> {
+  const response = await fetch("/api/v1/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: "Registration failed" }));
+    throw new Error(body.detail ?? "Registration failed");
+  }
+
+  const { access_token } = (await response.json()) as { access_token: string };
+  localStorage.setItem(TOKEN_KEY, access_token);
+}
+
 export function logout(): void {
   localStorage.removeItem(TOKEN_KEY);
 }
