@@ -359,7 +359,11 @@ async def _deploy_nextjs_app(
         "pm2 show \"$APP_NAME\" 2>/dev/null || true\n"
     )
 
-    # Base64-encode the script to avoid quoting issues in the outer shell
+    # Base64-encode the script to avoid quoting issues in the outer shell.
+    # Safety note: the "| bash" pattern is blocked for *user-supplied* commands
+    # (see _BLOCKED_PATTERNS). Here it is safe because the entire script content
+    # is constructed by this function from validated, server-side constants — no
+    # user-controlled data is ever passed through the pipe unescaped.
     script_b64 = base64.b64encode(deploy_script.encode()).decode()
     # Give deployment at least 10 minutes regardless of caller timeout
     deploy_timeout = max(timeout, 600)
