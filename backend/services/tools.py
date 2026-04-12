@@ -5,7 +5,7 @@ All tools execute REAL operations on remote servers via SSH.
 Nothing is simulated or faked.
 
 Every tool function signature:
-    async def <name>(*, server, args, allow_write, timeout) -> tuple[str, str, int]
+    async def <name>(*, server, args, workspace_path, allow_write, timeout) -> tuple[str, str, int]
     returns (stdout, stderr, exit_code)
 """
 
@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import re
+import shlex
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,6 +28,8 @@ from models.agent import StepResult, ToolName
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
+
+OutputChunkCallback = Callable[[int, str, str, str], Awaitable[None] | None]
 
 # ---------------------------------------------------------------------------
 # Safety constants
@@ -49,6 +54,20 @@ _BLOCKED_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\binit\s+[06]\b", flags=re.IGNORECASE),
     re.compile(r"curl\s+[^\s]+\s*\|", flags=re.IGNORECASE),
     re.compile(r"wget\s+[^\s]+\s*\|", flags=re.IGNORECASE),
+]
+
+_BLOCKED_LOCAL_PATHS: tuple[str, ...] = (
+    "/home/root/workspaces",
+    "/root/thinksync",
+    "/tmp",
+)
+
+_BLOCKED_SCAFFOLDING_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bgit\s+init\b", flags=re.IGNORECASE),
+    re.compile(r"\bnpm\s+create\b", flags=re.IGNORECASE),
+    re.compile(r"\bnpx\s+create-[^\s]+\b", flags=re.IGNORECASE),
+    re.compile(r"\bcreate-next-app\b", flags=re.IGNORECASE),
+    re.compile(r"\bcargo\s+new\b", flags=re.IGNORECASE),
 ]
 
 _READ_ONLY_PREFIXES: tuple[str, ...] = (
@@ -77,21 +96,73 @@ def _is_dangerous(command: str) -> bool:
     return False
 
 
+def _guard_error(*, code: str, message: str, blocked_value: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": code,
+            "message": message,
+            "blocked_value": blocked_value,
+        },
+    )
+
+
 def _validate_command(command: str, allow_write: bool) -> None:
-    if _is_dangerous(command):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Rejected dangerous command: {command!r}",
+    lowered = command.strip().lower()
+
+    # Path restrictions
+    for path in _BLOCKED_LOCAL_PATHS:
+        if path in lowered:
+            raise _guard_error(
+                code="local_path_blocked",
+                message=f"Access to {path} is blocked.",
+                blocked_value=command,
+            )
+
+    # Shell pipe restrictions
+    if re.search(r"curl\b.*\|\s*(bash|sh)\b", lowered, flags=re.IGNORECASE):
+        raise _guard_error(
+            code="unsafe_pipe_blocked",
+            message="Piping curl to bash/sh is blocked.",
+            blocked_value=command,
         )
+
+    if re.search(r"wget\b.*\|\s*(bash|sh)\b", lowered, flags=re.IGNORECASE):
+        raise _guard_error(
+            code="unsafe_pipe_blocked",
+            message="Piping wget to bash/sh is blocked.",
+            blocked_value=command,
+        )
+
+    # Git clone restriction
+    if "git clone" in lowered and not allow_write:
+        raise _guard_error(
+            code="git_clone_blocked",
+            message="git clone requires explicit write permission.",
+            blocked_value=command,
+        )
+
+    for pattern in _BLOCKED_SCAFFOLDING_PATTERNS:
+        if pattern.search(command):
+            raise _guard_error(
+                code="project_scaffolding_blocked",
+                message="Project scaffolding commands are not allowed.",
+                blocked_value=command,
+            )
+
+    if _is_dangerous(command):
+        raise _guard_error(
+            code="dangerous_command_blocked",
+            message="Rejected dangerous command.",
+            blocked_value=command,
+        )
+
     if not allow_write:
-        lowered = command.strip().lower()
         if not any(lowered.startswith(p) for p in _READ_ONLY_PREFIXES):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Command not allowed in read-only mode: {command!r}. "
-                    "Set allow_write=true or use a safe read-only command."
-                ),
+            raise _guard_error(
+                code="read_only_command_blocked",
+                message="Command is not allowed in read-only mode. Set allow_write=true or use a safe diagnostic command.",
+                blocked_value=command,
             )
 
 
@@ -125,6 +196,39 @@ def _sanitize_app_name(raw: str) -> str:
     return cleaned[:40] or "ts-app"
 
 
+def _truncate_for_log(value: str, limit: int = 800) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated>"
+
+
+def _log_ssh_execution(tool_name: str, command: str) -> None:
+    logger.info("[tools] SSH execute | tool=%s | command=%r", tool_name, command)
+
+
+def _log_ssh_result(tool_name: str, exit_code: int, output: str) -> None:
+    logger.info(
+        "[tools] SSH result | tool=%s | exit_code=%s | output=%r",
+        tool_name,
+        exit_code,
+        _truncate_for_log(output),
+    )
+
+
+def _scope_workspace_command(*, workspace_path: str, command: str) -> str:
+    cleaned = (workspace_path or "").strip()
+    if not cleaned or ".." in cleaned or "\n" in cleaned or "\r" in cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_workspace_path", "message": "Invalid workspace path"},
+        )
+    if not cleaned.startswith("/home/root/workspaces/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_workspace_path", "message": "Workspace path must be under /home/root/workspaces"},
+        )
+    return f"cd {shlex.quote(cleaned)} && {command}"
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -134,14 +238,28 @@ async def _run_command(
     *,
     server: dict[str, Any],
     args: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> tuple[str, str, int]:
     command: str = args.get("command", "").strip()
     if not command:
         return "", "run_command: 'command' argument is required", 1
     _validate_command(command, allow_write=allow_write)
-    resp = await SSHService.execute(server=server, command=command, command_timeout=timeout)
+    scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=command)
+    _log_ssh_execution(ToolName.RUN_COMMAND.value, scoped_command)
+    resp = await SSHService.execute(
+        server=server,
+        command=scoped_command,
+        command_timeout=timeout,
+        on_output_chunk=(
+            None if on_output_chunk is None else
+            lambda stream, chunk: on_output_chunk(step_number, ToolName.RUN_COMMAND.value, stream, chunk)
+        ),
+    )
+    _log_ssh_result(ToolName.RUN_COMMAND.value, resp.exit_code, resp.output)
     if resp.exit_code == 0:
         return resp.output, "", 0
     return "", resp.output, resp.exit_code
@@ -151,30 +269,65 @@ async def _check_disk(
     *,
     server: dict[str, Any],
     args: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> tuple[str, str, int]:
-    resp = await SSHService.execute(server=server, command="df -h", command_timeout=timeout)
-    return resp.output, "", resp.exit_code
+    command = _scope_workspace_command(workspace_path=workspace_path, command="df -h")
+    _log_ssh_execution(ToolName.CHECK_DISK.value, command)
+    resp = await SSHService.execute(
+        server=server,
+        command=command,
+        command_timeout=timeout,
+        on_output_chunk=(
+            None if on_output_chunk is None else
+            lambda stream, chunk: on_output_chunk(step_number, ToolName.CHECK_DISK.value, stream, chunk)
+        ),
+    )
+    _log_ssh_result(ToolName.CHECK_DISK.value, resp.exit_code, resp.output)
+    if resp.exit_code == 0:
+        return resp.output, "", 0
+    return "", resp.output, resp.exit_code
 
 
 async def _check_memory(
     *,
     server: dict[str, Any],
     args: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> tuple[str, str, int]:
-    resp = await SSHService.execute(server=server, command="free -m", command_timeout=timeout)
-    return resp.output, "", resp.exit_code
+    command = _scope_workspace_command(workspace_path=workspace_path, command="free -m")
+    _log_ssh_execution(ToolName.CHECK_MEMORY.value, command)
+    resp = await SSHService.execute(
+        server=server,
+        command=command,
+        command_timeout=timeout,
+        on_output_chunk=(
+            None if on_output_chunk is None else
+            lambda stream, chunk: on_output_chunk(step_number, ToolName.CHECK_MEMORY.value, stream, chunk)
+        ),
+    )
+    _log_ssh_result(ToolName.CHECK_MEMORY.value, resp.exit_code, resp.output)
+    if resp.exit_code == 0:
+        return resp.output, "", 0
+    return "", resp.output, resp.exit_code
 
 
 async def _read_logs(
     *,
     server: dict[str, Any],
     args: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> tuple[str, str, int]:
     service_name: str = args.get("service_name", "").strip()
     lines: int = max(1, min(int(args.get("lines", 100)), 1000))
@@ -184,14 +337,29 @@ async def _read_logs(
 
     if service_name.startswith("/"):
         # Absolute path — read file directly
-        if _is_dangerous(f"tail -n {lines} {service_name}"):
-            return "", f"Rejected dangerous log path: {service_name!r}", 1
+        candidate = f"tail -n {lines} {service_name}"
+        try:
+            _validate_command(candidate, allow_write=False)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            return "", json.dumps(detail), 1
         command = f"tail -n {lines} {service_name}"
     else:
         _validate_service_name(service_name)
         command = f"journalctl -u {service_name} -n {lines} --no-pager"
 
-    resp = await SSHService.execute(server=server, command=command, command_timeout=timeout)
+    scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=command)
+    _log_ssh_execution(ToolName.READ_LOGS.value, scoped_command)
+    resp = await SSHService.execute(
+        server=server,
+        command=scoped_command,
+        command_timeout=timeout,
+        on_output_chunk=(
+            None if on_output_chunk is None else
+            lambda stream, chunk: on_output_chunk(step_number, ToolName.READ_LOGS.value, stream, chunk)
+        ),
+    )
+    _log_ssh_result(ToolName.READ_LOGS.value, resp.exit_code, resp.output)
     if resp.exit_code == 0:
         return resp.output, "", 0
     return "", resp.output, resp.exit_code
@@ -201,8 +369,11 @@ async def _restart_service(
     *,
     server: dict[str, Any],
     args: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> tuple[str, str, int]:
     if not allow_write:
         return "", "restart_service requires allow_write=true.", 1
@@ -213,7 +384,18 @@ async def _restart_service(
 
     _validate_service_name(service_name)
     command = f"systemctl restart {service_name}"
-    resp = await SSHService.execute(server=server, command=command, command_timeout=timeout)
+    scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=command)
+    _log_ssh_execution(ToolName.RESTART_SERVICE.value, scoped_command)
+    resp = await SSHService.execute(
+        server=server,
+        command=scoped_command,
+        command_timeout=timeout,
+        on_output_chunk=(
+            None if on_output_chunk is None else
+            lambda stream, chunk: on_output_chunk(step_number, ToolName.RESTART_SERVICE.value, stream, chunk)
+        ),
+    )
+    _log_ssh_result(ToolName.RESTART_SERVICE.value, resp.exit_code, resp.output)
     if resp.exit_code == 0:
         return f"Service '{service_name}' restarted successfully.", "", 0
     return "", resp.output, resp.exit_code
@@ -223,8 +405,11 @@ async def _deploy_app(
     *,
     server: dict[str, Any],
     args: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> tuple[str, str, int]:
     """Legacy deploy_app tool — runs a deploy command via SSH."""
     if not allow_write:
@@ -237,7 +422,18 @@ async def _deploy_app(
         return "", "deploy_app: 'app_name' and 'deploy_command' are required", 1
 
     _validate_command(deploy_command, allow_write=True)
-    resp = await SSHService.execute(server=server, command=deploy_command, command_timeout=timeout)
+    scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=deploy_command)
+    _log_ssh_execution(ToolName.DEPLOY_APP.value, scoped_command)
+    resp = await SSHService.execute(
+        server=server,
+        command=scoped_command,
+        command_timeout=timeout,
+        on_output_chunk=(
+            None if on_output_chunk is None else
+            lambda stream, chunk: on_output_chunk(step_number, ToolName.DEPLOY_APP.value, stream, chunk)
+        ),
+    )
+    _log_ssh_result(ToolName.DEPLOY_APP.value, resp.exit_code, resp.output)
     if resp.exit_code == 0:
         return resp.output, "", 0
     return "", resp.output, resp.exit_code
@@ -247,136 +443,17 @@ async def _deploy_nextjs_app(
     *,
     server: dict[str, Any],
     args: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> tuple[str, str, int]:
-    """
-    Full Next.js deployment pipeline on the remote server:
-      1. Ensure Node.js (LTS) and pm2 are installed
-      2. Clone or update the repository
-      3. npm ci / npm install
-      4. npm run build  (NODE_ENV=production)
-      5. Start / restart via pm2 on the specified port
-      6. Return the public URL
-    """
-    if not allow_write:
-        return "", "deploy_nextjs_app requires allow_write=true.", 1
-
-    repo_url: str = args.get("repo_url", "").strip()
-    branch: str = args.get("branch", "main").strip()
-    port: int = int(args.get("port", 3000))
-    raw_name = args.get("app_name", f"ts-{port}").strip()
-    app_name = _sanitize_app_name(raw_name)
-
-    if not repo_url:
-        return "", "deploy_nextjs_app: 'repo_url' is required", 1
-
-    _validate_repo_url(repo_url)
-    _validate_port(port)
-
-    if not re.match(r"^[a-zA-Z0-9_.\\-/]+$", branch):
-        return "", f"Invalid branch name: {branch!r}", 1
-
-    # Build a self-contained bash script.
-    # We base64-encode it so that special characters in any of the
-    # user-supplied values (repo_url, branch, app_name) cannot break
-    # the outer shell invocation.
-    deploy_script = (
-        "#!/bin/bash\n"
-        "set -euo pipefail\n"
-        "\n"
-        f"REPO_URL='{repo_url}'\n"
-        f"BRANCH='{branch}'\n"
-        f"PORT={port}\n"
-        f"APP_NAME='{app_name}'\n"
-        "APPS_DIR='/opt/thinksync-apps'\n"
-        "APP_DIR=\"$APPS_DIR/$APP_NAME\"\n"
-        "\n"
-        "echo '=== ThinkSync: Next.js Deployment ==='\n"
-        "echo \"Repo   : $REPO_URL\"\n"
-        "echo \"Branch : $BRANCH\"\n"
-        "echo \"Port   : $PORT\"\n"
-        "echo \"Name   : $APP_NAME\"\n"
-        "\n"
-        "# Ensure apps directory exists\n"
-        "mkdir -p \"$APPS_DIR\"\n"
-        "\n"
-        "# --- Install Node.js (LTS) if missing ---\n"
-        "if ! command -v node >/dev/null 2>&1; then\n"
-        "    echo '--- Installing Node.js LTS ---'\n"
-        "    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -\n"
-        "    apt-get install -y nodejs\n"
-        "fi\n"
-        "echo \"Node: $(node --version)  npm: $(npm --version)\"\n"
-        "\n"
-        "# --- Install pm2 globally if missing ---\n"
-        "if ! command -v pm2 >/dev/null 2>&1; then\n"
-        "    echo '--- Installing pm2 ---'\n"
-        "    npm install -g pm2\n"
-        "fi\n"
-        "\n"
-        "# --- Stop existing pm2 process (ignore errors) ---\n"
-        "pm2 stop \"$APP_NAME\" 2>/dev/null || true\n"
-        "pm2 delete \"$APP_NAME\" 2>/dev/null || true\n"
-        "\n"
-        "# --- Clone or pull latest code ---\n"
-        "if [ -d \"$APP_DIR/.git\" ]; then\n"
-        "    echo '--- Updating existing repository ---'\n"
-        "    cd \"$APP_DIR\"\n"
-        "    git fetch origin\n"
-        "    git checkout \"$BRANCH\"\n"
-        "    git reset --hard \"origin/$BRANCH\"\n"
-        "else\n"
-        "    echo '--- Cloning repository ---'\n"
-        "    rm -rf \"$APP_DIR\"\n"
-        "    git clone --branch \"$BRANCH\" --depth 1 \"$REPO_URL\" \"$APP_DIR\"\n"
-        "    cd \"$APP_DIR\"\n"
-        "fi\n"
-        "\n"
-        "# --- Install dependencies ---\n"
-        "echo '--- Installing dependencies ---'\n"
-        "if [ -f package-lock.json ]; then\n"
-        "    npm ci\n"
-        "else\n"
-        "    npm install\n"
-        "fi\n"
-        "\n"
-        "# --- Build production bundle ---\n"
-        "echo '--- Building Next.js app ---'\n"
-        "NODE_ENV=production npm run build\n"
-        "\n"
-        "# --- Start app with pm2 ---\n"
-        "echo '--- Starting app with pm2 ---'\n"
-        "PORT=$PORT pm2 start npm --name \"$APP_NAME\" -- start\n"
-        "pm2 save\n"
-        "\n"
-        "# --- Report result ---\n"
-        "SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || hostname)\n"
-        "echo ''\n"
-        "echo '=== Deployment successful ==='\n"
-        "echo \"App URL : http://$SERVER_IP:$PORT\"\n"
-        "echo \"pm2 name: $APP_NAME\"\n"
-        "pm2 show \"$APP_NAME\" 2>/dev/null || true\n"
-    )
-
-    # Base64-encode the script to avoid quoting issues in the outer shell.
-    # Safety note: the "| bash" pattern is blocked for *user-supplied* commands
-    # (see _BLOCKED_PATTERNS). Here it is safe because the entire script content
-    # is constructed by this function from validated, server-side constants — no
-    # user-controlled data is ever passed through the pipe unescaped.
-    script_b64 = base64.b64encode(deploy_script.encode()).decode()
-    # Give deployment at least 10 minutes regardless of caller timeout
-    deploy_timeout = max(timeout, 600)
-    command = f"echo '{script_b64}' | base64 -d | bash"
-
-    resp = await SSHService.execute(
-        server=server,
-        command=command,
-        command_timeout=deploy_timeout,
-    )
-    if resp.exit_code == 0:
-        return resp.output, "", 0
-    return "", resp.output, resp.exit_code
+    return "", json.dumps({
+        "code": "tool_disabled",
+        "message": "deploy_nextjs_app is disabled. Use deploy_app with an explicit remote-safe deploy command.",
+        "blocked_value": ToolName.DEPLOY_NEXTJS_APP.value,
+    }), 1
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +476,11 @@ async def execute_tool(
     tool_name: str,
     args: dict[str, Any],
     server: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     timeout: int,
     step_number: int = 0,
+    on_output_chunk: OutputChunkCallback | None = None,
 ) -> StepResult:
     """
     Dispatch a named tool call to its implementation and return a StepResult.
@@ -437,20 +516,48 @@ async def execute_tool(
         )
 
     start = time.monotonic()
+    logger.info(
+        "[tools] dispatch | step=%s | tool=%s | args=%s | allow_write=%s | timeout=%s | execution_path=execute_tool->SSHService.execute",
+        step_number,
+        tool.value,
+        args,
+        allow_write,
+        timeout,
+    )
     try:
         stdout, stderr, exit_code = await asyncio.wait_for(
-            fn(server=server, args=args, allow_write=allow_write, timeout=timeout),
+            fn(
+                server=server,
+                args=args,
+                workspace_path=workspace_path,
+                allow_write=allow_write,
+                timeout=timeout,
+                step_number=step_number,
+                on_output_chunk=on_output_chunk,
+            ),
             timeout=timeout + 30,
         )
     except asyncio.TimeoutError:
         stdout, stderr, exit_code = "", f"Tool '{tool_name}' timed out after {timeout}s", 124
     except HTTPException as exc:
-        stdout, stderr, exit_code = "", str(exc.detail), 1
+        detail = exc.detail if isinstance(exc.detail, dict) else {
+            "code": "tool_execution_blocked",
+            "message": str(exc.detail),
+        }
+        stdout, stderr, exit_code = "", json.dumps(detail), 1
     except Exception as exc:
         logger.exception("Unexpected error in tool '%s': %s", tool_name, exc)
         stdout, stderr, exit_code = "", f"Internal tool error: {exc}", 1
 
     duration_ms = int((time.monotonic() - start) * 1000)
+    logger.info(
+        "[tools] tool result | step=%s | tool=%s | exit_code=%s | stdout=%r | stderr=%r",
+        step_number,
+        tool.value,
+        exit_code,
+        _truncate_for_log(stdout),
+        _truncate_for_log(stderr, 400),
+    )
     return StepResult(
         step=step_number,
         tool=tool,
@@ -641,9 +748,13 @@ _WRITE_ONLY_TOOLS: frozenset[str] = frozenset(
 
 def get_tool_definitions(allow_write: bool) -> list[dict[str, Any]]:
     """Return OpenAI tool definitions filtered by the caller's write permission."""
-    if allow_write:
-        return OPENAI_TOOL_DEFINITIONS
-    return [
+    filtered = [
         td for td in OPENAI_TOOL_DEFINITIONS
+        if td["function"]["name"] != ToolName.DEPLOY_NEXTJS_APP
+    ]
+    if allow_write:
+        return filtered
+    return [
+        td for td in filtered
         if td["function"]["name"] not in _WRITE_ONLY_TOOLS
     ]

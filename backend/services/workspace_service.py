@@ -1,4 +1,3 @@
-import re
 import shlex
 from datetime import datetime, timezone
 from typing import Any
@@ -15,7 +14,7 @@ from services.ssh_service import SSHService
 
 
 class WorkspaceService:
-    _SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9-]+")
+    _MAX_UNIQUE_ATTEMPTS = 50
 
     @staticmethod
     def _api_error_code(exc: APIError) -> str:
@@ -37,59 +36,43 @@ class WorkspaceService:
             UUID(value)
         except ValueError:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid {field_name} format",
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "WORKSPACE_NOT_FOUND"},
             )
 
     @staticmethod
-    def _slugify_workspace_name(name: str) -> str:
-        normalized = name.strip().lower().replace("_", "-")
-        normalized = WorkspaceService._SAFE_NAME_PATTERN.sub("-", normalized)
-        normalized = normalized.strip("-")
-        return normalized or "workspace"
+    def _workspace_path(slug: str) -> str:
+        # Deterministic project root for all workspaces.
+        return f"/home/root/workspaces/{slug}"
 
     @staticmethod
-    def _safe_workspace_path(username: str, workspace_id: str, workspace_name: str) -> str:
-        safe_username = username.strip()
-        if not safe_username or "/" in safe_username or ".." in safe_username:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid server SSH user",
+    def _unique_slug(*, supabase, server_id: str, base_slug: str) -> str:
+        base = (base_slug or "").strip().lower()
+        if not base:
+            base = "workspace"
+
+        def exists(candidate: str) -> bool:
+            result = (
+                supabase.table("workspaces")
+                .select("id")
+                .eq("server_id", server_id)
+                .eq("slug", candidate)
+                .limit(1)
+                .execute()
             )
+            return bool(result.data)
 
-        slug = WorkspaceService._slugify_workspace_name(workspace_name)
-        path = f"/home/{safe_username}/workspaces/{workspace_id}-{slug}"
+        if not exists(base):
+            return base
 
-        # Guard against path traversal and enforce expected root.
-        if ".." in path or not path.startswith(f"/home/{safe_username}/workspaces/"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace path",
-            )
-
-        return path
-
-    @staticmethod
-    def _get_unique_slug(supabase, max_retries: int = 5) -> str:
-        """Generate a unique slug with collision handling."""
-        for attempt in range(max_retries):
-            slug = SlugService.generate_slug("workspace")
-            try:
-                result = (
-                    supabase.table("workspaces")
-                    .select("id")
-                    .eq("slug", slug)
-                    .limit(1)
-                    .execute()
-                )
-                if not result.data:
-                    return slug
-            except APIError:
-                pass
+        for i in range(2, WorkspaceService._MAX_UNIQUE_ATTEMPTS + 1):
+            candidate = f"{base}-{i}"
+            if not exists(candidate):
+                return candidate
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate unique workspace identifier",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Workspace slug already exists on this server",
         )
 
     @staticmethod
@@ -105,40 +88,16 @@ class WorkspaceService:
             )
 
         server = ServerService.get_server(server_id=server_id, user_id=user_id)
+        supabase = get_supabase()
 
         workspace_id = str(uuid4())
-        workspace_path = WorkspaceService._safe_workspace_path(
-            username=server["ssh_user"],
-            workspace_id=workspace_id,
-            workspace_name=cleaned_name,
-        )
+        base_slug = SlugService.generate_slug(cleaned_name)
+        slug = WorkspaceService._unique_slug(supabase=supabase, server_id=server_id, base_slug=base_slug)
+        domain = SlugService.generate_domain(slug=slug, workspace_id=workspace_id)
+        workspace_path = WorkspaceService._workspace_path(slug)
 
         mkdir_command = f"mkdir -p {shlex.quote(workspace_path)}"
         await SSHService.execute(server=server, command=mkdir_command)
-
-        supabase = get_supabase()
-
-        # Generate unique slug and domain.
-        slug = SlugService.generate_slug(cleaned_name)
-        domain = SlugService.generate_domain(slug)
-
-        # Verify slug uniqueness
-        for attempt in range(5):
-            try:
-                check_result = (
-                    supabase.table("workspaces")
-                    .select("id")
-                    .eq("slug", slug)
-                    .limit(1)
-                    .execute()
-                )
-                if check_result.data:
-                    slug = SlugService.generate_slug(cleaned_name)
-                    domain = SlugService.generate_domain(slug)
-                    continue
-                break
-            except APIError:
-                pass
 
         record = {
             "id": workspace_id,
@@ -158,7 +117,7 @@ class WorkspaceService:
             if code == "23505":
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="Slug or domain collision — please try again",
+                    detail="Workspace slug already exists on this server",
                 )
             if code == "23503":
                 raise HTTPException(
@@ -200,10 +159,17 @@ class WorkspaceService:
             query = query.eq("server_id", server_id)
 
         result = query.execute()
-        return [WorkspaceResponse(**row) for row in result.data]
+        rows = result.data or []
+        hydrated: list[WorkspaceResponse] = []
+        for row in rows:
+            repaired = WorkspaceService._ensure_workspace_fields(dict(row), supabase=supabase, user_id=user_id)
+            hydrated.append(WorkspaceResponse(**repaired))
+        return hydrated
 
     @staticmethod
     def get_workspace_by_id(id: str, user_id: str) -> dict[str, Any]:
+        if not isinstance(id, str) or not id.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "WORKSPACE_REQUIRED"})
         WorkspaceService._validate_uuid(id, "workspace_id")
         WorkspaceService._validate_uuid(user_id, "user_id")
 
@@ -220,13 +186,56 @@ class WorkspaceService:
         except APIError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Workspace not found",
+                detail={"code": "WORKSPACE_NOT_FOUND"},
             )
 
         if not result or not result.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Workspace not found",
+                detail={"code": "WORKSPACE_NOT_FOUND"},
             )
 
-        return result.data
+        row = dict(result.data)
+        return WorkspaceService._ensure_workspace_fields(row, supabase=supabase, user_id=user_id)
+
+    @staticmethod
+    def _ensure_workspace_fields(
+        row: dict[str, Any],
+        *,
+        supabase,
+        user_id: str,
+    ) -> dict[str, Any]:
+        slug = (row.get("slug") or "").strip()
+        domain = (row.get("domain") or "").strip()
+        path = (row.get("path") or "").strip()
+
+        if slug and domain and path:
+            return row
+
+        server_id = str(row.get("server_id") or "")
+        workspace_id = str(row.get("id") or "")
+        name = str(row.get("name") or "workspace")
+
+        patch: dict[str, Any] = {}
+        if not slug:
+            base_slug = SlugService.generate_slug(name)
+            slug = WorkspaceService._unique_slug(supabase=supabase, server_id=server_id, base_slug=base_slug)
+            patch["slug"] = slug
+
+        if not domain:
+            domain = SlugService.generate_domain(slug=slug, workspace_id=workspace_id)
+            patch["domain"] = domain
+
+        if not path:
+            path = WorkspaceService._workspace_path(slug)
+            patch["path"] = path
+
+        if patch:
+            try:
+                supabase.table("workspaces").update(patch).eq("id", workspace_id).execute()
+            except Exception:
+                # Do not block reads; caller still gets a consistent view.
+                pass
+            row.update(patch)
+
+        return row

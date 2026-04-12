@@ -13,15 +13,22 @@ def _get_fernet() -> Fernet:
     settings = get_settings()
     configured_key = (settings.DATA_ENCRYPTION_KEY or "").strip()
 
+    # Fernet keys must be 32 urlsafe-base64-encoded bytes (typically 44 chars).
+    # In production, operators sometimes provide an arbitrary secret string.
+    # To keep the system usable (and deterministic), accept either:
+    # - a valid Fernet key (used as-is), or
+    # - any string (derived via SHA-256 -> urlsafe b64) as the effective Fernet key.
     if configured_key:
-        key = configured_key.encode("utf-8")
-    else:
-        # Backward-compatible fallback if no dedicated key is configured.
-        digest = hashlib.sha256(settings.JWT_SECRET.encode("utf-8")).digest()
-        key = base64.urlsafe_b64encode(digest)
+        try:
+            return Fernet(configured_key.encode("utf-8"))
+        except Exception:
+            digest = hashlib.sha256(configured_key.encode("utf-8")).digest()
+            return Fernet(base64.urlsafe_b64encode(digest))
 
+    # Backward-compatible fallback if no dedicated key is configured.
+    digest = hashlib.sha256(settings.JWT_SECRET.encode("utf-8")).digest()
     try:
-        return Fernet(key)
+        return Fernet(base64.urlsafe_b64encode(digest))
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -2,7 +2,7 @@ import asyncio
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 
 from core.security import get_current_user
 from models.agent import (
@@ -18,8 +18,11 @@ from models.agent import (
     ForgeV2PlanResponse,
     ForgeV2RunRequest,
 )
+from models.job import JobCreate
+from services.agent_service import AgentService, to_forge_v2_response
 from services.emergent_agent_service import EmergentE1Service
 from services.forge_v2 import ForgeV2Service
+from services.workspace_service import WorkspaceService
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -31,7 +34,10 @@ async def run_forge_v1(
     payload: AgentRunRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentRunResponse:
-    return await EmergentE1Service.run(payload=payload, current_user=current_user)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="forge-v1 is disabled. Use the unified forge-v2 pipeline.",
+    )
 
 
 @router.post("/forge-v1/orchestrate", response_model=AgentOrchestrationResponse)
@@ -39,7 +45,10 @@ async def orchestrate_forge_v1(
     payload: AgentOrchestrationRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentOrchestrationResponse:
-    return await EmergentE1Service.orchestrate(payload=payload, current_user=current_user)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="forge-v1 orchestration is disabled. Use the unified forge-v2 pipeline.",
+    )
 
 
 # ── Forge v1 async job queue endpoints ───────────────────────────────────────
@@ -49,8 +58,10 @@ async def forge_plan(
     payload: AgentRunRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentPlanResponse:
-    """Return an execution plan without connecting to any server (instant)."""
-    return await EmergentE1Service.get_plan(payload=payload, current_user=current_user)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="forge-v1 planning is disabled. Use /agents/forge-v2/plan.",
+    )
 
 
 @router.post("/forge/run", response_model=AgentAsyncRunAccepted, status_code=202)
@@ -59,11 +70,10 @@ async def forge_run_async(
     background_tasks: BackgroundTasks,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentAsyncRunAccepted:
-    """Queue the agent job and return immediately. Poll /forge/jobs/{job_id} for results."""
-    job_id = str(uuid4())
-    EmergentE1Service.submit_job(job_id)
-    background_tasks.add_task(EmergentE1Service._run_job, job_id, payload, current_user)
-    return AgentAsyncRunAccepted(job_id=job_id)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="forge-v1 async jobs are disabled. Use the unified forge-v2 pipeline.",
+    )
 
 
 @router.get("/forge/jobs/{job_id}", response_model=AgentJobResponse)
@@ -71,8 +81,10 @@ async def forge_job_status(
     job_id: str,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentJobResponse:
-    """Poll job status and retrieve results once completed."""
-    return EmergentE1Service.get_job_status(job_id=job_id)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="forge-v1 async jobs are disabled. Use the unified forge-v2 pipeline.",
+    )
 
 
 # ── Forge v2 endpoints ───────────────────────────────────────────────────────
@@ -93,10 +105,37 @@ async def forge_v2_run_async(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> ForgeV2JobResponse:
     """Queue a Forge v2 agent job. Poll /forge-v2/jobs/{job_id} for results."""
-    job_id = str(uuid4())
-    ForgeV2Service.submit_job(job_id)
-    background_tasks.add_task(ForgeV2Service.run_async, job_id, payload, current_user)
-    return ForgeV2JobResponse(job_id=job_id, status=AgentJobStatus.QUEUED)
+    user_id: str = current_user["sub"]
+    user_email = str(current_user.get("email", ""))
+    ForgeV2Service._check_write_permission(user_email, payload)
+    if payload.dry_run:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="dry_run is disabled for the production execution pipeline.",
+        )
+    if not payload.workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "WORKSPACE_REQUIRED"},
+        )
+
+    job_payload = JobCreate(
+        workspace_id=payload.workspace_id,
+        server_id=payload.server_id,
+        objective=payload.objective,
+        max_steps=payload.max_steps,
+        allow_write=payload.allow_write,
+        dry_run=False,
+        step_timeout_seconds=payload.step_timeout_seconds,
+    )
+    accepted = AgentService.submit_job(user_id=user_id, payload=job_payload)
+    background_tasks.add_task(AgentService.run_job, accepted.id, job_payload, user_id)
+    return {
+        "job_id": accepted.id,
+        "status": AgentJobStatus.QUEUED.value,
+        "run": None,
+        "error": None,
+    }
 
 
 @router.get("/forge-v2/jobs/{job_id}", response_model=ForgeV2JobResponse)
@@ -105,40 +144,16 @@ async def forge_v2_job_status(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> ForgeV2JobResponse:
     """Poll Forge v2 job status and retrieve results once completed."""
-    return ForgeV2Service.get_job_status(job_id=job_id)
+    job = AgentService.get_job(job_id=job_id, user_id=current_user["sub"])
+    if not job.workspace_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "WORKSPACE_REQUIRED"})
+    WorkspaceService.get_workspace_by_id(id=job.workspace_id, user_id=current_user["sub"])
+    return to_forge_v2_response(job)
 
 
 @router.websocket("/forge-v2/ws/{job_id}")
 async def forge_v2_ws(job_id: str, websocket: WebSocket) -> None:
-    """WebSocket endpoint for real-time Forge v2 job progress streaming.
-
-    Clients connect after submitting a job via POST /forge-v2/run.
-    Events are JSON objects: {"type": "...", ...}
-    Connection closes automatically when a "completed" or "error" event is received.
-    """
-    await websocket.accept()
-    try:
-        events_queue = ForgeV2Service.get_events_queue(job_id)
-    except Exception:
-        await websocket.close(code=1008)
-        return
-
-    try:
-        while True:
-            try:
-                event = await asyncio.wait_for(events_queue.get(), timeout=60.0)
-            except asyncio.TimeoutError:
-                await websocket.send_json({"type": "ping"})
-                continue
-
-            await websocket.send_json(event)
-
-            if event.get("type") in ("completed", "error", "abort"):
-                break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await websocket.close()
+    await websocket.close(code=1008)
 
 
 # ── Legacy alias (hidden from docs) ──────────────────────────────────────
@@ -148,4 +163,7 @@ async def run_emergent_e1_legacy(
     payload: AgentRunRequest,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentRunResponse:
-    return await EmergentE1Service.run(payload=payload, current_user=current_user)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="e1 is disabled. Use the unified forge-v2 pipeline.",
+    )

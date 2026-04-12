@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_ANON_KEY: str
     SUPABASE_SERVICE_ROLE_KEY: str
-
+    
     # JWT
     JWT_SECRET: str
     JWT_ALGORITHM: str = "HS256"
@@ -56,6 +56,10 @@ class Settings(BaseSettings):
 
     # Redis (Upstash) — optional; used by Forge v2 for LLM response caching
     REDIS_URL: str | None = None
+    REDIS_CHAT_MEMORY_TTL_SECONDS: int = 60 * 60 * 24
+    REDIS_CHAT_MEMORY_MAX_ITEMS: int = 50
+    REDIS_JOB_EVENT_TTL_SECONDS: int = 60 * 60 * 6
+    REDIS_JOB_EVENT_MAX_ITEMS: int = 1000
 
     # OpenAI
     OPENAI_API_KEY: str | None = None

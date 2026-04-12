@@ -183,7 +183,7 @@ async def _chat_json(
             model=settings.OPENAI_MODEL,
             messages=messages,  # type: ignore[arg-type]
             response_format={"type": "json_object"},
-            temperature=0.2,
+            temperature=0.0,
         )
     except Exception as exc:
         logger.error("OpenAI call failed: %s", exc)
@@ -218,8 +218,9 @@ async def _chat_json(
 # ---------------------------------------------------------------------------
 
 _PLAN_SYSTEM = """\
-You are Forge, a production-grade DevOps AI agent running inside ThinkSync.
-Your job is to translate a user objective into a safe, deterministic, step-by-step execution plan.
+You are Forge, ThinkSync's remote DevOps execution planner.
+You are NOT a coding assistant and NOT a project scaffolding agent.
+Your job is to translate a user objective into a safe, deterministic, remote-execution plan.
 
 ═══════════════════════════════════════════════════════
 AVAILABLE TOOLS  (you may ONLY use these — never raw shell)
@@ -245,11 +246,14 @@ PLANNING RULES
 7. If allow_write is false, exclude restart_service and deploy_app entirely.
 8. Produce the minimum number of steps needed; quality over quantity.
 9. If the objective is impossible or unsafe, return steps: [] and explain in context_summary.
+10. You are in an ongoing session. Consider previous chat context when the request is a follow-up.
 
 ═══════════════════════════════════════════════════════
 ABSOLUTE SAFETY RULES — NEVER VIOLATE
 ═══════════════════════════════════════════════════════
 These patterns are forbidden in any arg or command value:
+  ✗ Local filesystem paths such as /home/root/workspaces, /root/thinksync, /tmp, /workspace
+  ✗ Project scaffolding or repository creation: git clone, git init, npm create, npx create-*, create-next-app, cargo new
   ✗ rm -rf (any variant)
   ✗ mkfs, dd if=, shred, wipefs
   ✗ shutdown, reboot, poweroff, halt, init 0, init 6
@@ -734,79 +738,222 @@ async def revise_plan(
 # ReAct tool-calling loop  (PRIMARY AGENT LOOP)
 # ---------------------------------------------------------------------------
 
-_AGENT_SYSTEM_PROMPT = """\
-You are Forge, a production-grade AI DevOps execution agent running inside ThinkSync.
+_AGENT_SYSTEM_PROMPT = """You are a remote DevOps execution agent.
 
-═══════════════════════════════════════════════════════
-CRITICAL RULES — NEVER VIOLATE
-═══════════════════════════════════════════════════════
-1. You have NO local filesystem access. You CANNOT read or write files directly.
-2. You CANNOT execute commands yourself. You MUST call the provided tools.
-3. Every action on the server MUST go through a tool call. No exceptions.
-4. NEVER simulate, assume, or guess a command result. Always call the tool.
-5. NEVER use local paths like /home/root/workspaces, /tmp/local, or similar.
-6. All file paths must be paths on the REMOTE server.
-7. If the server_id is missing or the server is unreachable → stop immediately and explain.
+You MUST use tools
+You MUST execute at least one tool
+You CANNOT simulate results
+You CANNOT access local filesystem
+You MUST be minimal and direct
 
-═══════════════════════════════════════════════════════
-EXECUTION STRATEGY
-═══════════════════════════════════════════════════════
-1. Start with read-only diagnostics (check resources, inspect services, read logs).
-2. Execute write operations only after confirming the environment is ready.
-3. Verify every action's result before proceeding to the next step.
-4. If a step fails, analyse the stderr carefully and either retry or try an alternative.
-5. Prefer specialized tools (check_disk, read_logs, deploy_nextjs_app) over raw run_command.
-6. After completing all necessary actions, output a clear plain-text summary — do NOT call any more tools.
+If task is simple:→ execute minimal command
+If task is complex:→ proceed step-by-step"""
 
-═══════════════════════════════════════════════════════
-SAFETY — ABSOLUTELY FORBIDDEN
-═══════════════════════════════════════════════════════
-Never issue commands or tool calls that:
-  ✗ Delete data: rm -rf, shred, wipefs
-  ✗ Destroy storage: mkfs, dd if=, > /dev/sd*
-  ✗ Shut down the system: shutdown, reboot, poweroff, halt, init 0/6
-  ✗ Modify credentials: passwd, chpasswd, usermod
-  ✗ Pipe untrusted data to a shell: curl ... | bash, wget ... | sh
-  ✗ Escalate privileges dangerously: chmod 777 on system dirs
-  ✗ Modify system auth files: /etc/passwd, /etc/shadow, /etc/sudoers
+_SIMPLE_TASK_KEYWORDS = (
+    "check",
+    "status",
+    "disk",
+    "memory",
+    "ram",
+    "swap",
+    "cpu",
+    "uptime",
+    "logs",
+    "log",
+    "restart",
+    "run bot",
+)
 
-If the objective requires any of the above → explain why you cannot proceed and stop.
-"""
+_COMPLEX_TASK_KEYWORDS = (
+    "deploy",
+    "release",
+    "rollback",
+    "migrate",
+    "install",
+    "provision",
+    "configure",
+    "pipeline",
+    "orchestrate",
+    "multi-step",
+)
+
+
+def _truncate_for_log(value: str | None, limit: int = 4000) -> str:
+    if not value:
+        return ""
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated>"
+
+
+def _build_fallback_diagnostic_command(objective: str) -> str:
+    lowered = objective.lower()
+
+    if any(token in lowered for token in ("disk", "storage", "filesystem", "mount")):
+        return "df -h"
+    if any(token in lowered for token in ("memory", "ram", "swap")):
+        return "free -m"
+    if any(token in lowered for token in ("cpu", "load", "process", "processes")):
+        return "top -bn1 | head -n 20"
+    if any(token in lowered for token in ("docker", "container", "containers")):
+        return "docker ps -a"
+    if any(token in lowered for token in ("network", "port", "socket", "listen")):
+        return "ss -tulpn"
+    if any(token in lowered for token in ("log", "logs", "journal")):
+        return "journalctl -n 100 --no-pager"
+    if any(token in lowered for token in ("service", "status", "health", "uptime")):
+        return "hostname && uptime && df -h && free -m"
+    return "hostname && uptime && df -h && free -m"
+
+
+def _classify_task_mode(objective: str) -> str:
+    lowered = objective.lower()
+    if any(token in lowered for token in _COMPLEX_TASK_KEYWORDS):
+        return "complex"
+    if any(token in lowered for token in _SIMPLE_TASK_KEYWORDS):
+        return "simple"
+    return "complex"
+
+
+def _build_fallback_tool(objective: str) -> tuple[ToolName, dict[str, Any], str]:
+    lowered = objective.lower()
+    if any(token in lowered for token in ("disk", "storage", "filesystem", "mount")):
+        return ToolName.CHECK_DISK, {}, "Disk request maps directly to check_disk."
+    if any(token in lowered for token in ("memory", "ram", "swap")):
+        return ToolName.CHECK_MEMORY, {}, "Memory request maps directly to check_memory."
+    if any(token in lowered for token in ("log", "logs", "journal")):
+        return ToolName.RUN_COMMAND, {"command": "journalctl -n 100 --no-pager"}, "Use a safe log diagnostic."
+    return (
+        ToolName.RUN_COMMAND,
+        {"command": _build_fallback_diagnostic_command(objective)},
+        "Use a safe diagnostic fallback.",
+    )
+
+
+def _build_simple_plan(objective: str) -> list[AgentStep]:
+    tool, args, rationale = _build_fallback_tool(objective)
+    return [AgentStep(step=1, tool=tool, args=args, rationale=rationale)]
+
+
+def _build_complex_execution_messages(
+    *,
+    objective: str,
+    task_mode: str,
+    allow_write: bool,
+    server: dict[str, Any],
+    conversation_history: list[dict[str, str]] | None,
+    plan: list[AgentStep],
+) -> list[dict[str, Any]]:
+    server_info = {
+        "name": server.get("name"),
+        "host": server.get("host"),
+        "ssh_user": server.get("ssh_user"),
+    }
+    messages: list[dict[str, Any]] = [{"role": "system", "content": _AGENT_SYSTEM_PROMPT}]
+    for history_message in conversation_history or []:
+        role = history_message.get("role", "").strip()
+        content = history_message.get("content", "").strip()
+        if role in {"user", "assistant", "system"} and content:
+            messages.append({"role": role, "content": content})
+    messages.append(
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "objective": objective,
+                    "task_mode": task_mode,
+                    "allow_write": allow_write,
+                    "server": server_info,
+                    "plan": [step.model_dump(mode="json") for step in plan],
+                }
+            ),
+        }
+    )
+    return messages
+
+
+async def _request_executor_tool_call(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    messages: list[dict[str, Any]],
+    current_step: AgentStep,
+    tool_defs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    executor_messages = list(messages)
+    executor_messages.append(
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "instruction": "Execute exactly one tool call for the current step.",
+                    "step": current_step.model_dump(mode="json"),
+                }
+            ),
+        }
+    )
+    response = await client.chat.completions.create(
+        model=model,
+        messages=executor_messages,  # type: ignore[arg-type]
+        tools=tool_defs,  # type: ignore[arg-type]
+        tool_choice="required",
+        temperature=0.0,
+    )
+    return response.choices[0].message.model_dump(exclude_unset=True)
+
+
+async def _request_final_summary(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    objective: str,
+    results: list[StepResult],
+) -> str:
+    summary_payload = {
+        "objective": objective,
+        "results": [
+            {
+                "step": result.step,
+                "tool": result.tool.value,
+                "success": result.success,
+                "exit_code": result.exit_code,
+                "stdout": result.stdout[:1000],
+                "stderr": result.stderr[:500],
+            }
+            for result in results
+        ],
+    }
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(summary_payload)},
+            {
+                "role": "user",
+                "content": "Summarize only what the executed tools proved. Be concise and do not invent missing facts.",
+            },
+        ],  # type: ignore[arg-type]
+        temperature=0.0,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 async def run_tool_calling_loop(
     *,
     objective: str,
     server: dict[str, Any],
+    workspace_path: str,
     allow_write: bool,
     max_steps: int,
     step_timeout: int,
+    conversation_history: list[dict[str, str]] | None = None,
     on_step_start: Callable[[int, str, dict[str, Any]], Awaitable[None]] | None = None,
     on_step_result: Callable[[StepResult], Awaitable[None]] | None = None,
+    on_log_chunk: Callable[[int, str, str, str], Awaitable[None]] | None = None,
+    on_plan: Callable[[list[AgentStep], str], Awaitable[None]] | None = None,
+    on_decision: Callable[[AgentDecision], Awaitable[None]] | None = None,
 ) -> ToolCallingLoopResult:
-    """
-    Run the OpenAI tool-calling (ReAct) agent loop.
-
-    At each iteration the LLM either:
-      - calls one or more tools  → execute them on the server via SSH, feed results back
-      - returns a text response  → treated as the final summary; loop ends
-
-    All tool calls result in REAL SSH operations on the remote server.
-    Nothing is simulated.
-
-    Args:
-        objective:      User-supplied goal in natural language.
-        server:         Server dict (host, ssh_user, ssh_auth_method, etc.).
-        allow_write:    Whether write/destructive tools are permitted.
-        max_steps:      Maximum number of individual tool invocations.
-        step_timeout:   Per-tool SSH execution timeout in seconds.
-        on_step_start:  Optional async callback(step_num, tool_name, args).
-        on_step_result: Optional async callback(StepResult).
-
-    Returns:
-        ToolCallingLoopResult with all executed steps and a final summary.
-    """
-    # Import here to avoid circular dependency (tools.py imports models.agent)
+    """Run the deterministic planner → executor → evaluator loop."""
     from services.tools import execute_tool, get_tool_definitions
 
     settings = get_settings()
@@ -817,149 +964,230 @@ async def run_tool_calling_loop(
         )
 
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    tool_defs = get_tool_definitions(allow_write)
+    task_mode = _classify_task_mode(objective)
+    effective_max_steps = min(max_steps, 2) if task_mode == "simple" else max_steps
+    tool_defs = get_tool_definitions(allow_write and task_mode == "complex")
+    coordinator_context = {
+        "server_metadata": {
+            "host": server.get("host"),
+            "ssh_user": server.get("ssh_user"),
+            "name": server.get("name"),
+        },
+        "failure_history": [],
+        "allow_write": allow_write and task_mode == "complex",
+        "objective": objective,
+        "task_mode": task_mode,
+    }
 
-    server_info = (
-        f"Server: {server.get('name', 'unknown')} "
-        f"(host={server.get('host', '?')}, user={server.get('ssh_user', '?')})"
-    )
-    user_message = (
-        f"Objective: {objective}\n\n"
-        f"{server_info}\n"
-        f"allow_write: {allow_write}\n"
-        f"max_steps: {max_steps}"
-    )
+    if task_mode == "simple":
+        plan = _build_simple_plan(objective)
+    else:
+        generated_plan = await generate_plan(
+            objective=objective,
+            context=coordinator_context,
+            max_steps=effective_max_steps,
+        )
+        plan = generated_plan.steps[:effective_max_steps] or _build_simple_plan(objective)
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
-
-    results: list[StepResult] = []
-    step_counter = 0
-    final_summary = ""
-
-    while step_counter < max_steps:
+    if on_plan:
         try:
-            response = await client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=messages,  # type: ignore[arg-type]
-                tools=tool_defs,  # type: ignore[arg-type]
-                tool_choice="auto",
-                temperature=0.1,
+            await on_plan(plan, task_mode)
+        except Exception:
+            pass
+
+    messages = _build_complex_execution_messages(
+        objective=objective,
+        task_mode=task_mode,
+        allow_write=allow_write,
+        server=server,
+        conversation_history=conversation_history,
+        plan=plan,
+    )
+    results: list[StepResult] = []
+    decisions: list[AgentDecision] = []
+
+    async def _execute_single_tool(
+        *,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        step_number: int,
+    ) -> StepResult:
+        if on_step_start:
+            try:
+                await on_step_start(step_number, tool_name, tool_args)
+            except Exception:
+                pass
+
+        result = await execute_tool(
+            tool_name=tool_name,
+            args=tool_args,
+            server=server,
+            workspace_path=workspace_path,
+            allow_write=allow_write,
+            timeout=step_timeout,
+            step_number=step_number,
+            on_output_chunk=on_log_chunk,
+        )
+        results.append(result)
+
+        if on_step_result:
+            try:
+                await on_step_result(result)
+            except Exception:
+                pass
+
+        return result
+
+    step_pointer = 0
+    while step_pointer < min(len(plan), effective_max_steps):
+        current_step = plan[step_pointer]
+        attempts = 0
+        while True:
+            if task_mode == "simple":
+                tool_name = current_step.tool.value
+                tool_args = current_step.args
+                tool_call_id = f"simple-step-{current_step.step}"
+            else:
+                try:
+                    raw_message = await _request_executor_tool_call(
+                        client=client,
+                        model=settings.OPENAI_MODEL,
+                        messages=messages,
+                        current_step=current_step,
+                        tool_defs=tool_defs,
+                    )
+                except Exception as exc:
+                    logger.error("OpenAI executor request failed: %s", exc)
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=f"LLM request failed: {exc}",
+                    )
+                messages.append(raw_message)
+                tool_calls = raw_message.get("tool_calls") or []
+                if not tool_calls:
+                    tool_name = current_step.tool.value
+                    tool_args = current_step.args
+                    tool_call_id = f"forced-step-{current_step.step}"
+                else:
+                    first_call = tool_calls[0]
+                    tool_name = first_call.get("function", {}).get("name") or current_step.tool.value
+                    try:
+                        tool_args = json.loads(first_call.get("function", {}).get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        tool_args = current_step.args
+                    if tool_name != current_step.tool.value:
+                        tool_name = current_step.tool.value
+                        tool_args = current_step.args
+                    tool_call_id = first_call.get("id") or f"tool-step-{current_step.step}"
+
+            result = await _execute_single_tool(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                step_number=current_step.step,
             )
-        except Exception as exc:
-            logger.error("OpenAI tool-calling request failed: %s", exc)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"LLM request failed: {exc}",
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(
+                        {
+                            "stdout": result.stdout[:4000],
+                            "stderr": result.stderr[:2000],
+                            "exit_code": result.exit_code,
+                            "success": result.success,
+                            "duration_ms": result.duration_ms,
+                        }
+                    ),
+                }
             )
 
-        msg = response.choices[0].message
+            decision = AgentDecision(
+                action=DecisionAction.CONTINUE if result.success else DecisionAction.ABORT,
+                reason="Simple mode executes one minimal command." if task_mode == "simple" else "",
+                summary_so_far="",
+            )
+            if task_mode == "complex":
+                decision = await evaluate_step(
+                    current_step,
+                    result,
+                    {
+                        **coordinator_context,
+                        "retry_count": attempts,
+                        "max_retries": settings.AGENT_MAX_RETRIES,
+                        "previous_steps_summary": " ".join(
+                            existing.summary_so_far for existing in decisions if existing.summary_so_far
+                        ),
+                    },
+                )
+            decisions.append(decision)
+            if on_decision:
+                try:
+                    await on_decision(decision)
+                except Exception:
+                    pass
 
-        # Append assistant message (may contain tool_calls and/or content)
-        messages.append(msg.model_dump(exclude_unset=True))
-
-        if not msg.tool_calls:
-            # LLM returned a plain text response → final summary, stop loop
-            final_summary = (msg.content or "").strip()
+            if decision.action == DecisionAction.CONTINUE:
+                break
+            if (
+                decision.action == DecisionAction.RETRY
+                and attempts < settings.AGENT_MAX_RETRIES
+            ):
+                attempts += 1
+                continue
+            if decision.action == DecisionAction.MODIFY and decision.modified_step is not None:
+                current_step = decision.modified_step
+                plan[step_pointer] = current_step
+                attempts += 1
+                continue
+            step_pointer = len(plan)
             break
 
-        # Execute each tool call the LLM requested
-        tool_result_messages: list[dict[str, Any]] = []
-        for tc in msg.tool_calls:
-            if step_counter >= max_steps:
-                # Hard limit reached mid-batch: add a refusal message and stop
-                tool_result_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps({
-                        "error": f"max_steps ({max_steps}) reached — no more tool calls allowed."
-                    }),
-                })
-                continue
+        step_pointer += 1
 
-            tool_name: str = tc.function.name
+    if not results:
+        fallback_tool, fallback_args, fallback_reason = _build_fallback_tool(objective)
+        forced_step = AgentStep(step=1, tool=fallback_tool, args=fallback_args, rationale=fallback_reason)
+        plan = [forced_step]
+        if on_plan:
             try:
-                tool_args: dict[str, Any] = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                tool_args = {}
-
-            step_counter += 1
-
-            if on_step_start:
-                try:
-                    await on_step_start(step_counter, tool_name, tool_args)
-                except Exception:
-                    pass
-
-            result = await execute_tool(
-                tool_name=tool_name,
-                args=tool_args,
-                server=server,
-                allow_write=allow_write,
-                timeout=step_timeout,
-                step_number=step_counter,
+                await on_plan(plan, task_mode)
+            except Exception:
+                pass
+        forced_result = await _execute_single_tool(
+            tool_name=forced_step.tool.value,
+            tool_args=forced_step.args,
+            step_number=forced_step.step,
+        )
+        decisions.append(
+            AgentDecision(
+                action=DecisionAction.CONTINUE if forced_result.success else DecisionAction.ABORT,
+                reason="Forced fallback execution to satisfy the required tool-use contract.",
+                summary_so_far="",
             )
-            results.append(result)
-
-            if on_step_result:
-                try:
-                    await on_step_result(result)
-                except Exception:
-                    pass
-
-            # Format tool result as a JSON string for the conversation
-            tool_output = json.dumps({
-                "stdout": result.stdout[:4000] if result.stdout else "",
-                "stderr": result.stderr[:2000] if result.stderr else "",
-                "exit_code": result.exit_code,
-                "success": result.success,
-                "duration_ms": result.duration_ms,
-            })
-            tool_result_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": tool_output,
-            })
-
-        # Add all tool results to the conversation before next LLM call
-        messages.extend(tool_result_messages)
-
-    else:
-        # Loop exhausted max_steps without a plain-text conclusion from the LLM.
-        # Ask LLM for a summary of what it accomplished.
-        messages.append({
-            "role": "user",
-            "content": (
-                f"You have reached the maximum of {max_steps} tool call(s). "
-                "Provide a concise summary of what was accomplished and what (if anything) remains."
-            ),
-        })
-        try:
-            summary_resp = await client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=0.1,
-            )
-            final_summary = (summary_resp.choices[0].message.content or "").strip()
-        except Exception as exc:
-            logger.warning("Failed to get final summary from LLM: %s", exc)
-            final_summary = (
-                f"Agent stopped after reaching the {max_steps}-step limit. "
-                f"{sum(1 for r in results if r.success)} of {len(results)} step(s) succeeded."
-            )
-
-    overall_success = bool(results) and all(r.success for r in results)
-    if not final_summary:
-        ok = sum(1 for r in results if r.success)
-        final_summary = (
-            f"Completed: {len(results)} step(s) executed, {ok} successful."
         )
 
+    overall_success = bool(results) and all(result.success for result in results)
+    try:
+        final_summary = await _request_final_summary(
+            client=client,
+            model=settings.OPENAI_MODEL,
+            objective=objective,
+            results=results,
+        )
+    except Exception as exc:
+        logger.warning("Failed to get final summary from LLM: %s", exc)
+        final_summary = ""
+
+    if not final_summary:
+        ok = sum(1 for result in results if result.success)
+        final_summary = f"Executed {len(results)} tool step(s); {ok} succeeded."
+
     return ToolCallingLoopResult(
+        task_mode=task_mode,
+        plan=plan,
         steps=results,
+        decisions=decisions,
         summary=final_summary,
         success=overall_success,
-        steps_taken=step_counter,
+        steps_taken=len(results),
     )

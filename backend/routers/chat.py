@@ -4,7 +4,6 @@ from fastapi import APIRouter, Depends
 
 from core.security import get_current_user
 from models.chat import ChatMessageRequest, ChatResponse, ChatSendMessageResponse
-from services.ai_service import AIService
 from services.chat_service import ChatService
 from services.workspace_service import WorkspaceService
 
@@ -21,7 +20,7 @@ async def get_workspace_chat(
     if chat is None:
         chat = ChatService.create_chat(workspace_id=workspace_id, user_id=current_user["sub"])
 
-    messages = ChatService.list_messages(chat_id=chat["id"])
+    messages = ChatService.list_workspace_messages(workspace_id=workspace_id, user_id=current_user["sub"])
     return ChatResponse(
         id=chat["id"],
         workspace_id=workspace["id"],
@@ -42,12 +41,16 @@ async def send_workspace_message(
     if chat is None:
         chat = ChatService.create_chat(workspace_id=workspace_id, user_id=current_user["sub"])
 
-    ChatService.save_message(chat_id=chat["id"], role="user", content=payload.message)
-    ai_response = await AIService.process_message(workspace=workspace, message=payload.message)
-    ChatService.save_message(chat_id=chat["id"], role="assistant", content=ai_response)
+    stored_message = ChatService.save_workspace_message(
+        workspace_id=workspace["id"],
+        user_id=current_user["sub"],
+        role=payload.role.value,
+        content=payload.message,
+    )
 
     return ChatSendMessageResponse(
         chat_id=chat["id"],
         workspace_id=workspace_id,
-        response=ai_response,
+        response=stored_message.content,
+        message=stored_message,
     )

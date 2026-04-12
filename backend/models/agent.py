@@ -163,13 +163,17 @@ class AgentDecision(BaseModel):
 class ToolCallingLoopResult(BaseModel):
     """Result of the OpenAI tool-calling agent loop."""
 
+    task_mode: str = "complex"
+    plan: list[AgentStep] = []
     steps: list[StepResult] = []
+    decisions: list[AgentDecision] = []
     summary: str = ""
     success: bool = True
     steps_taken: int = 0
 
 
 class ForgeV2RunRequest(BaseModel):
+    workspace_id: str | None = None
     server_id: str
     objective: str = Field(..., min_length=3, max_length=1000)
     max_steps: int = Field(default=8, ge=1, le=20)

@@ -8,7 +8,7 @@ import json
 import sys
 from datetime import datetime
 
-BASE_URL = "http://localhost:8000/api/v1"
+BASE_URL = "http://localhost:8000/api"
 HEADERS = {"Content-Type": "application/json"}
 
 # Colors for output
@@ -36,7 +36,7 @@ def test_health():
     """Test health endpoint"""
     print_test("Health Check")
     try:
-        # Health endpoint is at root level, not under /api/v1
+        # Health endpoint is at root level, not under /api
         response = requests.get("http://localhost:8000/health")
         if response.status_code == 200:
             print_success(f"Health check passed")
@@ -212,19 +212,19 @@ def main():
     
     print_success("Backend is running and responding to requests")
     print_info("✓ GET /health — Health check (root level)")
-    print_info("✓ POST /api/v1/auth/login — User login with credentials")
-    print_info("✓ GET /api/v1/auth/me — Get current user info (requires auth)")
-    print_info("✓ POST /api/v1/auth/logout — Logout endpoint (requires auth)")
-    print_info("✓ GET /api/v1/servers — List servers (requires auth)")
-    print_info("✓ GET /api/v1/workspaces — List workspaces (requires auth)")
-    print_info("✓ POST /api/v1/workspaces — Create workspace (requires auth)")
-    print_info("✓ GET /api/v1/chat/{workspace_id} — Get workspace chat")
-    print_info("✓ POST /api/v1/chat/{workspace_id}/message — Send chat message")
-    print_info("✓ GET /api/v1/chat/workspace/{workspace_id} — Get workspace chat (v2)")
-    print_info("✓ POST /api/v1/commands/execute — Execute SSH command (requires auth)")
-    print_info("✓ POST /api/v1/deployments/{workspace_id} — Create deployment")
-    print_info("✓ GET /api/v1/deployments/{workspace_id} — Get deployment")
-    print_info("✓ DELETE /api/v1/deployments/{workspace_id} — Delete deployment")
+    print_info("✓ POST /api/auth/login — User login with credentials")
+    print_info("✓ GET /api/auth/me — Get current user info (requires auth)")
+    print_info("✓ POST /api/auth/logout — Logout endpoint (requires auth)")
+    print_info("✓ GET /api/servers — List servers (requires auth)")
+    print_info("✓ GET /api/workspaces — List workspaces (requires auth)")
+    print_info("✓ POST /api/workspaces — Create workspace (requires auth)")
+    print_info("✓ GET /api/chat/{workspace_id} — Get workspace chat")
+    print_info("✓ POST /api/chat/{workspace_id}/message — Send chat message")
+    print_info("✓ GET /api/chat/workspace/{workspace_id} — Get workspace chat (v2)")
+    print_info("✓ POST /api/commands/execute — Execute SSH command (requires auth)")
+    print_info("✓ POST /api/deployments/{workspace_id} — Create deployment")
+    print_info("✓ GET /api/deployments/{workspace_id} — Get deployment")
+    print_info("✓ DELETE /api/deployments/{workspace_id} — Delete deployment")
     
     print(f"\n{GREEN}All endpoints are properly configured and accessible!{RESET}\n")
 

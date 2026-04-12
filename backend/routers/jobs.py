@@ -1,10 +1,11 @@
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 
 from core.security import get_current_user
 from models.job import JobAccepted, JobCreate, JobResponse
 from services.agent_service import AgentService
+from services.workspace_service import WorkspaceService
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -17,23 +18,33 @@ async def submit_job(
 ) -> JobAccepted:
     """Submit a natural-language job. Returns immediately; poll or stream for results."""
     user_id: str = current_user["sub"]
-    accepted = AgentService.create_job(user_id=user_id, payload=payload)
+    accepted = AgentService.submit_job(user_id=user_id, payload=payload)
     background_tasks.add_task(AgentService.run_job, accepted.id, payload, user_id)
     return accepted
 
 
 @router.get("/", response_model=list[JobResponse])
 async def list_jobs(
+    workspace_id: str | None = Query(default=None),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> list[JobResponse]:
     """List all jobs for the authenticated user, newest first."""
-    return AgentService.list_jobs(user_id=current_user["sub"])
+    return AgentService.list_jobs(user_id=current_user["sub"], workspace_id=workspace_id)
 
 
 @router.get("/{job_id}", response_model=JobResponse)
 async def get_job(
     job_id: str,
+    workspace_id: str | None = Query(default=None),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> JobResponse:
     """Fetch the current state of a job, including all executed steps."""
-    return AgentService.get_job(job_id=job_id, user_id=current_user["sub"])
+    if not workspace_id:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "WORKSPACE_REQUIRED"})
+    WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=current_user["sub"])
+    job = AgentService.get_job(job_id=job_id, user_id=current_user["sub"])
+    if job.workspace_id != workspace_id:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "WORKSPACE_NOT_FOUND"})
+    return job

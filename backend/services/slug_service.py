@@ -1,21 +1,23 @@
 import re
-import secrets
 import string
-from typing import Any
-
 from fastapi import HTTPException, status
 
 
 class SlugService:
-    """Generate safe, unique slugs for workspaces."""
+    """Slug + deploy domain helpers.
+
+    Slugs are derived from the user-provided workspace name and must be:
+    - lowercase
+    - alphanumeric + hyphens
+    Uniqueness is enforced per-server at the DB layer (and validated by the service).
+    """
 
     _VALID_SLUG_CHARS = set(string.ascii_lowercase + string.digits + "-")
-    _MAX_SLUG_LENGTH = 30
-    _SHORT_ID_LENGTH = 4
+    _MAX_SLUG_LENGTH = 50
 
     @staticmethod
     def sanitize_name(name: str) -> str:
-        """Sanitize workspace name for slug generation."""
+        """Sanitize workspace name for slug generation (no uniqueness)."""
         cleaned = name.strip().lower()
 
         # Replace spaces with hyphens
@@ -31,35 +33,22 @@ class SlugService:
         if not cleaned:
             cleaned = "workspace"
 
-        # Truncate to reasonable length (leaving room for suffix)
-        max_name_part = SlugService._MAX_SLUG_LENGTH - SlugService._SHORT_ID_LENGTH - 1
-        cleaned = cleaned[:max_name_part]
+        cleaned = cleaned[: SlugService._MAX_SLUG_LENGTH].strip("-") or "workspace"
 
         return cleaned
 
     @staticmethod
-    def generate_short_id() -> str:
-        """Generate a short unique identifier (4 chars)."""
-        return "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(SlugService._SHORT_ID_LENGTH))
-
-    @staticmethod
     def generate_slug(name: str) -> str:
-        """Generate a unique slug from workspace name."""
-        sanitized = SlugService.sanitize_name(name)
-        short_id = SlugService.generate_short_id()
-        slug = f"{sanitized}-{short_id}"
-
-        if len(slug) > SlugService._MAX_SLUG_LENGTH:
-            slug = slug[: SlugService._MAX_SLUG_LENGTH]
-
-        return slug
+        """Generate a deterministic slug from workspace name (no uniqueness)."""
+        return SlugService.sanitize_name(name)
 
     @staticmethod
-    def generate_domain(slug: str, base_domain: str = "app.yoursite.com") -> str:
-        """Generate subdomain from slug."""
+    def generate_domain(*, slug: str, workspace_id: str, base_domain: str = "thinksync.art") -> str:
+        """Generate deploy domain using {slug}-{short_id}.{base_domain}."""
         if not slug or not all(c in SlugService._VALID_SLUG_CHARS for c in slug):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid slug format",
             )
-        return f"https://{slug}.{base_domain}"
+        short_id = (workspace_id or "").replace("-", "").lower()[:6] or "000000"
+        return f"{slug}-{short_id}.{base_domain}"

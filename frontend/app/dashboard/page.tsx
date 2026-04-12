@@ -85,8 +85,8 @@ export default function DashboardPage() {
           <div className="space-y-3">
             {[
               { n: "1", text: "Add a server with SSH credentials" },
-              { n: "2", text: "A workspace is automatically created" },
-              { n: "3", text: "Tap the server to chat with AI about it" },
+              { n: "2", text: "Create a workspace (project) for the server" },
+              { n: "3", text: "Open the workspace to start chatting" },
             ].map(({ n, text }) => (
               <div key={n} className="flex items-start gap-3">
                 <span className="w-5 h-5 rounded-full bg-blue-600/20 text-blue-400 text-[11px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5">

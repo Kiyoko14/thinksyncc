@@ -11,6 +11,7 @@ class MessageRole(str, Enum):
 
 
 class CommandRequest(BaseModel):
+    workspace_id: str | None = None
     server_id: str
     command: str
 
@@ -18,6 +19,8 @@ class CommandRequest(BaseModel):
 class CommandResponse(BaseModel):
     server_id: str
     command: str
+    stdout: str = ""
+    stderr: str = ""
     output: str
     exit_code: int
     executed_at: datetime

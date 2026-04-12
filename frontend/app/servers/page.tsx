@@ -4,11 +4,10 @@ import { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import BottomNav from "@/components/BottomNav";
 import {
+  ApiError,
   getServers,
   addServer,
   deleteServer,
-  createWorkspace,
-  getWorkspacesByServer,
 } from "@/services/api";
 import { getToken, logout } from "@/services/auth";
 import type { Server, ServerCreatePayload } from "@/services/api";
@@ -27,6 +26,7 @@ export default function ServersPage() {
   const router = useRouter();
   const [servers, setServers] = useState<Server[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [showSheet, setShowSheet] = useState(false);
   const [form, setForm] = useState<ServerCreatePayload>(EMPTY_FORM);
   const [submitting, setSubmitting] = useState(false);
@@ -39,7 +39,7 @@ export default function ServersPage() {
       router.replace("/login");
       return;
     }
-    loadServers();
+    void loadServers();
   }, [router]);
 
   // Close sheet when tapping backdrop
@@ -55,9 +55,12 @@ export default function ServersPage() {
   }, [showSheet]);
 
   const loadServers = async () => {
+    setLoadError("");
     try {
       const data = await getServers();
       setServers(data);
+    } catch (err: unknown) {
+      setLoadError(err instanceof Error ? err.message : "Failed to load servers");
     } finally {
       setLoading(false);
     }
@@ -68,15 +71,7 @@ export default function ServersPage() {
     setSubmitting(true);
     setFormError("");
     try {
-      const server = await addServer(form);
-      // Automatically create a workspace for the new server.
-      // If workspace creation fails we still close the sheet — the user can
-      // open the workspace later by tapping the server card.
-      try {
-        await createWorkspace(server.id, server.name);
-      } catch {
-        // workspace creation failure is non-fatal; log only in dev
-      }
+      await addServer(form);
       setShowSheet(false);
       setForm(EMPTY_FORM);
       await loadServers();
@@ -88,18 +83,23 @@ export default function ServersPage() {
   };
 
   const handleServerTap = async (server: Server) => {
-    setOpeningId(server.id);
+    const serverId = server?.id;
+    if (!serverId) {
+      console.error("Cannot open workspace: server_id is missing", server);
+      return;
+    }
+
+    setOpeningId(serverId);
     try {
-      const workspaces = await getWorkspacesByServer(server.id);
-      let workspaceId: string;
-      if (workspaces.length > 0) {
-        workspaceId = workspaces[0].id;
-      } else {
-        const ws = await createWorkspace(server.id, server.name);
-        workspaceId = ws.id;
+      router.push(`/servers/${serverId}/workspaces`);
+    } catch (err: unknown) {
+      console.error("Failed to open workspace", err);
+
+      if (err instanceof ApiError && err.status === 401) {
+        logout();
+        router.replace("/login");
       }
-      router.push(`/chat/${workspaceId}`);
-    } catch {
+    } finally {
       setOpeningId(null);
     }
   };
@@ -159,6 +159,20 @@ export default function ServersPage() {
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
             </svg>
+          </div>
+        ) : loadError ? (
+          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
+            <p className="text-sm font-semibold text-white">Couldn&apos;t load servers</p>
+            <p className="text-sm text-gray-500 mt-1">{loadError}</p>
+            <button
+              onClick={() => {
+                setLoading(true);
+                void loadServers();
+              }}
+              className="mt-4 bg-gray-800 hover:bg-gray-700 text-white text-sm font-medium px-4 py-2.5 rounded-xl transition-colors"
+            >
+              Retry
+            </button>
           </div>
         ) : servers.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-center">

@@ -12,14 +12,17 @@ class ChatMessageRole(str, Enum):
 
 class ChatMessageRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=20000)
+    role: ChatMessageRole = ChatMessageRole.USER
 
 
 class StoredMessageResponse(BaseModel):
     id: str
-    chat_id: str
     role: ChatMessageRole
     content: str
     created_at: datetime
+    chat_id: str | None = None
+    workspace_id: str | None = None
+    user_id: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -38,3 +41,4 @@ class ChatSendMessageResponse(BaseModel):
     chat_id: str
     workspace_id: str
     response: str
+    message: StoredMessageResponse

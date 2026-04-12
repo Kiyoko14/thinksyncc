@@ -18,6 +18,18 @@ create table if not exists public.servers (
     updated_at timestamptz not null default now()
 );
 
+create table if not exists public.workspaces (
+    id uuid primary key default gen_random_uuid(),
+    user_id uuid not null references auth.users(id) on delete cascade,
+    server_id uuid not null references public.servers(id) on delete cascade,
+    name text not null,
+    path text not null,
+    slug text not null,
+    domain text not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
 create table if not exists public.chats (
     id uuid primary key default gen_random_uuid(),
     server_id uuid not null references public.servers(id) on delete cascade,
@@ -35,6 +47,35 @@ create table if not exists public.messages (
     created_at timestamptz not null default now()
 );
 
+create table if not exists public.chat_messages (
+    id uuid primary key default gen_random_uuid(),
+    workspace_id uuid not null references public.workspaces(id) on delete cascade,
+    user_id uuid not null references auth.users(id) on delete cascade,
+    role text not null check (role in ('user', 'assistant', 'system')),
+    content text not null,
+    created_at timestamptz not null default now()
+);
+
+create table if not exists public.jobs (
+    id uuid primary key default gen_random_uuid(),
+    user_id uuid not null references auth.users(id) on delete cascade,
+    workspace_id uuid references public.workspaces(id) on delete cascade,
+    server_id uuid not null references public.servers(id) on delete cascade,
+    objective text not null,
+    status text not null default 'queued'
+        check (status in ('queued', 'running', 'waiting_for_llm', 'completed', 'failed')),
+    allow_write boolean not null default false,
+    dry_run boolean not null default false,
+    task_mode text not null default 'complex'
+        check (task_mode in ('simple', 'complex')),
+    plan jsonb not null default '[]'::jsonb,
+    steps jsonb not null default '[]'::jsonb,
+    decisions jsonb not null default '[]'::jsonb,
+    summary text,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
 create table if not exists public.tasks (
     id uuid primary key default gen_random_uuid(),
     chat_id uuid not null references public.chats(id) on delete cascade,
@@ -44,11 +85,22 @@ create table if not exists public.tasks (
 );
 
 create index if not exists idx_servers_user_id on public.servers (user_id);
+create index if not exists idx_workspaces_user_id on public.workspaces (user_id);
+create index if not exists idx_workspaces_server_id on public.workspaces (server_id);
+create index if not exists idx_workspaces_server_slug on public.workspaces (server_id, slug);
+create unique index if not exists idx_workspaces_server_slug_unique on public.workspaces (server_id, slug);
+create unique index if not exists idx_workspaces_domain_unique on public.workspaces (domain);
 create index if not exists idx_chats_user_id on public.chats (user_id);
 create index if not exists idx_chats_server_id on public.chats (server_id);
 create index if not exists idx_messages_chat_id on public.messages (chat_id);
+create index if not exists idx_chat_messages_workspace_id on public.chat_messages (workspace_id, created_at);
+create index if not exists idx_chat_messages_user_id on public.chat_messages (user_id, created_at);
 create index if not exists idx_tasks_user_id on public.tasks (user_id);
 create index if not exists idx_tasks_chat_id on public.tasks (chat_id);
+create index if not exists idx_jobs_user_id on public.jobs (user_id);
+create index if not exists idx_jobs_workspace_id on public.jobs (workspace_id, created_at desc);
+create index if not exists idx_jobs_server_id on public.jobs (server_id);
+create index if not exists idx_jobs_status on public.jobs (status);
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -72,14 +124,30 @@ before update on public.chats
 for each row
 execute function public.set_updated_at();
 
+drop trigger if exists trg_workspaces_set_updated_at on public.workspaces;
+create trigger trg_workspaces_set_updated_at
+before update on public.workspaces
+for each row
+execute function public.set_updated_at();
+
 alter table public.servers enable row level security;
+alter table public.workspaces enable row level security;
 alter table public.chats enable row level security;
 alter table public.messages enable row level security;
+alter table public.chat_messages enable row level security;
 alter table public.tasks enable row level security;
+alter table public.jobs enable row level security;
 
 drop policy if exists "Users manage own servers" on public.servers;
 create policy "Users manage own servers"
 on public.servers
+for all
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists "Users manage own workspaces" on public.workspaces;
+create policy "Users manage own workspaces"
+on public.workspaces
 for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);
@@ -112,9 +180,23 @@ with check (
     )
 );
 
+drop policy if exists "Users manage own workspace chat messages" on public.chat_messages;
+create policy "Users manage own workspace chat messages"
+on public.chat_messages
+for all
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
 drop policy if exists "Users manage own tasks" on public.tasks;
 create policy "Users manage own tasks"
 on public.tasks
+for all
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists "Users manage own jobs" on public.jobs;
+create policy "Users manage own jobs"
+on public.jobs
 for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);

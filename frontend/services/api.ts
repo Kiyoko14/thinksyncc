@@ -1,30 +1,96 @@
 // All requests go to relative paths — Next.js rewrites proxy them to the backend.
 // See next.config.js → rewrites() for the INTERNAL_API_URL mapping.
 
-function getAuthHeaders(): Record<string, string> {
-  const token =
-    typeof window !== "undefined" ? localStorage.getItem("thinksync_token") : null;
-  return {
-    "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
+import { getToken, logout } from "./auth";
+
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+
+  constructor(message: string, status: number, body: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      ...getAuthHeaders(),
-      ...options.headers,
-    },
-  });
+function handleUnauthorized(): void {
+  if (typeof window === "undefined") return;
+
+  logout();
+
+  const currentPath = window.location.pathname;
+  if (currentPath !== "/login") {
+    window.location.replace("/login");
+  }
+}
+
+function buildHeaders(options: RequestInit): Headers {
+  const headers = new Headers(options.headers ?? {});
+
+  // Default to JSON unless explicitly overridden (or using FormData).
+  if (!headers.has("Content-Type") && !(options.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  // Never trust localStorage blindly: getToken() auto-clears invalid/expired tokens.
+  const token = getToken();
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  return headers;
+}
+
+export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(path, { ...options, headers: buildHeaders(options) });
+
+  if (response.status === 401) {
+    handleUnauthorized();
+  }
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: "Request failed" }));
-    throw new Error(body.detail ?? "Request failed");
+    const contentType = response.headers.get("content-type") ?? "";
+    let body: unknown = null;
+    let detail = "Request failed";
+
+    if (contentType.includes("application/json")) {
+      body = await response.json().catch(() => null);
+      if (body && typeof body === "object" && "detail" in body) {
+        const rawDetail = (body as any).detail as unknown;
+        if (typeof rawDetail === "string") {
+          detail = rawDetail;
+        } else if (rawDetail && typeof rawDetail === "object") {
+          const code = (rawDetail as any).code as unknown;
+          const message = (rawDetail as any).message as unknown;
+          if (typeof code === "string" && typeof message === "string" && message.trim()) {
+            detail = `${code}: ${message}`;
+          } else if (typeof message === "string" && message.trim()) {
+            detail = message;
+          } else if (typeof code === "string" && code.trim()) {
+            detail = code;
+          }
+        }
+      }
+    } else {
+      body = await response.text().catch(() => null);
+      if (typeof body === "string" && body.trim()) detail = body;
+    }
+
+    if (response.status === 401) detail = "Unauthorized";
+    if (response.status === 403) detail = "Forbidden";
+
+    throw new ApiError(detail, response.status, body);
   }
 
   if (response.status === 204) return undefined as T;
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    return (await response.text()) as T;
+  }
+
   return response.json() as Promise<T>;
 }
 
@@ -62,22 +128,6 @@ export interface Workspace {
   created_at: string;
 }
 
-export interface ChatMessage {
-  id: string;
-  chat_id: string;
-  role: "user" | "assistant" | "system";
-  content: string;
-  created_at: string;
-}
-
-export interface ChatHistory {
-  id: string;
-  workspace_id: string;
-  user_id: string;
-  created_at: string;
-  messages: ChatMessage[];
-}
-
 export interface CommandResult {
   server_id: string;
   command: string;
@@ -88,48 +138,37 @@ export interface CommandResult {
 
 // ── Servers ──────────────────────────────────────────────────────────────────
 
-export const getServers = () => request<Server[]>("/api/v1/servers/");
+export const getServers = () => request<Server[]>("/api/servers/");
 
 export const addServer = (data: ServerCreatePayload) =>
-  request<Server>("/api/v1/servers/", {
+  request<Server>("/api/servers/", {
     method: "POST",
     body: JSON.stringify(data),
   });
 
 export const deleteServer = (id: string) =>
-  request<void>(`/api/v1/servers/${id}`, { method: "DELETE" });
+  request<void>(`/api/servers/${id}`, { method: "DELETE" });
 
 // ── Workspaces ────────────────────────────────────────────────────────────────
 
 export const createWorkspace = (server_id: string, name: string) =>
-  request<Workspace>("/api/v1/workspaces/", {
+  request<Workspace>("/api/workspaces/", {
     method: "POST",
     body: JSON.stringify({ server_id, name }),
   });
 
+export const getWorkspace = (workspace_id: string) =>
+  request<Workspace>(`/api/workspaces/${workspace_id}`);
+
 export const getWorkspacesByServer = (server_id: string) =>
-  request<Workspace[]>(`/api/v1/workspaces/?server_id=${server_id}`);
-
-// ── Chat ──────────────────────────────────────────────────────────────────────
-
-export const getChatHistory = (workspace_id: string) =>
-  request<ChatHistory>(`/api/v1/chat/${workspace_id}`);
-
-export const sendChatMessage = (workspace_id: string, message: string) =>
-  request<{ chat_id: string; workspace_id: string; response: string }>(
-    `/api/v1/chat/${workspace_id}/message`,
-    {
-      method: "POST",
-      body: JSON.stringify({ message }),
-    }
-  );
+  request<Workspace[]>(`/api/workspaces/?server_id=${server_id}`);
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-export const executeCommand = (server_id: string, command: string) =>
-  request<CommandResult>("/api/v1/commands/execute", {
+export const executeCommand = (workspace_id: string, server_id: string, command: string) =>
+  request<CommandResult>("/api/commands/execute", {
     method: "POST",
-    body: JSON.stringify({ server_id, command }),
+    body: JSON.stringify({ workspace_id, server_id, command }),
   });
 
 // ── Agents (Forge v2) ────────────────────────────────────────────────────────
@@ -142,6 +181,7 @@ export type AgentJobStatus =
   | "failed";
 
 export interface ForgeV2RunRequest {
+  workspace_id: string;
   server_id: string;
   objective: string;
   max_steps?: number;
@@ -196,17 +236,86 @@ export interface ForgeV2JobResponse {
   error: string | null;
 }
 
+export interface JobRecord {
+  id: string;
+  workspace_id?: string | null;
+  server_id: string;
+  objective: string;
+  status: AgentJobStatus;
+  allow_write: boolean;
+  dry_run: boolean;
+  task_mode: "simple" | "complex";
+  plan: AgentStep[];
+  steps: StepResult[];
+  decisions: AgentDecision[];
+  summary: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobStreamEvent {
+  type: "step_start" | "step_result" | "log_chunk" | "status_update" | "completed" | "ping";
+  sequence?: number;
+  status?: AgentJobStatus;
+  step: number;
+  tool: string | null;
+  timestamp?: string;
+  args?: Record<string, unknown>;
+  stream?: "stdout" | "stderr";
+  data?: string;
+  stdout_preview?: string;
+  stderr_preview?: string;
+  success?: boolean;
+  exit_code?: number;
+  summary?: string;
+  decision?: AgentDecision;
+  task_mode?: "simple" | "complex";
+  plan?: AgentStep[];
+}
+
+export type ChatRole = "user" | "assistant" | "system";
+
+export interface StoredChatMessage {
+  id: string;
+  role: ChatRole;
+  content: string;
+  created_at: string;
+  chat_id?: string | null;
+  workspace_id?: string | null;
+  user_id?: string | null;
+}
+
+export interface WorkspaceChatResponse {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  created_at: string;
+  messages: StoredChatMessage[];
+}
+
 export const runForgeV2 = (payload: ForgeV2RunRequest) =>
-  request<ForgeV2JobResponse>("/api/v1/agents/forge-v2/run", {
+  request<ForgeV2JobResponse>("/api/agents/forge-v2/run", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 
 export const getForgeV2JobStatus = (job_id: string) =>
-  request<ForgeV2JobResponse>(`/api/v1/agents/forge-v2/jobs/${job_id}`);
+  request<ForgeV2JobResponse>(`/api/agents/forge-v2/jobs/${job_id}`);
 
 export const getForgeV2Plan = (payload: ForgeV2RunRequest) =>
   request<{ plan: AgentStep[]; objective: string; context_summary: string }>(
-    "/api/v1/agents/forge-v2/plan",
+    "/api/agents/forge-v2/plan",
     { method: "POST", body: JSON.stringify(payload) }
   );
+
+export const getWorkspaceChat = (workspace_id: string) =>
+  request<WorkspaceChatResponse>(`/api/chat/${workspace_id}`);
+
+export const getWorkspaceJobs = (workspace_id: string) =>
+  request<JobRecord[]>(`/api/jobs/?workspace_id=${workspace_id}`);
+
+export function getJobWebSocketUrl(jobId: string): string {
+  const token = getToken();
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/v1/ws/jobs/${jobId}?token=${encodeURIComponent(token ?? "")}`;
+}

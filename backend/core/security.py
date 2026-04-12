@@ -30,12 +30,12 @@ def decode_token(token: str) -> dict[str, Any]:
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
+            detail="Unauthorized",
         )
     except jwt.InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token",
+            detail="Unauthorized",
         )
 
 
@@ -45,7 +45,7 @@ def get_current_user(
     if credentials is None or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
+            detail="Unauthorized",
         )
 
     payload = decode_token(credentials.credentials)
@@ -53,7 +53,7 @@ def get_current_user(
     if not isinstance(sub, str):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token",
+            detail="Unauthorized",
         )
 
     try:
@@ -61,7 +61,7 @@ def get_current_user(
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token",
+            detail="Unauthorized",
         )
 
     return payload
