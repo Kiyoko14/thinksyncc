@@ -11,6 +11,8 @@ from postgrest.exceptions import APIError
 from core.config import get_settings
 from core.database import get_supabase
 from models.workspace import WorkspaceResponse
+from services.domain_service import assign_domain as _redis_assign_domain
+from services.port_allocator import allocate_port as _allocate_port, release_port as _release_port
 from services.server_service import ServerService
 from services.slug_service import SlugService
 from services.ssh_service import SSHService
@@ -331,6 +333,20 @@ class WorkspaceService:
 
         payload = dict(result.data[0])
         payload["url"] = WorkspaceService._workspace_url(str(payload.get("domain") or ""))
+
+        # Allocate an immutable port for this workspace and persist the subdomain
+        # mapping in Redis so the gateway can resolve it.
+        try:
+            _allocate_port(workspace_id)
+        except Exception:
+            logger.warning("Port allocation failed for workspace %s — Redis may be unavailable", workspace_id)
+
+        try:
+            subdomain = slug
+            _redis_assign_domain(workspace_id, subdomain)
+        except Exception:
+            logger.warning("Domain assignment failed for workspace %s — Redis may be unavailable", workspace_id)
+
         return WorkspaceResponse(**payload)
 
     @staticmethod

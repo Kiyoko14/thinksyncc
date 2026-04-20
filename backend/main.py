@@ -12,7 +12,7 @@ import traceback
 from typing import Any
 
 from core.config import get_settings
-from routers import agents, auth, chat, commands, deployments, health, jobs, servers, workspaces, ws
+from routers import agents, auth, chat, commands, deployments, gateway, health, jobs, servers, workspaces, ws
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -108,6 +108,7 @@ app.include_router(deployments.router)
 app.include_router(agents.router)
 app.include_router(jobs.router)
 app.include_router(ws.router)
+app.include_router(gateway.router)
 
 
 def _api_error_code(exc: APIError) -> str:
