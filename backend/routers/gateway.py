@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
 import uuid
 
 import httpx
@@ -23,12 +23,8 @@ _ALLOWED_HOST_SUFFIX = "thinksync.art"
 _RATE_LIMIT_MAX = 100
 _RATE_LIMIT_WINDOW = 60
 
-_STATIC_EXTENSIONS = {
-    ".css", ".js", ".mjs", ".map",
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp",
-    ".woff", ".woff2", ".ttf", ".eot",
-    ".html", ".htm", ".xml", ".txt",
-}
+_MAX_CONCURRENT = 50
+_upstream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
 
 _UNSAFE_REQUEST_HEADERS = {
     "connection",
@@ -56,12 +52,14 @@ _UNSAFE_RESPONSE_HEADERS = {
 }
 
 
-def _forward_request_headers(request: Request) -> dict[str, str]:
-    return {
+def _forward_request_headers(request: Request, request_id: str) -> dict[str, str]:
+    headers = {
         k: v
         for k, v in request.headers.items()
         if k.lower() not in _UNSAFE_REQUEST_HEADERS
     }
+    headers["x-request-id"] = request_id
+    return headers
 
 
 def _forward_response_headers(upstream: httpx.Response) -> dict[str, str]:
@@ -84,10 +82,10 @@ def _extract_subdomain(host: str) -> str | None:
 
 
 def _resolve_timeout(path: str) -> float:
-    ext = os.path.splitext(path.split("?")[0])[1].lower()
-    if ext in _STATIC_EXTENSIONS:
-        return 5.0
-    return 15.0
+    clean = path.lstrip("/")
+    if clean.startswith("api"):
+        return 15.0
+    return 5.0
 
 
 async def _is_rate_limited(workspace_id: str, client_ip: str) -> bool:
@@ -96,9 +94,11 @@ async def _is_rate_limited(workspace_id: str, client_ip: str) -> bool:
         return False
     key = f"rate:{workspace_id}:{client_ip}"
     try:
-        count = await r.incr(key)
-        if count == 1:
-            await r.expire(key, _RATE_LIMIT_WINDOW)
+        pipeline = r.pipeline()
+        pipeline.incr(key)
+        pipeline.expire(key, _RATE_LIMIT_WINDOW)
+        results = await pipeline.execute()
+        count = results[0]
         return int(count) > _RATE_LIMIT_MAX
     except Exception as exc:
         logger.warning("Rate limit check failed for ip=%s workspace=%s: %s", client_ip, workspace_id, exc)
@@ -165,17 +165,18 @@ async def proxy_request(path: str, request: Request) -> Response:
         target_url = f"{target_url}?{request.url.query}"
 
     body = await request.body()
-    headers = _forward_request_headers(request)
+    headers = _forward_request_headers(request, request_id)
     timeout = _resolve_timeout(path)
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            upstream = await client.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                content=body,
-            )
+        async with _upstream_semaphore:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                upstream = await client.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    content=body,
+                )
     except httpx.TimeoutException:
         mark_workspace_health(workspace_id, healthy=False)
         logger.warning(

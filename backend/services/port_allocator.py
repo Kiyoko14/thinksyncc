@@ -14,6 +14,7 @@ PORT_MAX = 8000
 
 _FREE_SET = "ports:free"
 _USED_SET = "ports:used"
+_ACTIVE_SET = "ws:active"
 
 
 def _ws_port_key(workspace_id: str) -> str:
@@ -78,6 +79,12 @@ def allocate_port(workspace_id: str) -> int:
         )
 
     port = int(raw)
+
+    try:
+        r.sadd(_ACTIVE_SET, workspace_id)
+    except Exception:
+        pass
+
     logger.info("Allocated port %d for workspace %s", port, workspace_id)
     return port
 
@@ -155,6 +162,7 @@ def release_port(workspace_id: str) -> None:
     pipeline.delete(port_key)
     pipeline.srem(_USED_SET, str(port))
     pipeline.sadd(_FREE_SET, str(port))
+    pipeline.srem(_ACTIVE_SET, workspace_id)
     pipeline.execute()
 
     logger.info("Released port %d for workspace %s", port, workspace_id)
