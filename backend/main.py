@@ -6,20 +6,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from postgrest.exceptions import APIError
 from starlette.responses import Response
 
+import asyncio
 import json
 import logging
 import traceback
+from contextlib import asynccontextmanager
 from typing import Any
 
 from core.config import get_settings
 from routers import agents, auth, chat, commands, deployments, gateway, health, jobs, servers, workspaces, ws
+from services.health_checker import run_health_check_loop, run_startup_consistency_check
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(application):  # type: ignore[type-arg]
+    await run_startup_consistency_check()
+    task = asyncio.create_task(run_health_check_loop())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
+    lifespan=lifespan,
     # Disable interactive docs in production to reduce attack surface.
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url=None,

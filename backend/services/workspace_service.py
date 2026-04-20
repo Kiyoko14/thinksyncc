@@ -12,7 +12,7 @@ from core.config import get_settings
 from core.database import get_supabase
 from models.workspace import WorkspaceResponse
 from services.domain_service import assign_domain as _redis_assign_domain
-from services.port_allocator import allocate_port as _allocate_port, release_port as _release_port
+from services.port_allocator import allocate_port as _allocate_port, check_port_consistency as _check_consistency, release_port as _release_port
 from services.server_service import ServerService
 from services.slug_service import SlugService
 from services.ssh_service import SSHService
@@ -175,6 +175,11 @@ class WorkspaceService:
         slug = SlugService.generate_slug(cleaned_name)
         existing = WorkspaceService.get_workspace_by_slug(user_id=user_id, server_id=server_id, slug=slug)
         if existing:
+            # Run consistency check on startup so port state is always valid.
+            try:
+                _check_consistency(str(existing.get("id") or ""))
+            except Exception:
+                pass
             # Ensure remote folder exists for reliable writes/execution.
             try:
                 server = ServerService.get_server(server_id=server_id, user_id=user_id)
