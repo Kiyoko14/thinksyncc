@@ -147,6 +147,17 @@ def check_port_consistency(workspace_id: str) -> bool:
     return False
 
 
+def remove_from_active(workspace_id: str) -> None:
+    r = RedisService.get_sync_client()
+    if r is None:
+        return
+    try:
+        r.srem(_ACTIVE_SET, workspace_id)
+        logger.info("Removed workspace %s from active set", workspace_id)
+    except Exception as exc:
+        logger.warning("Failed to remove workspace %s from active set: %s", workspace_id, exc)
+
+
 def release_port(workspace_id: str) -> None:
     r = RedisService.get_sync_client()
     if r is None:

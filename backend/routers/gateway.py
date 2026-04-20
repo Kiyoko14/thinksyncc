@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
+from collections import defaultdict
 
 import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from services.domain_service import get_workspace_by_domain
+from services.http_client import get_http_client
 from services.port_allocator import get_port, mark_workspace_health
 from services.redis_service import RedisService
 
@@ -23,8 +26,24 @@ _ALLOWED_HOST_SUFFIX = "thinksync.art"
 _RATE_LIMIT_MAX = 100
 _RATE_LIMIT_WINDOW = 60
 
-_MAX_CONCURRENT = 50
-_upstream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+_PER_WS_CONCURRENCY = 10
+_ws_semaphores: defaultdict[str, asyncio.Semaphore] = defaultdict(
+    lambda: asyncio.Semaphore(_PER_WS_CONCURRENCY)
+)
+
+_SLIDING_WINDOW_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local uid = ARGV[4]
+local cutoff = now - window
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+redis.call('ZADD', key, now, uid)
+redis.call('EXPIRE', key, window + 1)
+local count = redis.call('ZCARD', key)
+if tonumber(count) > tonumber(limit) then return 1 else return 0 end
+"""
 
 _UNSAFE_REQUEST_HEADERS = {
     "connection",
@@ -92,14 +111,16 @@ async def _is_rate_limited(workspace_id: str, client_ip: str) -> bool:
     r = RedisService.get_async_client()
     if r is None:
         return False
-    key = f"rate:{workspace_id}:{client_ip}"
+    key = f"rate:sw:{workspace_id}:{client_ip}"
+    now = time.time()
+    uid = f"{now:.6f}-{uuid.uuid4().hex[:8]}"
     try:
-        pipeline = r.pipeline()
-        pipeline.incr(key)
-        pipeline.expire(key, _RATE_LIMIT_WINDOW)
-        results = await pipeline.execute()
-        count = results[0]
-        return int(count) > _RATE_LIMIT_MAX
+        result = await r.eval(
+            _SLIDING_WINDOW_SCRIPT, 1,
+            key,
+            str(now), str(_RATE_LIMIT_WINDOW), str(_RATE_LIMIT_MAX), uid,
+        )
+        return bool(result)
     except Exception as exc:
         logger.warning("Rate limit check failed for ip=%s workspace=%s: %s", client_ip, workspace_id, exc)
         return False
@@ -167,16 +188,17 @@ async def proxy_request(path: str, request: Request) -> Response:
     body = await request.body()
     headers = _forward_request_headers(request, request_id)
     timeout = _resolve_timeout(path)
+    semaphore = _ws_semaphores[workspace_id]
 
     try:
-        async with _upstream_semaphore:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                upstream = await client.request(
-                    method=request.method,
-                    url=target_url,
-                    headers=headers,
-                    content=body,
-                )
+        async with semaphore:
+            upstream = await get_http_client().request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=body,
+                timeout=timeout,
+            )
     except httpx.TimeoutException:
         mark_workspace_health(workspace_id, healthy=False)
         logger.warning(

@@ -8,8 +8,8 @@ import httpx
 from services.port_allocator import (
     _ACTIVE_SET,
     check_port_consistency,
-    get_port,
     mark_workspace_health,
+    remove_from_active,
 )
 from services.redis_service import RedisService
 
@@ -17,30 +17,67 @@ logger = logging.getLogger(__name__)
 
 _PING_INTERVAL = 30
 _PING_TIMEOUT = 5.0
+_EVICT_AFTER_FAILURES = 5
+
+_detected_endpoints: dict[str, str] = {}
+_unhealthy_streak: dict[str, int] = {}
 
 
 async def _ping_workspace(workspace_id: str, port: int) -> None:
-    health_url = f"http://127.0.0.1:{port}/health"
-    fallback_url = f"http://127.0.0.1:{port}/"
-    healthy = False
-    try:
-        async with httpx.AsyncClient(timeout=_PING_TIMEOUT) as client:
+    detected = _detected_endpoints.get(workspace_id)
+
+    async with httpx.AsyncClient(timeout=_PING_TIMEOUT) as client:
+        if detected == "health":
             try:
-                resp = await client.get(health_url)
+                resp = await client.get(f"http://127.0.0.1:{port}/health")
                 healthy = resp.status_code < 500
+            except Exception:
+                healthy = False
+
+        elif detected == "root":
+            try:
+                resp = await client.get(f"http://127.0.0.1:{port}/")
+                healthy = resp.status_code < 500
+            except Exception:
+                healthy = False
+
+        else:
+            try:
+                resp = await client.get(f"http://127.0.0.1:{port}/health")
+                if resp.status_code < 500:
+                    _detected_endpoints[workspace_id] = "health"
+                    healthy = True
+                else:
+                    _detected_endpoints[workspace_id] = "root"
+                    healthy = resp.status_code < 500
             except (httpx.ConnectError, httpx.TimeoutException):
-                resp = await client.get(fallback_url)
-                healthy = resp.status_code < 500
-    except Exception:
-        healthy = False
+                try:
+                    resp = await client.get(f"http://127.0.0.1:{port}/")
+                    healthy = resp.status_code < 500
+                    _detected_endpoints[workspace_id] = "root"
+                except Exception:
+                    healthy = False
+            except Exception:
+                healthy = False
+
     mark_workspace_health(workspace_id, healthy=healthy)
+
+    if healthy:
+        _unhealthy_streak.pop(workspace_id, None)
+    else:
+        streak = _unhealthy_streak.get(workspace_id, 0) + 1
+        _unhealthy_streak[workspace_id] = streak
+        if streak >= _EVICT_AFTER_FAILURES:
+            logger.warning(
+                "Health checker: workspace %s unhealthy for %d consecutive checks — evicting from active set",
+                workspace_id, streak,
+            )
+            remove_from_active(workspace_id)
+            _unhealthy_streak.pop(workspace_id, None)
+            _detected_endpoints.pop(workspace_id, None)
 
 
 async def _collect_active_workspaces() -> list[tuple[str, int]]:
-    """
-    Read from ws:active set — O(n) where n = active workspaces only,
-    instead of scanning all ws:*:port keys.
-    """
     r = RedisService.get_async_client()
     if r is None:
         return []
