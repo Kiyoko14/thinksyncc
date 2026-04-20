@@ -24,6 +24,19 @@ def _ws_type_key(workspace_id: str) -> str:
     return f"ws:{workspace_id}:type"
 
 
+_ALLOC_SCRIPT = """
+local existing = redis.call('GET', KEYS[1])
+if existing then return existing end
+local sz = redis.call('SCARD', KEYS[2])
+if tonumber(sz) == 0 then return false end
+local port = redis.call('SPOP', KEYS[2])
+if not port then return false end
+redis.call('SET', KEYS[1], port)
+redis.call('SADD', KEYS[3], port)
+return port
+"""
+
+
 def _initialize_pool_if_needed(r) -> None:
     if r.exists(_FREE_SET) or r.exists(_USED_SET):
         return
@@ -41,28 +54,18 @@ def allocate_port(workspace_id: str) -> int:
             detail={"code": "REDIS_UNAVAILABLE", "message": "Redis is required for port allocation"},
         )
 
-    port_key = _ws_port_key(workspace_id)
-
-    existing = r.get(port_key)
-    if existing is not None:
-        return int(existing)
-
     _initialize_pool_if_needed(r)
 
-    raw = r.spop(_FREE_SET)
-    if raw is None:
+    port_key = _ws_port_key(workspace_id)
+
+    raw = r.eval(_ALLOC_SCRIPT, 3, port_key, _FREE_SET, _USED_SET)
+    if not raw:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "NO_PORTS_AVAILABLE", "message": "No free ports available"},
         )
 
     port = int(raw)
-
-    pipeline = r.pipeline()
-    pipeline.set(port_key, str(port))
-    pipeline.sadd(_USED_SET, str(port))
-    pipeline.execute()
-
     logger.info("Allocated port %d for workspace %s", port, workspace_id)
     return port
 

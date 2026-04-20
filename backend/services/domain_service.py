@@ -30,6 +30,12 @@ def assign_domain(workspace_id: str, subdomain: str) -> str:
     if existing_domain is not None:
         return existing_domain
 
+    owner = r.get(lookup_key)
+    if owner is not None and owner != workspace_id:
+        raise ValueError(
+            f"Subdomain '{clean}' is already assigned to workspace {owner}"
+        )
+
     pipeline = r.pipeline()
     pipeline.set(domain_key, clean)
     pipeline.set(lookup_key, workspace_id)

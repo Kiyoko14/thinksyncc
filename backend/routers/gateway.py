@@ -15,6 +15,8 @@ router = APIRouter(tags=["gateway"])
 
 _SUPPORTED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
 
+_ALLOWED_HOST_SUFFIX = "thinksync.art"
+
 _HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -51,8 +53,15 @@ def _extract_subdomain(host: str) -> str | None:
 )
 async def proxy_request(path: str, request: Request) -> Response:
     host_header = request.headers.get("host", "")
-    subdomain = _extract_subdomain(host_header)
+    bare_host = host_header.split(":")[0].lower().strip()
 
+    if not bare_host.endswith(_ALLOWED_HOST_SUFFIX):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid host — only thinksync.art subdomains are accepted"},
+        )
+
+    subdomain = _extract_subdomain(host_header)
     if not subdomain:
         return JSONResponse(
             status_code=400,
@@ -69,7 +78,7 @@ async def proxy_request(path: str, request: Request) -> Response:
     port = get_port(workspace_id)
     if not port:
         return JSONResponse(
-            status_code=503,
+            status_code=500,
             content={"status": "error", "error": "Workspace has no allocated port"},
         )
 
@@ -81,13 +90,19 @@ async def proxy_request(path: str, request: Request) -> Response:
     headers = _forward_headers(request)
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             upstream = await client.request(
                 method=request.method,
                 url=target_url,
                 headers=headers,
                 content=body,
             )
+    except httpx.TimeoutException:
+        logger.warning("Gateway: upstream timeout at port %d for workspace %s", port, workspace_id)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": "Upstream workspace timed out"},
+        )
     except httpx.ConnectError:
         logger.warning("Gateway: upstream unreachable at port %d for workspace %s", port, workspace_id)
         return JSONResponse(
