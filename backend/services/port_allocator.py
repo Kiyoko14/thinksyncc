@@ -24,6 +24,18 @@ def _ws_type_key(workspace_id: str) -> str:
     return f"ws:{workspace_id}:type"
 
 
+_CONSISTENCY_SCRIPT = """
+local port = redis.call('GET', KEYS[1])
+if not port then return 0 end
+local in_used = redis.call('SISMEMBER', KEYS[2], port)
+if tonumber(in_used) == 0 then
+    redis.call('SADD', KEYS[2], port)
+    redis.call('SREM', KEYS[3], port)
+    return 1
+end
+return 0
+"""
+
 _ALLOC_SCRIPT = """
 local existing = redis.call('GET', KEYS[1])
 if existing then return existing end
@@ -90,6 +102,42 @@ def get_workspace_type(workspace_id: str) -> Optional[str]:
     if r is None:
         return None
     return r.get(_ws_type_key(workspace_id))
+
+
+def _ws_health_key(workspace_id: str) -> str:
+    return f"ws:{workspace_id}:health"
+
+
+def mark_workspace_health(workspace_id: str, healthy: bool) -> None:
+    r = RedisService.get_sync_client()
+    if r is None:
+        return
+    state = "healthy" if healthy else "unhealthy"
+    r.set(_ws_health_key(workspace_id), state, ex=300)
+    if not healthy:
+        logger.warning("Workspace %s marked unhealthy", workspace_id)
+
+
+def check_port_consistency(workspace_id: str) -> bool:
+    """
+    Verify ws:{id}:port is present in ports:used.
+    If not → atomically fix the inconsistency.
+    Returns True if a fix was applied, False if state was already consistent.
+    """
+    r = RedisService.get_sync_client()
+    if r is None:
+        return False
+    try:
+        fixed = r.eval(
+            _CONSISTENCY_SCRIPT, 3,
+            _ws_port_key(workspace_id), _USED_SET, _FREE_SET,
+        )
+        if int(fixed) == 1:
+            logger.warning("Consistency fix applied for workspace %s", workspace_id)
+            return True
+    except Exception as exc:
+        logger.warning("Consistency check failed for workspace %s: %s", workspace_id, exc)
+    return False
 
 
 def release_port(workspace_id: str) -> None:
