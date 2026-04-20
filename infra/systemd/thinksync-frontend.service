@@ -1,0 +1,35 @@
+[Unit]
+Description=ThinkSync Frontend (Next.js)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/thinksync/frontend
+EnvironmentFile=/etc/thinksync/frontend.env
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=2
+TimeoutStartSec=90
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log/thinksync /opt/thinksync/frontend
+
+LimitNOFILE=65535
+MemoryMax=750M
+CPUQuota=60%
+
+StandardOutput=append:/var/log/thinksync/frontend.log
+StandardError=append:/var/log/thinksync/frontend.log
+
+[Install]
+WantedBy=multi-user.target
+

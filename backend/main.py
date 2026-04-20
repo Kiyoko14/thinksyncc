@@ -1,4 +1,6 @@
 from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from postgrest.exceptions import APIError
@@ -6,6 +8,8 @@ from starlette.responses import Response
 
 import json
 import logging
+import traceback
+from typing import Any
 
 from core.config import get_settings
 from routers import agents, auth, chat, commands, deployments, health, jobs, servers, workspaces, ws
@@ -120,23 +124,83 @@ def _api_error_code(exc: APIError) -> str:
     return ""
 
 
+def _stringify_error_detail(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        if isinstance(detail.get("message"), str) and detail["message"].strip():
+            return detail["message"].strip()
+        if isinstance(detail.get("error"), str) and detail["error"].strip():
+            return detail["error"].strip()
+        if isinstance(detail.get("detail"), str) and detail["detail"].strip():
+            return detail["detail"].strip()
+        try:
+            return json.dumps(detail, ensure_ascii=False)
+        except Exception:
+            return str(detail)
+    if isinstance(detail, list):
+        try:
+            return json.dumps(detail, ensure_ascii=False)
+        except Exception:
+            return str(detail)
+    return str(detail)
+
+
+def _error_payload(message: str, *, request: Request | None = None, code: str | None = None, exc: Exception | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"status": "error", "error": message or "Unknown error"}
+    if code:
+        payload["code"] = code
+    if request is not None:
+        payload["path"] = request.url.path
+    if settings.DEBUG and exc is not None:
+        payload["exception_type"] = type(exc).__name__
+        payload["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return payload
+
+
 @app.exception_handler(APIError)
-async def handle_postgrest_error(_: Request, exc: APIError) -> JSONResponse:
+async def handle_postgrest_error(request: Request, exc: APIError) -> JSONResponse:
     code = _api_error_code(exc)
-    message = str(exc) or "PostgREST error"
+    message = _stringify_error_detail(getattr(exc, "args", [""])[0] if getattr(exc, "args", None) else exc)
     if code == "22P02":
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"detail": {"code": code, "message": message}},
+            content=_error_payload(message or "Invalid request data.", request=request, code=code, exc=exc),
         )
     if code in {"42501", "23503"}:
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
-            content={"detail": {"code": code, "message": message}},
+            content=_error_payload(message or "Access denied.", request=request, code=code, exc=exc),
         )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": {"code": code or "DB_ERROR", "message": message}},
+        content=_error_payload(message or "Database error", request=request, code=code or "DB_ERROR", exc=exc),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=_error_payload(_stringify_error_detail(exc.errors()), request=request, code="INVALID_REQUEST", exc=exc),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+    message = _stringify_error_detail(exc.detail)
+    code = str(exc.status_code)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_payload(message, request=request, code=code, exc=exc),
+    )
+
+
+@app.exception_handler(Exception)
+async def handle_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=_error_payload(f"{type(exc).__name__}: {exc}", request=request, code="INTERNAL_ERROR", exc=exc),
     )
 
 

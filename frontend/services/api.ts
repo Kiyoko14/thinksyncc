@@ -6,12 +6,14 @@ import { getToken, logout } from "./auth";
 export class ApiError extends Error {
   status: number;
   body: unknown;
+  rawText: string;
 
-  constructor(message: string, status: number, body: unknown) {
+  constructor(message: string, status: number, body: unknown, rawText = "") {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.body = body;
+    this.rawText = rawText;
   }
 }
 
@@ -43,55 +45,100 @@ function buildHeaders(options: RequestInit): Headers {
   return headers;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+async function readResponseBody(response: Response): Promise<{ text: string; body: unknown }> {
+  const text = await response.text();
+  console.log("RESPONSE STATUS:", response.status, response.statusText);
+  console.log("RAW RESPONSE:", text);
+
+  if (!text.trim()) {
+    return { text, body: null };
+  }
+
+  try {
+    return { text, body: JSON.parse(text) };
+  } catch {
+    return { text, body: text };
+  }
+}
+
+function extractErrorMessage(value: unknown): string | null {
+  if (typeof value === "string") {
+    const message = value.trim();
+    return message || null;
+  }
+
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const detailMessage = extractErrorMessage(value.detail);
+  if (detailMessage) return detailMessage;
+
+  const errorMessage = extractErrorMessage(value.error);
+  if (errorMessage) return errorMessage;
+
+  if (typeof value.message === "string" && value.message.trim()) {
+    return value.message.trim();
+  }
+
+  if (Array.isArray(value.errors)) {
+    const messages = value.errors.map(extractErrorMessage).filter((item): item is string => Boolean(item));
+    if (messages.length > 0) {
+      return messages.join("\n");
+    }
+  }
+
+  if (typeof value.code === "string" && value.code.trim()) {
+    return value.code.trim();
+  }
+
+  return null;
+}
+
+function buildErrorMessage(response: Response, body: unknown, text: string): string {
+  const fromBody = extractErrorMessage(body);
+  if (fromBody) return fromBody;
+
+  const fromText = text.trim();
+  if (fromText) return fromText;
+
+  const statusText = response.statusText.trim();
+  if (statusText) return `${response.status} ${statusText}`;
+
+  return `HTTP ${response.status}`;
+}
+
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { ...options, headers: buildHeaders(options) });
+  const { text, body } = response.status === 204 ? { text: "", body: null } : await readResponseBody(response);
 
   if (response.status === 401) {
     handleUnauthorized();
   }
 
   if (!response.ok) {
-    const contentType = response.headers.get("content-type") ?? "";
-    let body: unknown = null;
-    let detail = "Request failed";
-
-    if (contentType.includes("application/json")) {
-      body = await response.json().catch(() => null);
-      if (body && typeof body === "object" && "detail" in body) {
-        const rawDetail = (body as any).detail as unknown;
-        if (typeof rawDetail === "string") {
-          detail = rawDetail;
-        } else if (rawDetail && typeof rawDetail === "object") {
-          const code = (rawDetail as any).code as unknown;
-          const message = (rawDetail as any).message as unknown;
-          if (typeof code === "string" && typeof message === "string" && message.trim()) {
-            detail = `${code}: ${message}`;
-          } else if (typeof message === "string" && message.trim()) {
-            detail = message;
-          } else if (typeof code === "string" && code.trim()) {
-            detail = code;
-          }
-        }
-      }
-    } else {
-      body = await response.text().catch(() => null);
-      if (typeof body === "string" && body.trim()) detail = body;
-    }
-
-    if (response.status === 401) detail = "Unauthorized";
-    if (response.status === 403) detail = "Forbidden";
-
-    throw new ApiError(detail, response.status, body);
+    const error = new ApiError(buildErrorMessage(response, body, text), response.status, body, text);
+    console.error("API ERROR:", error);
+    throw error;
   }
 
   if (response.status === 204) return undefined as T;
 
-  const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
-    return (await response.text()) as T;
+  if (isRecord(body) && body.status === "error") {
+    const error = new ApiError(buildErrorMessage(response, body, text), response.status, body, text);
+    console.error("API ERROR:", error);
+    throw error;
   }
 
-  return response.json() as Promise<T>;
+  if (isRecord(body) && body.status === "success" && "data" in body) {
+    return body.data as T;
+  }
+
+  return body as T;
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -195,7 +242,9 @@ export interface AgentStep {
   step: number;
   tool: string;
   args: Record<string, unknown>;
-  rationale: string;
+  reason?: string;
+  rationale?: string;
+  risk_level?: string;
 }
 
 export interface StepResult {
@@ -293,6 +342,19 @@ export interface WorkspaceChatResponse {
   messages: StoredChatMessage[];
 }
 
+export interface ChatSendMessageResponse {
+  chat_id: string;
+  workspace_id: string;
+  response: string;
+  message: StoredChatMessage;
+}
+
+export const sendWorkspaceMessage = (workspace_id: string, message: string, role: ChatRole = "user") =>
+  request<ChatSendMessageResponse>(`/api/chat/${workspace_id}/message`, {
+    method: "POST",
+    body: JSON.stringify({ message, role }),
+  });
+
 export const runForgeV2 = (payload: ForgeV2RunRequest) =>
   request<ForgeV2JobResponse>("/api/agents/forge-v2/run", {
     method: "POST",
@@ -307,6 +369,12 @@ export const getForgeV2Plan = (payload: ForgeV2RunRequest) =>
     "/api/agents/forge-v2/plan",
     { method: "POST", body: JSON.stringify(payload) }
   );
+
+export const runPlanModeChat = (objective: string) =>
+  request<{ type: "chat"; message: string }>("/api/agents/route", {
+    method: "POST",
+    body: JSON.stringify({ mode: "plan", objective }),
+  });
 
 export const getWorkspaceChat = (workspace_id: string) =>
   request<WorkspaceChatResponse>(`/api/chat/${workspace_id}`);

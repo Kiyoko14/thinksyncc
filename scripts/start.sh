@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "▶  Starting ThinkSync backend…"
 cd "$ROOT_DIR/backend"
-python -m venv .venv --upgrade-deps
+python3 -m venv .venv --upgrade-deps
 source .venv/bin/activate
 pip install -q -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000 &

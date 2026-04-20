@@ -1,3 +1,5 @@
+import logging
+import os
 import shlex
 from datetime import datetime, timezone
 from typing import Any
@@ -6,6 +8,7 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
+from core.config import get_settings
 from core.database import get_supabase
 from models.workspace import WorkspaceResponse
 from services.server_service import ServerService
@@ -13,8 +16,83 @@ from services.slug_service import SlugService
 from services.ssh_service import SSHService
 
 
+logger = logging.getLogger(__name__)
+
+
 class WorkspaceService:
     _MAX_UNIQUE_ATTEMPTS = 50
+
+    @staticmethod
+    def _workspaces_root() -> str:
+        """
+        Root folder for all workspaces on the remote server.
+
+        Defaults to ~/workspaces (root: /root/workspaces) but can be overridden.
+        """
+        return "/root/workspaces"
+
+    @staticmethod
+    def _sanitize_workspace_name(user_input: str) -> str:
+        raw = (user_input or "").strip().lower()
+        if not raw:
+            return "workspace"
+        cleaned = []
+        prev_dash = False
+        for ch in raw:
+            is_alnum = ("a" <= ch <= "z") or ("0" <= ch <= "9")
+            if is_alnum:
+                cleaned.append(ch)
+                prev_dash = False
+                continue
+            if ch.isspace() or ch in {"-", "_"}:
+                if not prev_dash:
+                    cleaned.append("-")
+                    prev_dash = True
+                continue
+            # ignore other punctuation
+        name = "".join(cleaned).strip("-")
+        name = "-".join(part for part in name.split("-") if part)
+        return (name[:60] or "workspace")
+
+    @staticmethod
+    async def create_workspace_from_prompt(*, user_id: str, server_id: str, user_input: str) -> dict[str, Any]:
+        name = WorkspaceService._sanitize_workspace_name(user_input)
+        workspace = await WorkspaceService.resolve_workspace(user_id=user_id, server_id=server_id, name=name)
+        slug = str(workspace.get("slug") or name).strip().lower() or "workspace"
+        workspace_path = f"{WorkspaceService._workspaces_root()}/{slug}"
+
+        if not workspace_path.startswith("/root/workspaces"):
+            workspace_path = f"/root/workspaces/{slug}"
+
+        try:
+            os.makedirs(workspace_path, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            server = ServerService.get_server(server_id=server_id, user_id=user_id)
+            await SSHService.execute(server=server, command=f"mkdir -p {shlex.quote(workspace_path)}")
+        except Exception:
+            pass
+
+        try:
+            supabase = get_supabase()
+            supabase.table("workspaces").update({"path": workspace_path}).eq("id", str(workspace.get("id") or "")).execute()
+        except Exception:
+            pass
+
+        workspace["slug"] = slug
+        workspace["path"] = workspace_path
+        workspace["url"] = WorkspaceService._workspace_url(str(workspace.get("domain") or ""))
+        return workspace
+
+    @staticmethod
+    def _base_domain() -> str:
+        settings = get_settings()
+        value = (getattr(settings, "WORKSPACE_BASE_DOMAIN", None) or "").strip()
+        if not value:
+            value = os.getenv("THINKSYNC_WORKSPACE_BASE_DOMAIN", "").strip()
+        return value or "thinksync.art"
 
     @staticmethod
     def _api_error_code(exc: APIError) -> str:
@@ -43,7 +121,71 @@ class WorkspaceService:
     @staticmethod
     def _workspace_path(slug: str) -> str:
         # Deterministic project root for all workspaces.
-        return f"/home/root/workspaces/{slug}"
+        return f"{WorkspaceService._workspaces_root()}/{slug}"
+
+    @staticmethod
+    def _workspace_url(domain: str) -> str | None:
+        cleaned = (domain or "").strip()
+        if not cleaned:
+            return None
+        return f"https://{cleaned}"
+
+    @staticmethod
+    def get_workspace_by_slug(*, user_id: str, server_id: str, slug: str) -> dict[str, Any] | None:
+        WorkspaceService._validate_uuid(user_id, "user_id")
+        WorkspaceService._validate_uuid(server_id, "server_id")
+        cleaned_slug = (slug or "").strip().lower()
+        if not cleaned_slug:
+            return None
+
+        supabase = get_supabase()
+        try:
+            result = (
+                supabase.table("workspaces")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("server_id", server_id)
+                .eq("slug", cleaned_slug)
+                .maybe_single()
+                .execute()
+            )
+        except APIError:
+            return None
+
+        if not result or not result.data:
+            return None
+        row = dict(result.data)
+        return WorkspaceService._ensure_workspace_fields(row, supabase=supabase, user_id=user_id)
+
+    @staticmethod
+    async def resolve_workspace(*, user_id: str, server_id: str, name: str) -> dict[str, Any]:
+        """
+        Resolve a workspace by deterministic slug (derived from name).
+        If it exists, return it. Otherwise create a new workspace.
+        """
+        WorkspaceService._validate_uuid(user_id, "user_id")
+        WorkspaceService._validate_uuid(server_id, "server_id")
+
+        cleaned_name = (name or "").strip()
+        if not cleaned_name:
+            cleaned_name = "workspace"
+
+        slug = SlugService.generate_slug(cleaned_name)
+        existing = WorkspaceService.get_workspace_by_slug(user_id=user_id, server_id=server_id, slug=slug)
+        if existing:
+            # Ensure remote folder exists for reliable writes/execution.
+            try:
+                server = ServerService.get_server(server_id=server_id, user_id=user_id)
+                workspace_path = str(existing.get("path") or "").strip()
+                if workspace_path:
+                    mkdir_command = f"mkdir -p {shlex.quote(workspace_path)}"
+                    await SSHService.execute(server=server, command=mkdir_command)
+            except Exception:
+                pass
+            return existing
+
+        created = await WorkspaceService.create_workspace(user_id=user_id, server_id=server_id, name=cleaned_name)
+        return created.model_dump(mode="python")
 
     @staticmethod
     def _unique_slug(*, supabase, server_id: str, base_slug: str) -> str:
@@ -52,15 +194,35 @@ class WorkspaceService:
             base = "workspace"
 
         def exists(candidate: str) -> bool:
-            result = (
-                supabase.table("workspaces")
-                .select("id")
-                .eq("server_id", server_id)
-                .eq("slug", candidate)
-                .limit(1)
-                .execute()
-            )
-            return bool(result.data)
+            # Keep server-scoped slug uniqueness for workspace lookup.
+            try:
+                result = (
+                    supabase.table("workspaces")
+                    .select("id")
+                    .eq("server_id", server_id)
+                    .eq("slug", candidate)
+                    .limit(1)
+                    .execute()
+                )
+                if result.data:
+                    return True
+            except Exception:
+                pass
+
+            # Also ensure the derived subdomain is globally unique to avoid duplicate domains.
+            derived_domain = f"{candidate}.{WorkspaceService._base_domain()}"
+            try:
+                domain_result = (
+                    supabase.table("workspaces")
+                    .select("id")
+                    .eq("domain", derived_domain)
+                    .limit(1)
+                    .execute()
+                )
+                return bool(domain_result.data)
+            except Exception:
+                # Backward compatibility if the domain column doesn't exist yet.
+                return False
 
         if not exists(base):
             return base
@@ -90,10 +252,37 @@ class WorkspaceService:
         server = ServerService.get_server(server_id=server_id, user_id=user_id)
         supabase = get_supabase()
 
-        workspace_id = str(uuid4())
         base_slug = SlugService.generate_slug(cleaned_name)
+
+        # Idempotency / UX: if this workspace already exists (same user+server+slug), reuse it.
+        existing = WorkspaceService.get_workspace_by_slug(user_id=user_id, server_id=server_id, slug=base_slug)
+        if existing:
+            existing["url"] = WorkspaceService._workspace_url(str(existing.get("domain") or ""))
+            return WorkspaceResponse(**existing)
+
+        # Also reuse by exact name (prevents accidental duplicates from double-clicks / retries).
+        try:
+            by_name = (
+                supabase.table("workspaces")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("server_id", server_id)
+                .eq("name", cleaned_name)
+                .order("created_at", desc=True)
+                .limit(1)
+                .maybe_single()
+                .execute()
+            )
+            if by_name and by_name.data:
+                row = WorkspaceService._ensure_workspace_fields(dict(by_name.data), supabase=supabase, user_id=user_id)
+                row["url"] = WorkspaceService._workspace_url(str(row.get("domain") or ""))
+                return WorkspaceResponse(**row)
+        except Exception:
+            pass
+
+        workspace_id = str(uuid4())
         slug = WorkspaceService._unique_slug(supabase=supabase, server_id=server_id, base_slug=base_slug)
-        domain = SlugService.generate_domain(slug=slug, workspace_id=workspace_id)
+        domain = f"{slug}.{WorkspaceService._base_domain()}"
         workspace_path = WorkspaceService._workspace_path(slug)
 
         mkdir_command = f"mkdir -p {shlex.quote(workspace_path)}"
@@ -140,7 +329,9 @@ class WorkspaceService:
                 detail="Failed to create workspace",
             )
 
-        return WorkspaceResponse(**result.data[0])
+        payload = dict(result.data[0])
+        payload["url"] = WorkspaceService._workspace_url(str(payload.get("domain") or ""))
+        return WorkspaceResponse(**payload)
 
     @staticmethod
     def get_workspaces(user_id: str, server_id: str | None = None) -> list[WorkspaceResponse]:
@@ -199,6 +390,85 @@ class WorkspaceService:
         return WorkspaceService._ensure_workspace_fields(row, supabase=supabase, user_id=user_id)
 
     @staticmethod
+    def ensure_workspace_domain(*, workspace_id: str, user_id: str, desired_domain: str) -> tuple[str, bool]:
+        """
+        Ensure a workspace has a persisted domain.
+
+        Returns: (domain, reused_domain)
+        - reused_domain=True when an existing domain was already present and reused.
+        - reused_domain=False when the domain was missing and was written.
+        """
+        WorkspaceService._validate_uuid(workspace_id, "workspace_id")
+        WorkspaceService._validate_uuid(user_id, "user_id")
+
+        supabase = get_supabase()
+        try:
+            result = (
+                supabase.table("workspaces")
+                .select("id,domain")
+                .eq("id", workspace_id)
+                .eq("user_id", user_id)
+                .maybe_single()
+                .execute()
+            )
+        except Exception:
+            result = None
+
+        if not result or not result.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "WORKSPACE_NOT_FOUND"},
+            )
+
+        existing = (result.data.get("domain") or "").strip()
+        if existing:
+            return existing, True
+
+        cleaned = (desired_domain or "").strip().lower()
+        if not cleaned:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "invalid_domain", "message": "Invalid domain"},
+            )
+
+        def domain_taken(value: str) -> bool:
+            try:
+                check = supabase.table("workspaces").select("id").eq("domain", value).limit(1).execute()
+                return bool(check.data)
+            except Exception:
+                return False
+
+        candidate = cleaned
+        if domain_taken(candidate):
+            # Avoid duplicates by suffixing with a stable short id.
+            left, _, rest = candidate.partition(".")
+            short_id = (workspace_id or "").replace("-", "").lower()[:6] or "000000"
+            if rest:
+                candidate = f"{left}-{short_id}.{rest}"
+            else:
+                candidate = f"{left}-{short_id}"
+
+        try:
+            supabase.table("workspaces").update({"domain": candidate}).eq("id", workspace_id).eq("user_id", user_id).execute()
+        except APIError as exc:
+            code = WorkspaceService._api_error_code(exc)
+            if code == "23505" and candidate == cleaned:
+                left, _, rest = cleaned.partition(".")
+                short_id = (workspace_id or "").replace("-", "").lower()[:6] or "000000"
+                alt = f"{left}-{short_id}.{rest}" if rest else f"{left}-{short_id}"
+                supabase.table("workspaces").update({"domain": alt}).eq("id", workspace_id).eq("user_id", user_id).execute()
+                return alt, False
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "domain_conflict", "message": "Workspace domain already exists"},
+            )
+        except Exception:
+            # If persistence fails, still return the candidate, but caller should treat deployment as best-effort.
+            return candidate, False
+
+        return candidate, False
+
+    @staticmethod
     def _ensure_workspace_fields(
         row: dict[str, Any],
         *,
@@ -210,6 +480,15 @@ class WorkspaceService:
         path = (row.get("path") or "").strip()
 
         if slug and domain and path:
+            if not path.startswith("/root/workspaces"):
+                path = WorkspaceService._workspace_path(slug)
+                patch = {"path": path}
+                try:
+                    supabase.table("workspaces").update(patch).eq("id", str(row.get("id") or "")).execute()
+                except Exception:
+                    pass
+                row.update(patch)
+            row["url"] = WorkspaceService._workspace_url(domain)
             return row
 
         server_id = str(row.get("server_id") or "")
@@ -223,10 +502,13 @@ class WorkspaceService:
             patch["slug"] = slug
 
         if not domain:
-            domain = SlugService.generate_domain(slug=slug, workspace_id=workspace_id)
+            domain = f"{slug}.{WorkspaceService._base_domain()}"
             patch["domain"] = domain
 
         if not path:
+            path = WorkspaceService._workspace_path(slug)
+            patch["path"] = path
+        elif not path.startswith("/root/workspaces"):
             path = WorkspaceService._workspace_path(slug)
             patch["path"] = path
 
@@ -238,4 +520,5 @@ class WorkspaceService:
                 pass
             row.update(patch)
 
+        row["url"] = WorkspaceService._workspace_url(domain)
         return row

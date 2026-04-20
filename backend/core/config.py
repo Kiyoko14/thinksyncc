@@ -60,10 +60,25 @@ class Settings(BaseSettings):
     REDIS_CHAT_MEMORY_MAX_ITEMS: int = 50
     REDIS_JOB_EVENT_TTL_SECONDS: int = 60 * 60 * 6
     REDIS_JOB_EVENT_MAX_ITEMS: int = 1000
+    REDIS_CONTEXT_TTL_SECONDS: int = 60 * 10
+    REDIS_PATCH_SUCCESS_TTL_SECONDS: int = 60 * 20
+    REDIS_PATCH_PROCESSING_TTL_SECONDS: int = 60 * 5
+
+    # Context engine
+    AGENT_CONTEXT_MAX_FILES: int = 3
+    AGENT_CONTEXT_MAX_TOTAL_LINES: int = 260
+    AGENT_CONTEXT_MAX_LINES_PER_FILE: int = 120
+    AGENT_CONTEXT_MAX_INDEXED_FILES: int = 2000
 
     # OpenAI
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = "gpt-4o-mini"
+    # Optional model overrides for tiered performance/quality.
+    OPENAI_MODEL_CLASSIFIER: str | None = None
+    OPENAI_MODEL_PLANNER: str | None = None
+    OPENAI_MODEL_EXECUTOR: str | None = None
+    OPENAI_MODEL_DEBUG: str | None = None
+    OPENAI_MODEL_SUMMARY: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -9,6 +9,7 @@ from postgrest.exceptions import APIError
 
 from core.config import get_settings
 from core.database import get_supabase
+from core.value_coercion import value_to_str
 from models.chat import ChatMessageRole, StoredMessageResponse
 from services.redis_service import RedisService
 from services.workspace_service import WorkspaceService
@@ -24,11 +25,17 @@ class ChatService:
         return f"chat:{workspace_id}"
 
     @staticmethod
+    def _workspace_chat_name(workspace_id: str) -> str:
+        # Backward-compatible mapping for legacy `chats` schema (no workspace_id column):
+        # store a deterministic, unique chat "name" per workspace.
+        return f"ws:{workspace_id}"
+
+    @staticmethod
     def _message_to_cache_payload(message: StoredMessageResponse) -> str:
         return json.dumps(
             {
                 "id": message.id,
-                "role": message.role.value,
+                "role": value_to_str(getattr(message, "role", None)),
                 "content": message.content,
                 "created_at": message.created_at.isoformat(),
                 "chat_id": message.chat_id,
@@ -112,23 +119,42 @@ class ChatService:
         ChatService._validate_uuid(workspace_id, "workspace_id")
         ChatService._validate_uuid(user_id, "user_id")
 
-        WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
+        workspace = WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
 
         supabase = get_supabase()
-        result = (
-            supabase.table("chats")
-            .select("*")
-            .eq("workspace_id", workspace_id)
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if not result or not result.data:
+        try:
+            # New schema (preferred): chats.workspace_id exists.
+            result = (
+                supabase.table("chats")
+                .select("*")
+                .eq("workspace_id", workspace_id)
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if result and result.data:
+                return result.data[0]
             return None
+        except APIError:
+            # Legacy schema fallback: chats has server_id + name, but no workspace_id.
+            legacy_name = ChatService._workspace_chat_name(workspace_id)
+            try:
+                legacy = (
+                    supabase.table("chats")
+                    .select("*")
+                    .eq("server_id", workspace["server_id"])
+                    .eq("user_id", user_id)
+                    .eq("name", legacy_name)
+                    .maybe_single()
+                    .execute()
+                )
+            except APIError:
+                return None
 
-        return result.data[0]
+            if not legacy or not legacy.data:
+                return None
+            return legacy.data
 
     @staticmethod
     def create_chat(workspace_id: str, user_id: str) -> dict[str, Any]:
@@ -152,27 +178,26 @@ class ChatService:
             result = supabase.table("chats").insert(payload).execute()
         except APIError as exc:
             code = ChatService._api_error_code(exc)
-            if code == "23502":
-                # Backward compatibility: legacy schema requires server_id and name.
-                legacy_payload = {
-                    **payload,
-                    "server_id": workspace["server_id"],
-                    "name": f"Workspace: {workspace['name']}",
-                }
-                try:
-                    result = supabase.table("chats").insert(legacy_payload).execute()
-                except APIError as legacy_exc:
-                    legacy_code = ChatService._api_error_code(legacy_exc)
-                    if legacy_code in {"23503", "42501"}:
-                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-                    if legacy_code == "22P02":
-                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request data")
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create chat")
-            elif code in {"23503", "42501"}:
+            if code in {"23503", "42501"}:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-            elif code == "22P02":
+            if code == "22P02":
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request data")
-            else:
+
+            # Backward compatibility: legacy schema requires server_id and name (and may not have workspace_id).
+            legacy_payload = {
+                "server_id": workspace["server_id"],
+                "user_id": user_id,
+                "name": ChatService._workspace_chat_name(workspace_id),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                result = supabase.table("chats").insert(legacy_payload).execute()
+            except APIError as legacy_exc:
+                legacy_code = ChatService._api_error_code(legacy_exc)
+                if legacy_code in {"23503", "42501"}:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+                if legacy_code == "22P02":
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request data")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create chat")
 
         if not result or not result.data:
@@ -314,11 +339,11 @@ class ChatService:
         cleaned_current = (current_input or "").strip()
         if trimmed and cleaned_current:
             last_message = trimmed[-1]
-            if last_message.role == ChatMessageRole.USER and last_message.content.strip() == cleaned_current:
+            if value_to_str(getattr(last_message, "role", None)) == ChatMessageRole.USER.value and last_message.content.strip() == cleaned_current:
                 trimmed = trimmed[:-1]
 
         return [
-            {"role": message.role.value, "content": message.content}
+            {"role": value_to_str(getattr(message, "role", None)), "content": message.content}
             for message in trimmed
         ]
 

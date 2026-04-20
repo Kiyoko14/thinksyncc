@@ -6,7 +6,12 @@ import { validateStoredToken } from "@/services/auth";
 
 function isPublicPath(pathname: string | null): boolean {
   if (!pathname) return false;
-  return pathname === "/" || pathname === "/login" || pathname === "/signup";
+  return (
+    pathname === "/" ||
+    pathname === "/login" ||
+    pathname === "/signup" ||
+    pathname === "/demo"
+  );
 }
 
 export default function AuthBootstrap({ children }: { children: React.ReactNode }) {

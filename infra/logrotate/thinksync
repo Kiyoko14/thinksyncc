@@ -1,0 +1,12 @@
+/var/log/thinksync/*.log /var/log/nginx/thinksync.*.log {
+  daily
+  rotate 14
+  size 50M
+  missingok
+  notifempty
+  compress
+  delaycompress
+  copytruncate
+  create 0640 root adm
+}
+

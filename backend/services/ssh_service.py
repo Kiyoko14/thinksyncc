@@ -10,6 +10,7 @@ import asyncssh
 from fastapi import HTTPException, status
 
 from core.config import get_settings
+from core.mode_context import get_request_mode
 from models.message import CommandResponse
 
 logger = logging.getLogger(__name__)
@@ -227,6 +228,12 @@ class SSHService:
         ssh_password: str | None = None,
         ssh_key: str | None = None,
     ) -> None:
+        if get_request_mode() == "plan":
+            raise SSHService._http_error(
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="PLAN_MODE_BLOCKED",
+                message="Server access is blocked in plan mode.",
+            )
         settings = get_settings()
 
         host_clean = SSHService._require_nonempty_str(host, "host")
@@ -290,6 +297,12 @@ class SSHService:
         command_timeout: int | None = None,
         on_output_chunk: Callable[[str, str], Awaitable[None] | None] | None = None,
     ) -> CommandResponse:
+        if get_request_mode() == "plan":
+            raise SSHService._http_error(
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="PLAN_MODE_BLOCKED",
+                message="Execution is blocked in plan mode.",
+            )
         settings = get_settings()
         effective_timeout = command_timeout or settings.SSH_COMMAND_TIMEOUT
 

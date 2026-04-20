@@ -16,6 +16,7 @@ class WorkspaceResponse(BaseModel):
     path: str
     slug: str
     domain: str
+    url: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

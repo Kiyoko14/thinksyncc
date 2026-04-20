@@ -3,6 +3,19 @@ from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+from pydantic.alias_generators import to_snake
+from pydantic.functional_validators import AfterValidator
+from typing_extensions import Annotated
+
+
+def _non_empty_str(value: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError("Value must be a non-empty string")
+    return cleaned
+
+
+NonEmptyStr = Annotated[str, AfterValidator(_non_empty_str)]
 
 
 class AgentTier(str, Enum):
@@ -124,9 +137,10 @@ class AgentStep(BaseModel):
     """A single step in an LLM-generated execution plan."""
 
     step: int = Field(..., ge=1)
-    tool: ToolName
-    args: dict[str, Any] = Field(default_factory=dict)
-    rationale: str
+    tool: str = Field(..., min_length=1)
+    args: dict = Field(default_factory=dict)
+    reason: str = Field(..., min_length=1)
+    risk_level: str = "safe"
 
 
 class AgentPlan(BaseModel):
@@ -167,6 +181,8 @@ class ToolCallingLoopResult(BaseModel):
     plan: list[AgentStep] = []
     steps: list[StepResult] = []
     decisions: list[AgentDecision] = []
+    errors: list[dict[str, Any]] = []
+    retries: list[dict[str, Any]] = []
     summary: str = ""
     success: bool = True
     steps_taken: int = 0
@@ -178,7 +194,7 @@ class ForgeV2RunRequest(BaseModel):
     objective: str = Field(..., min_length=3, max_length=1000)
     max_steps: int = Field(default=8, ge=1, le=20)
     max_retries: int | None = Field(default=None, ge=0, le=5)
-    allow_write: bool = False
+    allow_write: bool | None = None
     dry_run: bool = False
     step_timeout_seconds: int | None = Field(default=None, ge=5, le=600)
 

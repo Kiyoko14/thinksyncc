@@ -5,6 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from core.security import get_current_user
 from models.job import JobAccepted, JobCreate, JobResponse
 from services.agent_service import AgentService
+from services import logger as obs
 from services.workspace_service import WorkspaceService
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -17,9 +18,12 @@ async def submit_job(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> JobAccepted:
     """Submit a natural-language job. Returns immediately; poll or stream for results."""
+    trace_id = obs.new_trace_id()
+    if payload.allow_write is None:
+        payload.allow_write = True
     user_id: str = current_user["sub"]
-    accepted = AgentService.submit_job(user_id=user_id, payload=payload)
-    background_tasks.add_task(AgentService.run_job, accepted.id, payload, user_id)
+    accepted = AgentService.submit_job(user_id=user_id, payload=payload, trace_id=trace_id)
+    background_tasks.add_task(AgentService.run_job, accepted.id, payload, user_id, trace_id=trace_id)
     return accepted
 
 

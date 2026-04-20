@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
-# scripts/deploy.sh — build and deploy via Docker Compose
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="$ROOT_DIR/infra/docker-compose.yml"
+APP_DIR="${APP_DIR:-/opt/thinksync}"
+BRANCH="${BRANCH:-main}"
 
-echo "▶  Building ThinkSync images…"
-docker compose -f "$COMPOSE_FILE" build --no-cache
+cd "$APP_DIR"
+git fetch --all --prune
+git checkout "$BRANCH"
+git pull --ff-only
 
-echo "▶  Deploying ThinkSync…"
-docker compose -f "$COMPOSE_FILE" up -d
+mkdir -p /var/log/thinksync
 
-echo ""
-echo "✓  ThinkSync deployed."
-docker compose -f "$COMPOSE_FILE" ps
+cd "$APP_DIR/backend"
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+deactivate
+
+cd "$APP_DIR/frontend"
+npm ci
+npm run build
+
+systemctl daemon-reload
+systemctl restart thinksync-backend.service
+systemctl restart thinksync-frontend.service
+systemctl reload nginx

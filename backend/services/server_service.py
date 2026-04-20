@@ -7,6 +7,7 @@ from postgrest.exceptions import APIError
 
 from core.crypto import decrypt_secret, encrypt_secret
 from core.database import get_supabase
+from core.value_coercion import value_to_str
 from models.server import ServerCreate, ServerResponse
 from services.ssh_service import SSHService
 
@@ -81,11 +82,12 @@ class ServerService:
     @staticmethod
     async def create_server(user_id: str, data: ServerCreate) -> ServerResponse:
         ServerService._validate_uuid(user_id, "user_id")
+        ssh_auth_method = value_to_str(getattr(data, "ssh_auth_method", None))
         await SSHService.validate_server_connection(
             host=data.host,
             port=data.ssh_port,
             username=data.ssh_user,
-            auth_method=data.ssh_auth_method.value,
+            auth_method=ssh_auth_method,
             ssh_password=data.ssh_password,
             ssh_key=data.ssh_key,
         )
@@ -96,7 +98,7 @@ class ServerService:
             "host": data.host,
             "ssh_user": data.ssh_user,
             "ssh_port": data.ssh_port,
-            "ssh_auth_method": data.ssh_auth_method.value,
+            "ssh_auth_method": ssh_auth_method,
             "ssh_key": encrypt_secret(data.ssh_key),
             "ssh_password": encrypt_secret(data.ssh_password),
             "created_at": datetime.now(timezone.utc).isoformat(),

@@ -2,6 +2,65 @@ const TOKEN_KEY = "thinksync_token";
 
 export type JwtPayload = Record<string, unknown> & { exp?: number; sub?: string };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+async function readResponseBody(response: Response): Promise<{ text: string; body: unknown }> {
+  const text = await response.text();
+  console.log("RAW RESPONSE:", text);
+
+  if (!text.trim()) {
+    return { text, body: null };
+  }
+
+  try {
+    return { text, body: JSON.parse(text) };
+  } catch {
+    return { text, body: text };
+  }
+}
+
+function extractErrorMessage(value: unknown): string | null {
+  if (typeof value === "string") {
+    const message = value.trim();
+    return message || null;
+  }
+
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const detailMessage = extractErrorMessage(value.detail);
+  if (detailMessage) return detailMessage;
+
+  const errorMessage = extractErrorMessage(value.error);
+  if (errorMessage) return errorMessage;
+
+  if (typeof value.message === "string" && value.message.trim()) {
+    return value.message.trim();
+  }
+
+  if (typeof value.code === "string" && value.code.trim()) {
+    return value.code.trim();
+  }
+
+  return null;
+}
+
+function buildErrorMessage(response: Response, body: unknown, text: string): string {
+  const fromBody = extractErrorMessage(body);
+  if (fromBody) return fromBody;
+
+  const fromText = text.trim();
+  if (fromText) return fromText;
+
+  const statusText = response.statusText.trim();
+  if (statusText) return `${response.status} ${statusText}`;
+
+  return `HTTP ${response.status}`;
+}
+
 function base64UrlDecode(input: string): string {
   const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
@@ -43,13 +102,21 @@ export async function login(email: string, password: string): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
+  const { text, body } = await readResponseBody(response);
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: "Login failed" }));
-    throw new Error(body.detail ?? "Login failed");
+    const error = new Error(buildErrorMessage(response, body, text));
+    console.error("API ERROR:", error);
+    throw error;
   }
 
-  const { access_token } = (await response.json()) as { access_token: string };
+  if (!isRecord(body) || typeof body.access_token !== "string") {
+    const error = new Error(buildErrorMessage(response, body, text));
+    console.error("API ERROR:", error);
+    throw error;
+  }
+
+  const { access_token } = body as { access_token: string };
   setToken(access_token);
 }
 
@@ -59,13 +126,21 @@ export async function register(email: string, password: string): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
+  const { text, body } = await readResponseBody(response);
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: "Registration failed" }));
-    throw new Error(body.detail ?? "Registration failed");
+    const error = new Error(buildErrorMessage(response, body, text));
+    console.error("API ERROR:", error);
+    throw error;
   }
 
-  const { access_token } = (await response.json()) as { access_token: string };
+  if (!isRecord(body) || typeof body.access_token !== "string") {
+    const error = new Error(buildErrorMessage(response, body, text));
+    console.error("API ERROR:", error);
+    throw error;
+  }
+
+  const { access_token } = body as { access_token: string };
   setToken(access_token);
 }
 
