@@ -1,6 +1,46 @@
+import random
 import re
 import string
 from fastapi import HTTPException, status
+
+
+_NORMALIZED_NAME_RE = re.compile(r"^[a-z0-9]+$")
+_RANDOM_SLUG_ALPHABET = string.ascii_lowercase + string.digits
+_RANDOM_SLUG_LENGTH = 6
+_MAX_NAME_LENGTH = 10
+_MAX_SUBDOMAIN_LENGTH = 63
+
+
+def normalize_name(name: str) -> str:
+    """Strict workspace name validator. Lowercase alphanumeric, max 10 chars."""
+    cleaned = (name or "").strip().lower()
+    if not _NORMALIZED_NAME_RE.match(cleaned):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only letters and numbers allowed",
+        )
+    if len(cleaned) > _MAX_NAME_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Max 10 characters",
+        )
+    return cleaned
+
+
+def generate_random_slug() -> str:
+    """Generate a 6-char [a-z0-9] random slug (uniqueness checked by caller)."""
+    return "".join(random.choices(_RANDOM_SLUG_ALPHABET, k=_RANDOM_SLUG_LENGTH))
+
+
+def build_subdomain(normalized_name: str, slug: str) -> str:
+    """Build {name}-{slug} subdomain and validate total length ≤ 63."""
+    subdomain = f"{normalized_name}-{slug}"
+    if len(subdomain) > _MAX_SUBDOMAIN_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Subdomain too long",
+        )
+    return subdomain
 
 
 class SlugService:

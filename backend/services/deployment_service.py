@@ -7,6 +7,8 @@ from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
 from core.database import get_supabase
+from services.port_allocator import allocate_port
+from services.redis_service import RedisService
 from services.server_service import ServerService
 from services.ssh_service import SSHService
 
@@ -143,39 +145,8 @@ class DeploymentService:
             return None
         return existing.data[0]
 
-    @staticmethod
-    def get_next_available_port() -> int:
-        """Allocate next available port from pool."""
-        supabase = get_supabase()
-        try:
-            result = (
-                supabase.table("workspace_deployments")
-                .select("port")
-                .eq("is_active", True)
-                .execute()
-            )
-
-            used_ports = {
-                row.get("port")
-                for row in (result.data or [])
-                if isinstance(row.get("port"), int)
-            }
-            for port in range(DeploymentService._MIN_PORT, DeploymentService._MAX_PORT + 1):
-                if port not in used_ports:
-                    return port
-        except APIError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "message": "Failed to allocate deployment port",
-                    "error": str(exc),
-                },
-            )
-
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No ports available for deployment",
-        )
+    # NOTE: get_next_available_port() removed — replaced by Redis-backed
+    # services.port_allocator.allocate_port (single source of truth, range 3000-8000).
 
     @staticmethod
     async def create_deployment(workspace_id: str, user_id: str) -> dict[str, Any]:
@@ -195,10 +166,7 @@ class DeploymentService:
         supabase = get_supabase()
         existing = DeploymentService._get_existing_deployment(supabase=supabase, workspace_id=workspace_id)
 
-        if existing and isinstance(existing.get("port"), int):
-            port = existing["port"]
-        else:
-            port = DeploymentService.get_next_available_port()
+        port = allocate_port(workspace_id)
 
         run_command = DeploymentService._deployment_command(workspace_path=workspace_path, port=port)
 
@@ -239,6 +207,21 @@ class DeploymentService:
                     "output": (verify_result.output or "")[:2000],
                 },
             )
+
+        # Sync deployment state into Redis (single source of truth for the gateway).
+        try:
+            r = RedisService.get_sync_client()
+            if r is not None:
+                domain_value = str(workspace.get("domain") or "").strip().lower()
+                subdomain = domain_value.split(".", 1)[0] if domain_value else ""
+                pipe = r.pipeline()
+                pipe.set(f"ws:{workspace_id}:port", port)
+                if subdomain:
+                    pipe.set(f"ws_domain:{subdomain}", workspace_id)
+                pipe.sadd("ws:active", workspace_id)
+                pipe.execute()
+        except Exception:
+            pass
 
         if existing:
             payload = {

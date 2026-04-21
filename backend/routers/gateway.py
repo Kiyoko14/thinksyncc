@@ -23,6 +23,8 @@ _SUPPORTED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
 
 _ALLOWED_HOST_SUFFIX = "thinksync.art"
 
+_RESERVED_SUBDOMAINS = {"app", "api", "www"}
+
 _RATE_LIMIT_MAX = 100
 _RATE_LIMIT_WINDOW = 60
 
@@ -139,8 +141,8 @@ async def proxy_request(path: str, request: Request) -> Response:
     if not bare_host.endswith(_ALLOWED_HOST_SUFFIX):
         logger.warning("rid=%s Gateway: rejected invalid host '%s'", request_id, bare_host)
         return JSONResponse(
-            status_code=400,
-            content={"status": "error", "error": "Invalid host — only thinksync.art subdomains are accepted"},
+            status_code=404,
+            content={"status": "error", "error": "Invalid host"},
         )
 
     subdomain = _extract_subdomain(host_header)
@@ -148,7 +150,21 @@ async def proxy_request(path: str, request: Request) -> Response:
         logger.warning("rid=%s Gateway: no subdomain in host '%s'", request_id, bare_host)
         return JSONResponse(
             status_code=404,
-            content={"status": "error", "error": "No workspace found — subdomain missing or invalid"},
+            content={"status": "error", "error": "No subdomain in host"},
+        )
+
+    if subdomain in _RESERVED_SUBDOMAINS:
+        logger.info("rid=%s Gateway: reserved subdomain '%s' — 404", request_id, subdomain)
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "error": "Reserved subdomain"},
+        )
+
+    if "-" not in subdomain:
+        logger.info("rid=%s Gateway: invalid subdomain format '%s' — must be name-slug", request_id, subdomain)
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "error": "Invalid subdomain format"},
         )
 
     workspace_id = get_workspace_by_domain(subdomain)

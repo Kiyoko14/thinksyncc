@@ -14,7 +14,11 @@ from models.workspace import WorkspaceResponse
 from services.domain_service import assign_domain as _redis_assign_domain
 from services.port_allocator import allocate_port as _allocate_port, check_port_consistency as _check_consistency, release_port as _release_port
 from services.server_service import ServerService
-from services.slug_service import SlugService
+from services.slug_service import (
+    SlugService,
+    build_subdomain as _build_subdomain,
+    generate_random_slug as _generate_random_slug,
+)
 from services.ssh_service import SSHService
 
 
@@ -35,26 +39,12 @@ class WorkspaceService:
 
     @staticmethod
     def _sanitize_workspace_name(user_input: str) -> str:
+        """Coerce arbitrary input into a strict-compliant name (alphanumeric, max 10)."""
         raw = (user_input or "").strip().lower()
-        if not raw:
-            return "workspace"
-        cleaned = []
-        prev_dash = False
-        for ch in raw:
-            is_alnum = ("a" <= ch <= "z") or ("0" <= ch <= "9")
-            if is_alnum:
-                cleaned.append(ch)
-                prev_dash = False
-                continue
-            if ch.isspace() or ch in {"-", "_"}:
-                if not prev_dash:
-                    cleaned.append("-")
-                    prev_dash = True
-                continue
-            # ignore other punctuation
-        name = "".join(cleaned).strip("-")
-        name = "-".join(part for part in name.split("-") if part)
-        return (name[:60] or "workspace")
+        cleaned = "".join(ch for ch in raw if ("a" <= ch <= "z") or ("0" <= ch <= "9"))
+        if not cleaned:
+            cleaned = "ws"
+        return cleaned[:10]
 
     @staticmethod
     async def create_workspace_from_prompt(*, user_id: str, server_id: str, user_input: str) -> dict[str, Any]:
@@ -195,6 +185,28 @@ class WorkspaceService:
         return created.model_dump(mode="python")
 
     @staticmethod
+    def _unique_random_slug(*, supabase) -> str:
+        """Generate a globally unique 6-char random slug."""
+        for _ in range(WorkspaceService._MAX_UNIQUE_ATTEMPTS):
+            candidate = _generate_random_slug()
+            try:
+                result = (
+                    supabase.table("workspaces")
+                    .select("id")
+                    .eq("slug", candidate)
+                    .limit(1)
+                    .execute()
+                )
+                if not result.data:
+                    return candidate
+            except Exception:
+                return candidate
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to generate unique slug",
+        )
+
+    @staticmethod
     def _unique_slug(*, supabase, server_id: str, base_slug: str) -> str:
         base = (base_slug or "").strip().lower()
         if not base:
@@ -288,8 +300,10 @@ class WorkspaceService:
             pass
 
         workspace_id = str(uuid4())
-        slug = WorkspaceService._unique_slug(supabase=supabase, server_id=server_id, base_slug=base_slug)
-        domain = f"{slug}.{WorkspaceService._base_domain()}"
+        normalized_name = WorkspaceService._sanitize_workspace_name(cleaned_name) or base_slug or "ws"
+        slug = WorkspaceService._unique_random_slug(supabase=supabase)
+        subdomain = _build_subdomain(normalized_name, slug)
+        domain = f"{subdomain}.{WorkspaceService._base_domain()}"
         workspace_path = WorkspaceService._workspace_path(slug)
 
         mkdir_command = f"mkdir -p {shlex.quote(workspace_path)}"
@@ -347,7 +361,6 @@ class WorkspaceService:
             logger.warning("Port allocation failed for workspace %s — Redis may be unavailable", workspace_id)
 
         try:
-            subdomain = slug
             _redis_assign_domain(workspace_id, subdomain)
         except Exception:
             logger.warning("Domain assignment failed for workspace %s — Redis may be unavailable", workspace_id)
