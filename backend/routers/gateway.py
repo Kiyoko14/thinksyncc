@@ -127,7 +127,7 @@ async def _is_rate_limited(workspace_id: str, client_ip: str) -> bool:
 
 
 @router.api_route(
-    "/gateway/{path:path}",
+    "/{path:path}",
     methods=list(_SUPPORTED_METHODS),
     include_in_schema=False,
 )

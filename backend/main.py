@@ -115,10 +115,12 @@ async def log_http_requests(request: Request, call_next):  # type: ignore[overri
         media_type=response.media_type,
     )
 
-# Health check lives at the root level.
-app.include_router(health.router)
 
-# Application API routes.
+# Gateway FIRST
+app.include_router(gateway.router)
+
+# keyin qolganlar
+app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(servers.router)
 app.include_router(commands.router)
@@ -128,7 +130,6 @@ app.include_router(deployments.router)
 app.include_router(agents.router)
 app.include_router(jobs.router)
 app.include_router(ws.router)
-app.include_router(gateway.router)
 
 
 def _api_error_code(exc: APIError) -> str:
