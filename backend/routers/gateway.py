@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -24,6 +25,8 @@ _SUPPORTED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
 _ALLOWED_HOST_SUFFIX = "thinksync.art"
 
 _RESERVED_SUBDOMAINS = {"app", "api", "www"}
+
+_SUBDOMAIN_RE = re.compile(r"^[a-z0-9]{1,10}-[a-z0-9]{6}$")
 
 _RATE_LIMIT_MAX = 100
 _RATE_LIMIT_WINDOW = 60
@@ -160,8 +163,8 @@ async def proxy_request(path: str, request: Request) -> Response:
             content={"status": "error", "error": "Reserved subdomain"},
         )
 
-    if "-" not in subdomain:
-        logger.info("rid=%s Gateway: invalid subdomain format '%s' — must be name-slug", request_id, subdomain)
+    if not _SUBDOMAIN_RE.match(subdomain):
+        logger.info("rid=%s Gateway: invalid subdomain format '%s'", request_id, subdomain)
         return JSONResponse(
             status_code=404,
             content={"status": "error", "error": "Invalid subdomain format"},
@@ -174,6 +177,11 @@ async def proxy_request(path: str, request: Request) -> Response:
             status_code=404,
             content={"status": "error", "error": f"No workspace found for subdomain '{subdomain}'"},
         )
+
+    logger.info(
+        "Gateway route | subdomain=%s workspace_id=%s port=%s",
+        subdomain, workspace_id, get_port(workspace_id),
+    )
 
     client_ip = request.client.host if request.client else "unknown"
     if await _is_rate_limited(workspace_id, client_ip):

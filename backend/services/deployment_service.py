@@ -209,19 +209,33 @@ class DeploymentService:
             )
 
         # Sync deployment state into Redis (single source of truth for the gateway).
+        # Order is critical: PM2 start → verify_http_server OK → Redis write.
+        from services.slug_service import build_subdomain
+        from services.workspace_service import WorkspaceService
+
+        r = RedisService.get_sync_client()
+        if r is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Critical: Redis sync failed",
+            )
+
+        normalized_name = WorkspaceService._sanitize_workspace_name(str(workspace.get("name") or ""))
+        slug = str(workspace.get("slug") or "").strip().lower()
+        subdomain = build_subdomain(normalized_name, slug)
+
+        pipe = r.pipeline()
+        pipe.set(f"ws:{workspace_id}:port", port)
+        pipe.set(f"ws_domain:{subdomain}", workspace_id)
+        pipe.sadd("ws:active", workspace_id)
+
         try:
-            r = RedisService.get_sync_client()
-            if r is not None:
-                domain_value = str(workspace.get("domain") or "").strip().lower()
-                subdomain = domain_value.split(".", 1)[0] if domain_value else ""
-                pipe = r.pipeline()
-                pipe.set(f"ws:{workspace_id}:port", port)
-                if subdomain:
-                    pipe.set(f"ws_domain:{subdomain}", workspace_id)
-                pipe.sadd("ws:active", workspace_id)
-                pipe.execute()
+            pipe.execute()
         except Exception:
-            pass
+            raise HTTPException(
+                status_code=500,
+                detail="Critical: Redis sync failed",
+            )
 
         if existing:
             payload = {
