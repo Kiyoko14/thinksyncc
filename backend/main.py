@@ -17,6 +17,7 @@ from core.config import get_settings
 from routers import agents, auth, chat, commands, deployments, gateway, health, jobs, servers, workspaces, ws
 from services.health_checker import run_health_check_loop, run_startup_consistency_check
 from services.http_client import close_http_client, init_http_client
+from services.redis_service import init_async_redis, init_redis
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(application):  # type: ignore[type-arg]
+    init_redis()
+    await init_async_redis()
+    logger.info("Redis connected (sync + async)")
     await init_http_client()
     await run_startup_consistency_check()
     task = asyncio.create_task(run_health_check_loop())

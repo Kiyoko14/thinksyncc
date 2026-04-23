@@ -115,20 +115,16 @@ def _resolve_timeout(path: str) -> float:
 async def _is_rate_limited(workspace_id: str, client_ip: str) -> bool:
     r = RedisService.get_async_client()
     if r is None:
-        return False
+        raise RuntimeError("Async Redis unavailable")
     key = f"rate:sw:{workspace_id}:{client_ip}"
     now = time.time()
     uid = f"{now:.6f}-{uuid.uuid4().hex[:8]}"
-    try:
-        result = await r.eval(
-            _SLIDING_WINDOW_SCRIPT, 1,
-            key,
-            str(now), str(_RATE_LIMIT_WINDOW), str(_RATE_LIMIT_MAX), uid,
-        )
-        return bool(result)
-    except Exception as exc:
-        logger.warning("Rate limit check failed for ip=%s workspace=%s: %s", client_ip, workspace_id, exc)
-        return False
+    result = await r.eval(
+        _SLIDING_WINDOW_SCRIPT, 1,
+        key,
+        str(now), str(_RATE_LIMIT_WINDOW), str(_RATE_LIMIT_MAX), uid,
+    )
+    return bool(result)
 
 
 @router.api_route(
@@ -170,7 +166,14 @@ async def proxy_request(path: str, request: Request) -> Response:
             content={"status": "error", "error": "Invalid subdomain format"},
         )
 
-    workspace_id = get_workspace_by_domain(subdomain)
+    try:
+        workspace_id = get_workspace_by_domain(subdomain)
+    except Exception as exc:
+        logger.error("rid=%s Gateway: routing service unavailable: %s", request_id, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "error": "Routing service unavailable"},
+        )
     if not workspace_id:
         logger.warning("rid=%s Gateway: no workspace for subdomain='%s'", request_id, subdomain)
         return JSONResponse(
@@ -184,7 +187,18 @@ async def proxy_request(path: str, request: Request) -> Response:
     )
 
     client_ip = request.client.host if request.client else "unknown"
-    if await _is_rate_limited(workspace_id, client_ip):
+    try:
+        rate_limited = await _is_rate_limited(workspace_id, client_ip)
+    except Exception as exc:
+        logger.error(
+            "rid=%s Gateway: rate limiter unavailable | ip=%s workspace_id=%s error=%s",
+            request_id, client_ip, workspace_id, exc,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "error": "Rate limiter unavailable"},
+        )
+    if rate_limited:
         logger.warning(
             "rid=%s Gateway: rate limit exceeded | ip=%s workspace_id=%s subdomain=%s",
             request_id, client_ip, workspace_id, subdomain,
