@@ -75,6 +75,35 @@ _BLOCKED_LOCAL_PATHS: tuple[str, ...] = (
     "/tmp",
 )
 
+# ---------------------------------------------------------------------------
+# Write-op auto-confirm patterns
+# Commands that write files / create directories are safe to auto-confirm for
+# ACTION steps. These are NOT in _BLOCKED_PATTERNS (truly dangerous commands),
+# so they only trip the "dangerous" branch of _classify_command_risk.
+# ---------------------------------------------------------------------------
+
+_WRITE_OP_RE: re.Pattern[str] = re.compile(
+    r"""
+    (?:
+        >{1,2}                          # shell redirect  > or >>
+        | \btee\b                       # tee  file
+        | \btouch\b                     # touch file
+        | \bmkdir\b                     # mkdir / mkdir -p
+        | \bcp\b                        # cp src dst
+        | \bmv\b                        # mv src dst
+        | \brm\b(?!\s+-rf\b)           # rm (but NOT rm -rf — that is blocked)
+    )
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def _is_write_op(command: str) -> bool:
+    """Return True when a command performs a file-write / directory operation
+    that should be auto-confirmed for ACTION-type plan steps."""
+    return bool(_WRITE_OP_RE.search(command))
+
+
 _BLOCKED_SCAFFOLDING_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bgit\s+init\b", flags=re.IGNORECASE),
     re.compile(r"\bnpm\s+create\b", flags=re.IGNORECASE),
@@ -946,7 +975,12 @@ async def _run_command(
     command: str = args.get("command", "").strip()
     if not command:
         return {"stdout": "", "stderr": "run_command: 'command' argument is required", "code": 1}
-    confirm = bool(args.get("confirm", False))
+    # Auto-confirm write operations (>, >>, tee, touch, mkdir, cp, mv, rm).
+    # Truly destructive commands (rm -rf, shutdown, etc.) remain blocked by
+    # _BLOCKED_PATTERNS regardless of this flag.
+    confirm = bool(args.get("confirm", False)) or _is_write_op(command)
+    if confirm and args.get("confirm") is None:
+        logger.info("[tools] run_command: auto-confirmed write-op | command=%r", command)
     _validate_command(command, allow_write=allow_write, confirm_dangerous=confirm)
     scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=command)
     _log_ssh_execution(ToolName.RUN_COMMAND.value, scoped_command)

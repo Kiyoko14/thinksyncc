@@ -37,7 +37,11 @@ def _normalize_userinfo(url: str) -> str:
 
 def _validated_url() -> str:
     settings = get_settings()
-    url = settings.REDIS_URL
+    url = (settings.REDIS_URL or "").strip()
+    # Strip accidental KEY=value prefix (e.g. "REDIS_URL=rediss://...")
+    if "=" in url and not url.startswith(("redis://", "rediss://")):
+        _, _, url = url.partition("=")
+        url = url.strip()
     if not url or not url.startswith(("redis://", "rediss://")):
         raise RuntimeError("Invalid REDIS_URL. Must use redis:// or rediss://")
     return _normalize_userinfo(url)
