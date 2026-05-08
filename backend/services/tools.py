@@ -86,12 +86,12 @@ _WRITE_OP_RE: re.Pattern[str] = re.compile(
     r"""
     (?:
         >{1,2}                          # shell redirect  > or >>
-        | \btee\b                       # tee  file
+        | \btee\b                       # tee file
         | \btouch\b                     # touch file
         | \bmkdir\b                     # mkdir / mkdir -p
         | \bcp\b                        # cp src dst
         | \bmv\b                        # mv src dst
-        | \brm\b(?!\s+-rf\b)           # rm (but NOT rm -rf — that is blocked)
+        # rm is intentionally excluded — requires explicit manual confirmation
     )
     """,
     re.VERBOSE | re.IGNORECASE,
@@ -99,8 +99,13 @@ _WRITE_OP_RE: re.Pattern[str] = re.compile(
 
 
 def _is_write_op(command: str) -> bool:
-    """Return True when a command performs a file-write / directory operation
-    that should be auto-confirmed for ACTION-type plan steps."""
+    """Return True when a command performs a safe file-write / directory operation
+    that can be auto-confirmed for ACTION-type plan steps.
+
+    Excluded (require explicit confirm=true):
+      rm, rm -rf, shutdown, reboot, kill, mkfs — all caught by _BLOCKED_PATTERNS
+      or _classify_command_risk and never auto-approved here.
+    """
     return bool(_WRITE_OP_RE.search(command))
 
 

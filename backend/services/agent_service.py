@@ -94,6 +94,42 @@ def _looks_like_raw_error(text: str) -> bool:
     )
 
 
+def _deployment_verified_from_steps(steps: list[Any]) -> bool:
+    """Return True only if at least one executed step contains evidence of a
+    successful HTTP response — i.e. an actual running HTTP server was confirmed.
+
+    Accepted evidence (case-insensitive):
+      • stdout contains an HTTP 200 status token ("200 ok", "http/1", "http/2")
+      • stdout contains a curl/wget success line ("< http", "200 ok")
+      • step args contain a curl/wget command that returned exit_code 0
+
+    Without this, "All set. Open: …" must never be emitted regardless of whether
+    the tool steps individually succeeded.
+    """
+    # Compile once — only stdout content is trusted; exit codes alone are not
+    # sufficient evidence (curl can exit 0 even for failed/redirected requests).
+    _HTTP_OK_RE = re.compile(
+        r"""
+        (?:
+            \b200\s+ok\b                    # "200 OK"
+            | http/[12][.\d]*\s+200\b       # "HTTP/1.1 200" or "HTTP/2 200"
+            | <\s*http/[12]                 # curl verbose header "< HTTP/1.1"
+        )
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+    for step in steps:
+        stdout = str(
+            getattr(step, "stdout", "")
+            or (step.get("stdout") if isinstance(step, dict) else "")
+            or ""
+        )
+        if _HTTP_OK_RE.search(stdout):
+            return True
+
+    return False
+
+
 def _clean_user_summary(text: str, *, fallback: str) -> str:
     cleaned = _strip_markdown_fences(text)
     cleaned = cleaned.replace("\u0000", "").strip()
@@ -1297,7 +1333,17 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             if isinstance(result, dict) and result.get("type") == "patch":
                 summary = json.dumps({"files": result.get("files") or []}, ensure_ascii=False)
             else:
-                summary = f"All set. Open: {workspace_url}" if workspace_url else "All set."
+                # BUG #2 guard — only emit URL after verified HTTP evidence in steps.
+                # workspace_url existing in DB does not mean the deployment is live.
+                steps_evidence = result.get("steps") or [] if isinstance(result, dict) else []
+                if workspace_url and _deployment_verified_from_steps(steps_evidence):
+                    summary = f"All set. Open: {workspace_url}"
+                    logger.info("[agent] deployment_url_verified | url=%s | job=%s", workspace_url, job_id)
+                else:
+                    summary = _clean_user_summary(
+                        str(result.get("summary") or result.get("message") or "") if isinstance(result, dict) else "",
+                        fallback="All set.",
+                    )
         else:
             summary = _result_to_error_string(result)
 
@@ -1860,11 +1906,19 @@ class AgentService:
                 except Exception:
                     workspace_url = None
 
-            message = (
-                (f"All set. Open: {workspace_url}" if workspace_url else "All set.")
-                if success
-                else _result_to_error_string(result)
-            )
+            if success:
+                # BUG #2 guard — only emit URL after verified HTTP evidence in steps.
+                steps_evidence = result.get("steps") or [] if isinstance(result, dict) else []
+                if workspace_url and _deployment_verified_from_steps(steps_evidence):
+                    message = f"All set. Open: {workspace_url}"
+                    logger.info("[agent] deployment_url_verified | url=%s | job=%s", workspace_url, job_id)
+                else:
+                    message = _clean_user_summary(
+                        str(result.get("summary") or result.get("message") or "") if isinstance(result, dict) else "",
+                        fallback="All set.",
+                    )
+            else:
+                message = _result_to_error_string(result)
             final_status = JobStatus.COMPLETED.value if success else JobStatus.FAILED.value
             _db_update(job_id, {"status": final_status, "summary": message})
             obs.METRICS.record_request(success=success, execution_time_seconds=0.0)

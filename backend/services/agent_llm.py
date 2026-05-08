@@ -2323,8 +2323,11 @@ async def generate_plan(
         except Exception as exc:
             logger.warning("Skipping malformed plan step %s: %s", s, exc)
 
+    # BUG #1 guard — always use the caller's objective, never the LLM's echoed
+    # version. The LLM may paraphrase or substitute it; the planner must stay
+    # bound to the exact current user request.
     return AgentPlan(
-        objective=raw.get("objective", objective),
+        objective=objective,
         steps=steps,
         context_summary=raw.get("context_summary", ""),
     )
@@ -2684,6 +2687,14 @@ async def run_tool_calling_loop(
             detail={"code": "INTENT_NOT_SERVER", "intent": normalized_intent},
         )
 
+    # BUG #1 guard — objective must be the user's current request, never empty.
+    _objective = (objective or "").strip()
+    if not _objective:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "EMPTY_OBJECTIVE", "message": "Objective cannot be empty."},
+        )
+
     from services.tools import execute_tool, get_tool_definitions
 
     settings = get_settings()
@@ -2713,14 +2724,28 @@ async def run_tool_calling_loop(
     }
 
     if normalized_task_mode == "simple":
-        plan = _build_simple_plan(objective)
+        plan = _build_simple_plan(_objective)
     else:
         generated_plan = await generate_plan(
-            objective=objective,
+            objective=_objective,
             context=coordinator_context,
             max_steps=effective_max_steps,
         )
-        plan = generated_plan.steps[:effective_max_steps] or _build_simple_plan(objective)
+        # BUG #1 guard — if LLM returned a different objective, override it and
+        # stop execution rather than silently proceeding with the wrong plan.
+        returned_obj = (generated_plan.objective or "").strip()
+        if returned_obj.lower() != _objective.lower():
+            logger.error(
+                "[planner] objective_mismatch | expected=%r | got=%r — overriding with user input",
+                _objective,
+                returned_obj,
+            )
+            generated_plan = AgentPlan(
+                objective=_objective,
+                steps=generated_plan.steps,
+                context_summary=generated_plan.context_summary,
+            )
+        plan = generated_plan.steps[:effective_max_steps] or _build_simple_plan(_objective)
 
     if on_plan:
         try:
