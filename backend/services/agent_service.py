@@ -33,6 +33,7 @@ from models.job import JobAccepted, JobCreate, JobResponse, JobStatus
 from services import agent_llm
 from services import logger as obs
 from services.chat_service import ChatService
+from services.capability_service import detect_capabilities
 from services.context_engine import ContextEngine
 from services.redis_service import RedisService
 from services.memory import MemoryStore
@@ -985,11 +986,16 @@ def _step_to_record(result: StepResult) -> dict[str, Any]:
         "step": result.step,
         "tool": value_to_str(getattr(result, "tool", None)),
         "args": result.args,
+        "command": result.command,
+        "command_type": result.command_type,
         "stdout": result.stdout[:4000],
         "stderr": result.stderr[:2000],
         "exit_code": result.exit_code,
         "duration_ms": result.duration_ms,
         "success": result.success,
+        "validation_passed": result.validation_passed,
+        "status": result.status,
+        "agent_reasoning": result.agent_reasoning,
         "executed_at": result.executed_at.isoformat(),
     }
 
@@ -1181,9 +1187,12 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     intent = (await agent_llm.classify_intent(user_input=payload.objective, conversation_history=conversation_history)).strip().lower()
     if intent not in {"chat", "code", "server"}:
         intent = "code"
+    deployment_intent = bool(re.search(r"\b(deploy|server|app|run|website)\b", payload.objective or "", re.IGNORECASE))
+    if deployment_intent:
+        intent = "server"
     if intent == "chat":
         intent = "code"
-    if intent == "server":
+    if intent == "server" and not deployment_intent:
         lowered_obj = (payload.objective or "").lower()
         if re.search(r"\b(telegram|bot|yoz|kod|code|python|script|program|programma)\b", lowered_obj):
             intent = "code"
@@ -1392,6 +1401,10 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
                 "tool": value_to_str(getattr(result, "tool", None)),
                 "success": result.success,
                 "exit_code": result.exit_code,
+                "command": result.command,
+                "command_type": result.command_type,
+                "validation_passed": result.validation_passed,
+                "step_status": result.status,
                 "stdout_preview": "",
                 "stderr_preview": "",
             },
@@ -1440,6 +1453,11 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         if not forced_workspace_path.startswith("/root/workspaces"):
             forced_workspace_path = f"/root/workspaces/{_sanitize_workspace_name(payload.objective)}"
         os.makedirs(forced_workspace_path, exist_ok=True)
+        if not payload.workspace_id:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="workspace_id missing")
+        capabilities = await detect_capabilities(server)
+        logger.info("Capabilities: %s", capabilities)
+        RedisService.get_sync_client().set(f"ws:{payload.workspace_id}:capabilities", json.dumps(capabilities), ex=3600)
         await SSHService.execute(server=server, command=f"mkdir -p {shlex.quote(forced_workspace_path)}", command_timeout=step_timeout)
         logger.info("[workspace] name=%s | path=%s | job=%s", forced_workspace_name, forced_workspace_path, job_id)
 
@@ -1459,6 +1477,7 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             plan_steps=plan_steps,
             plan_context_summary=str(plan_bundle.get("context_summary") or ""),
             server=server,
+            workspace_id=str(payload.workspace_id),
             workspace_path=forced_workspace_path,
             allow_write=allow_write,
             max_steps=payload.max_steps,

@@ -18,6 +18,7 @@ class TemplateSpec:
     keywords: list[str]
     files: dict[str, str]
     dependencies: list[str]
+    execution_steps: list[dict[str, Any]] | None = None
 
 
 _TELEGRAM_BOT_MAIN = (
@@ -177,6 +178,12 @@ TEMPLATES: dict[str, TemplateSpec] = {
             "requirements.txt": _requirements_txt(["fastapi>=0.110", "uvicorn[standard]>=0.23"]),
         },
         dependencies=["fastapi>=0.110", "uvicorn[standard]>=0.23"],
+        execution_steps=[
+            {"tool": "run_command", "args": {"command": "python3 --version && npm --version || true && node --version || true"}, "reason": "Detect runtime versions before choosing commands."},
+            {"tool": "run_command", "args": {"command": "python3 -m pip install -r requirements.txt"}, "reason": "Install Python dependencies if needed."},
+            {"tool": "run_command", "args": {"command": "PORT=8000 nohup python3 main.py > app.log 2>&1 &"}, "reason": "Start the FastAPI app in the workspace."},
+            {"tool": "run_command", "args": {"command": "curl -f http://127.0.0.1:8000/health || curl -f http://127.0.0.1:8000/"}, "reason": "Verify the app is serving traffic before reporting success."},
+        ],
     ),
     "flask_app": TemplateSpec(
         name="flask_app",
@@ -187,6 +194,12 @@ TEMPLATES: dict[str, TemplateSpec] = {
             "requirements.txt": _requirements_txt(["flask>=2.3"]),
         },
         dependencies=["flask>=2.3"],
+        execution_steps=[
+            {"tool": "run_command", "args": {"command": "python3 --version && npm --version || true && node --version || true"}, "reason": "Detect runtime versions before choosing commands."},
+            {"tool": "run_command", "args": {"command": "python3 -m pip install -r requirements.txt"}, "reason": "Install Python dependencies if needed."},
+            {"tool": "run_command", "args": {"command": "PORT=5000 nohup python3 main.py > app.log 2>&1 &"}, "reason": "Start the Flask app in the workspace."},
+            {"tool": "run_command", "args": {"command": "curl -f http://127.0.0.1:5000/health || curl -f http://127.0.0.1:5000/"}, "reason": "Verify the app is serving traffic before reporting success."},
+        ],
     ),
     "python_script": TemplateSpec(
         name="python_script",
@@ -196,6 +209,34 @@ TEMPLATES: dict[str, TemplateSpec] = {
         dependencies=[],
     ),
 }
+
+
+def template_execution_hint(text: str) -> dict[str, Any] | None:
+    """Return advisory template context for the planner.
+
+    Templates are baseline strategy only. The LLM/executor must adapt them to
+    actual capabilities and recover with a different approach when they fail.
+    """
+    template = match_template(text)
+    if template is None:
+        return None
+    rendered = render_template(template, extract_template_params(text))
+    return {
+        "matched": True,
+        "name": template.name,
+        "description": template.description,
+        "files": rendered.get("files") or {},
+        "dependencies": rendered.get("dependencies") or [],
+        "params": rendered.get("params") or {},
+        "baseline_steps": list(template.execution_steps or []),
+        "rules": [
+            "Template steps are advisory, not mandatory or authoritative.",
+            "Modify commands to match available runtime versions and project files.",
+            "Replace npm commands when npm is unavailable; prefer python3 when appropriate.",
+            "Add missing file creation, server start, and curl verification steps.",
+            "Do not return success unless curl verification succeeds.",
+        ],
+    }
 
 
 def match_template(text: str) -> TemplateSpec | None:

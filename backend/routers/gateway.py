@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 
 from services.domain_service import get_workspace_by_domain
 from services.http_client import get_http_client
-from services.port_allocator import get_port, mark_workspace_health
+from services.port_allocator import get_port, get_workspace_health, mark_workspace_health
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
@@ -24,9 +24,8 @@ _SUPPORTED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
 
 _ALLOWED_HOST_SUFFIX = "thinksync.art"
 
-_RESERVED_SUBDOMAINS = {"app", "api", "www"}
-
 _SUBDOMAIN_RE = re.compile(r"^[a-z0-9]{1,10}-[a-z0-9]{6}$")
+_RESERVED = {"app", "api", "www"}
 
 _RATE_LIMIT_MAX = 100
 _RATE_LIMIT_WINDOW = 60
@@ -115,7 +114,7 @@ def _resolve_timeout(path: str) -> float:
 async def _is_rate_limited(workspace_id: str, client_ip: str) -> bool:
     r = RedisService.get_async_client()
     if r is None:
-        raise RuntimeError("Async Redis unavailable")
+        raise RuntimeError("Rate limiter unavailable")
     key = f"rate:sw:{workspace_id}:{client_ip}"
     now = time.time()
     uid = f"{now:.6f}-{uuid.uuid4().hex[:8]}"
@@ -135,70 +134,50 @@ async def _is_rate_limited(workspace_id: str, client_ip: str) -> bool:
 async def proxy_request(path: str, request: Request) -> Response:
     request_id = str(uuid.uuid4())
     host_header = request.headers.get("host", "")
-    bare_host = host_header.split(":")[0].lower().strip()
-
-    if not bare_host.endswith(_ALLOWED_HOST_SUFFIX):
-        logger.warning("rid=%s Gateway: rejected invalid host '%s'", request_id, bare_host)
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "error": "Invalid host"},
-        )
-
     subdomain = _extract_subdomain(host_header)
-    if not subdomain:
-        logger.warning("rid=%s Gateway: no subdomain in host '%s'", request_id, bare_host)
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "error": "No subdomain in host"},
-        )
 
-    if subdomain in _RESERVED_SUBDOMAINS:
-        logger.info("rid=%s Gateway: reserved subdomain '%s' — 404", request_id, subdomain)
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "error": "Reserved subdomain"},
-        )
+    if not subdomain:
+        return JSONResponse(status_code=404, content={"error": "No subdomain"})
+
+    if subdomain in _RESERVED:
+        return JSONResponse(status_code=404, content={"error": "Reserved domain"})
 
     if not _SUBDOMAIN_RE.match(subdomain):
-        logger.info("rid=%s Gateway: invalid subdomain format '%s'", request_id, subdomain)
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "error": "Invalid subdomain format"},
-        )
+        return JSONResponse(status_code=404, content={"error": "Invalid subdomain"})
 
     try:
         workspace_id = get_workspace_by_domain(subdomain)
-    except Exception as exc:
-        logger.error("rid=%s Gateway: routing service unavailable: %s", request_id, exc)
-        return JSONResponse(
-            status_code=503,
-            content={"status": "error", "error": "Routing service unavailable"},
-        )
-    if not workspace_id:
-        logger.warning("rid=%s Gateway: no workspace for subdomain='%s'", request_id, subdomain)
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "error": f"No workspace found for subdomain '{subdomain}'"},
-        )
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "Routing unavailable"})
 
-    logger.info(
-        "Gateway route | subdomain=%s workspace_id=%s port=%s",
-        subdomain, workspace_id, get_port(workspace_id),
-    )
+    if not workspace_id:
+        return JSONResponse(status_code=404, content={"error": "Workspace not found"})
+
+    try:
+        health = get_workspace_health(workspace_id)
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "Health lookup failed"})
+
+    if health == "unhealthy":
+        return JSONResponse(status_code=503, content={"error": "Workspace unavailable"})
+
+    try:
+        port = get_port(workspace_id)
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "Port lookup failed"})
+
+    if not port:
+        return JSONResponse(status_code=500, content={"error": "Port missing"})
+
+    logger.info("GW route | subdomain=%s ws=%s port=%s", subdomain, workspace_id, port)
 
     client_ip = request.client.host if request.client else "unknown"
     try:
-        rate_limited = await _is_rate_limited(workspace_id, client_ip)
-    except Exception as exc:
-        logger.error(
-            "rid=%s Gateway: rate limiter unavailable | ip=%s workspace_id=%s error=%s",
-            request_id, client_ip, workspace_id, exc,
-        )
-        return JSONResponse(
-            status_code=503,
-            content={"status": "error", "error": "Rate limiter unavailable"},
-        )
-    if rate_limited:
+        limited = await _is_rate_limited(workspace_id, client_ip)
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "Rate limiter down"})
+
+    if limited:
         logger.warning(
             "rid=%s Gateway: rate limit exceeded | ip=%s workspace_id=%s subdomain=%s",
             request_id, client_ip, workspace_id, subdomain,
@@ -207,18 +186,6 @@ async def proxy_request(path: str, request: Request) -> Response:
             status_code=429,
             content={"status": "error", "error": "Too many requests — rate limit exceeded"},
         )
-
-    port = get_port(workspace_id)
-    if not port:
-        logger.error(
-            "rid=%s Gateway: no port | workspace_id=%s subdomain=%s",
-            request_id, workspace_id, subdomain,
-        )
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "error": "Workspace has no allocated port"},
-        )
-
     target_url = f"http://127.0.0.1:{port}/{path}"
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
@@ -227,6 +194,12 @@ async def proxy_request(path: str, request: Request) -> Response:
     headers = _forward_request_headers(request, request_id)
     timeout = _resolve_timeout(path)
     semaphore = _ws_semaphores[workspace_id]
+
+    if semaphore.locked():
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Too many concurrent requests"}
+        )
 
     try:
         async with semaphore:

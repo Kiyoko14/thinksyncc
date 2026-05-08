@@ -157,12 +157,17 @@ class StepResult(BaseModel):
     step: int
     tool: ToolName
     args: dict[str, Any]
+    command: str = ""
+    command_type: str = "ACTION"
     stdout: str = ""
     stderr: str = ""
     exit_code: int = 0
     duration_ms: int = 0
     executed_at: datetime
     success: bool
+    validation_passed: bool = False
+    status: str = "pending"
+    agent_reasoning: str = ""
 
 
 class AgentDecision(BaseModel):

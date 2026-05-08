@@ -69,7 +69,7 @@ async def _ping_workspace(workspace_id: str, port: int) -> None:
         _unhealthy_streak[workspace_id] = streak
         if streak >= _EVICT_AFTER_FAILURES:
             logger.warning(
-                "Health checker: workspace %s unhealthy for %d consecutive checks — evicting from active set",
+                "Health checker: workspace %s unhealthy for %d consecutive checks — marking unhealthy",
                 workspace_id, streak,
             )
             remove_from_active(workspace_id)

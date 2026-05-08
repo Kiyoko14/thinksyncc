@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from models.agent import AgentPlan, AgentStep, ToolName
 from services import agent_llm
+from services.capability_service import detect_capabilities
+from services.templates import template_execution_hint
 
 logger = logging.getLogger(__name__)
+
+_DEPLOYMENT_RE = re.compile(r"\b(deploy|server|app|run|website)\b", re.IGNORECASE)
 
 
 def _default_non_server_plan(*, intent: str, objective: str) -> list[dict[str, Any]]:
@@ -37,6 +42,8 @@ async def build_plan(
     """
     normalized_intent = (intent or "").strip().lower()
     normalized_task_mode = (task_mode or "").strip().lower()
+    if _DEPLOYMENT_RE.search(objective or ""):
+        normalized_task_mode = "complex"
     bounded_steps = max(1, min(int(max_steps or 8), 8))
     allow_write = True
     logger.info("Execution forced: allow_write=True")
@@ -58,6 +65,8 @@ async def build_plan(
     if server is None:
         raise ValueError("server is required when intent=='server'")
 
+    capabilities = await detect_capabilities(server)
+
     if normalized_task_mode == "simple":
         steps = agent_llm.build_simple_plan(objective=objective)
         return {"task_mode": "simple", "plan": [s.model_dump(mode="json") for s in steps], "context_summary": "Single-step server plan."}
@@ -73,6 +82,8 @@ async def build_plan(
         "allow_write": allow_write,
         "objective": objective,
         "task_mode": "complex",
+        "capabilities": capabilities,
+        "template": template_execution_hint(objective) or {"matched": False},
     }
     plan_result: AgentPlan = await agent_llm.generate_plan(objective=objective, context=context, max_steps=bounded_steps)
     steps: list[AgentStep] = plan_result.steps[:bounded_steps]

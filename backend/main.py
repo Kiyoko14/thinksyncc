@@ -5,6 +5,8 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from postgrest.exceptions import APIError
 from starlette.responses import Response
+from dotenv import load_dotenv
+load_dotenv()
 
 import asyncio
 import json
@@ -17,7 +19,6 @@ from core.config import get_settings
 from routers import agents, auth, chat, commands, deployments, gateway, health, jobs, servers, workspaces, ws
 from services.health_checker import run_health_check_loop, run_startup_consistency_check
 from services.http_client import close_http_client, init_http_client
-from services.redis_service import init_async_redis, init_redis
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -25,8 +26,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(application):  # type: ignore[type-arg]
-    init_redis()
-    await init_async_redis()
+    from services.redis_service import get_async_client, get_sync_client
+
+    get_sync_client().ping()
+    await get_async_client().ping()
     logger.info("Redis connected (sync + async)")
     await init_http_client()
     await run_startup_consistency_check()
@@ -120,8 +123,7 @@ async def log_http_requests(request: Request, call_next):  # type: ignore[overri
     )
 
 
-# Gateway FIRST
-app.include_router(gateway.router)
+
 
 # keyin qolganlar
 app.include_router(health.router)
@@ -134,7 +136,7 @@ app.include_router(deployments.router)
 app.include_router(agents.router)
 app.include_router(jobs.router)
 app.include_router(ws.router)
-
+app.include_router(gateway.router)
 
 def _api_error_code(exc: APIError) -> str:
     code = getattr(exc, "code", None)

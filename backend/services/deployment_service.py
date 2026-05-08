@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import logging
 import shlex
 from typing import Any
 from uuid import UUID
@@ -7,17 +8,16 @@ from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
 from core.database import get_supabase
-from services.port_allocator import allocate_port
+from services.port_allocator import allocate_port, release_port
 from services.redis_service import RedisService
 from services.server_service import ServerService
 from services.ssh_service import SSHService
 
+logger = logging.getLogger(__name__)
+
 
 class DeploymentService:
     """Manage workspace deployments and domain→port mappings."""
-
-    _MIN_PORT = 10000
-    _MAX_PORT = 65535
 
     @staticmethod
     def _process_name(workspace_id: str) -> str:
@@ -145,9 +145,6 @@ class DeploymentService:
             return None
         return existing.data[0]
 
-    # NOTE: get_next_available_port() removed — replaced by Redis-backed
-    # services.port_allocator.allocate_port (single source of truth, range 3000-8000).
-
     @staticmethod
     async def create_deployment(workspace_id: str, user_id: str) -> dict[str, Any]:
         """Create a deployment for a workspace."""
@@ -159,7 +156,7 @@ class DeploymentService:
         workspace = WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
         server = ServerService.get_server(server_id=workspace["server_id"], user_id=user_id)
         workspace_path = DeploymentService._safe_workspace_path(str(workspace.get("path", "")))
-        process_name = DeploymentService._process_name(workspace_id)
+        process_name = f"ws-{workspace_id}"
 
         await DeploymentService._ensure_pm2_installed(server=server)
 
@@ -169,60 +166,97 @@ class DeploymentService:
         port = allocate_port(workspace_id)
 
         run_command = DeploymentService._deployment_command(workspace_path=workspace_path, port=port)
+        start_cmd = f'pm2 start "{run_command}" --name {process_name} --force'
+        check_cmd = f"pm2 describe {process_name}"
+        verify_cmd = f"curl -f http://127.0.0.1:{port}"
 
-        # If the PM2 process already exists, restart it; otherwise create it.
-        pm2_command = (
-            f'pm2 describe {shlex.quote(process_name)} >/dev/null 2>&1 && '
-            f'pm2 restart {shlex.quote(process_name)} --update-env || '
-            f'pm2 start "{run_command}" --name {shlex.quote(process_name)}'
-        )
-        pm2_result = await DeploymentService._execute_remote(
-            server=server,
-            command=pm2_command,
-            step="pm2_start_or_restart",
-        )
-        if pm2_result.exit_code != 0:
-            raise DeploymentService._structured_command_error(
-                step="pm2_start_or_restart",
-                output=pm2_result.output,
-                exit_code=pm2_result.exit_code,
+        try:
+            existing_process = await DeploymentService._execute_remote(
+                server=server,
+                command=check_cmd,
+                step="pm2_describe_existing",
             )
+            process_exists = existing_process.exit_code == 0
 
-        verify_command = DeploymentService._deployment_command(
-            workspace_path=workspace_path,
-            port=port,
-        ).replace(f"python3 -m http.server {port}", f"curl -fsS http://127.0.0.1:{port}")
-        verify_result = await DeploymentService._execute_remote(
-            server=server,
-            command=verify_command,
-            step="verify_http_server",
-        )
-        if verify_result.exit_code != 0:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "message": "Deployment process started but HTTP server is not reachable",
-                    "step": "verify_http_server",
-                    "exit_code": verify_result.exit_code,
-                    "output": (verify_result.output or "")[:2000],
-                },
+            pm2_result = await DeploymentService._execute_remote(
+                server=server,
+                command=start_cmd,
+                step="pm2_start",
             )
+            if pm2_result.exit_code != 0:
+                raise DeploymentService._structured_command_error(
+                    step="pm2_start",
+                    output=pm2_result.output,
+                    exit_code=pm2_result.exit_code,
+                )
+
+            check_result = await DeploymentService._execute_remote(
+                server=server,
+                command=check_cmd,
+                step="pm2_describe",
+            )
+            if check_result.exit_code != 0 or "online" not in (check_result.output or "").lower():
+                raise HTTPException(500, "PM2 process not running")
+
+            verify_result = await DeploymentService._execute_remote(
+                server=server,
+                command=verify_cmd,
+                step="verify_http_server",
+            )
+            if verify_result.exit_code != 0 and process_exists:
+                restart_result = await DeploymentService._execute_remote(
+                    server=server,
+                    command=f"pm2 restart {process_name}",
+                    step="pm2_restart",
+                )
+                if restart_result.exit_code != 0:
+                    raise DeploymentService._structured_command_error(
+                        step="pm2_restart",
+                        output=restart_result.output,
+                        exit_code=restart_result.exit_code,
+                    )
+
+                check_result = await DeploymentService._execute_remote(
+                    server=server,
+                    command=check_cmd,
+                    step="pm2_describe_after_restart",
+                )
+                if check_result.exit_code != 0 or "online" not in (check_result.output or "").lower():
+                    raise HTTPException(500, "PM2 process not running")
+
+                verify_result = await DeploymentService._execute_remote(
+                    server=server,
+                    command=verify_cmd,
+                    step="verify_http_server_after_restart",
+                )
+
+            if verify_result.exit_code != 0:
+                raise HTTPException(502, "Workspace failed to start")
+
+            check = await SSHService.execute(
+                server=server,
+                command=f"curl -f http://127.0.0.1:{port}",
+            )
+            if check.exit_code != 0:
+                raise HTTPException(502, "Port not serving traffic")
+        except HTTPException:
+            release_port(workspace_id)
+            raise
+        except Exception:
+            release_port(workspace_id)
+            raise
 
         # Sync deployment state into Redis (single source of truth for the gateway).
         # Order is critical: PM2 start → verify_http_server OK → Redis write.
-        from services.slug_service import build_subdomain
         from services.workspace_service import WorkspaceService
-
-        r = RedisService.get_sync_client()
-        if r is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Critical: Redis sync failed",
-            )
 
         normalized_name = WorkspaceService._sanitize_workspace_name(str(workspace.get("name") or ""))
         slug = str(workspace.get("slug") or "").strip().lower()
-        subdomain = build_subdomain(normalized_name, slug)
+        subdomain = f"{normalized_name}-{slug}"
+
+        from services.redis_service import RedisService
+
+        r = RedisService.get_sync_client()
 
         pipe = r.pipeline()
         pipe.set(f"ws:{workspace_id}:port", port)
@@ -232,10 +266,16 @@ class DeploymentService:
         try:
             pipe.execute()
         except Exception:
+            release_port(workspace_id)
             raise HTTPException(
                 status_code=500,
                 detail="Critical: Redis sync failed",
             )
+
+        logger.info(
+            "DEPLOY OK | ws=%s port=%s process=%s",
+            workspace_id, port, process_name
+        )
 
         if existing:
             payload = {
@@ -280,7 +320,7 @@ class DeploymentService:
         return {
             "workspace_id": workspace_id,
             "port": port,
-            "domain": workspace.get("domain"),
+            "domain": f"{subdomain}.{WorkspaceService._base_domain()}",
             "slug": workspace.get("slug"),
             "is_active": True,
         }
@@ -309,10 +349,13 @@ class DeploymentService:
             return None
 
         deployment = result.data[0]
+        normalized_name = WorkspaceService._sanitize_workspace_name(str(workspace.get("name") or ""))
+        slug = str(workspace.get("slug") or "").strip().lower()
+        subdomain = f"{normalized_name}-{slug}"
         return {
             "workspace_id": workspace_id,
             "port": deployment["port"],
-            "domain": workspace.get("domain"),
+            "domain": f"{subdomain}.{WorkspaceService._base_domain()}",
             "slug": workspace.get("slug"),
             "is_active": deployment["is_active"],
         }

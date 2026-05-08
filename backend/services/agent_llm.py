@@ -198,9 +198,15 @@ _FALLBACK_CODE_RE = re.compile(
     r"код|скрипт|функц|бот"
     r")\b"
 )
+_DEPLOYMENT_INTENT_RE = re.compile(
+    r"(?ix)\b("
+    r"deploy|server|app|run|website"
+    r")\b"
+)
 _FALLBACK_SERVER_RE = re.compile(
     r"(?ix)\b("
     r"deploy|rollout|restart|reload|status|logs|"
+    r"server|app|run|website|"
     r"nginx|apache2|httpd|systemctl|journalctl|service|"
     r"docker|docker-compose|kubectl|helm|pm2|supervisorctl|"
     r"ssh|port|firewall|iptables|ufw|"
@@ -217,7 +223,11 @@ def fallback_intent(text: str) -> str:
         return "chat"
     lowered = cleaned.lower()
 
-    # Prefer "code" on overlap to avoid accidentally routing to server execution.
+    # Deployment-style requests must enter the execution pipeline.
+    if _DEPLOYMENT_INTENT_RE.search(lowered):
+        return "server"
+
+    # Prefer "code" on non-deployment overlap to avoid accidental server actions.
     if _FALLBACK_CODE_RE.search(lowered):
         return "code"
     if _FALLBACK_SERVER_RE.search(lowered):
@@ -1909,6 +1919,16 @@ PLANNING RULES
     - safe: read-only diagnostics (status, logs, disk, memory)
     - moderate: controlled operational changes (restart/reload/deploy) when allow_write is true
     - dangerous: disruptive actions (stop/disable, deleting resources). Avoid; only include if explicitly requested.
+12. For deployment intent (deploy/server/app/run/website), execution MUST include:
+    - runtime checks: node -v, python3 --version, npm -v before choosing commands
+    - any needed file creation in the current workspace or dependency installation
+    - a server start command
+    - curl verification against localhost
+13. Templates, when provided, are only baseline strategy. They are NOT mandatory and NOT authoritative.
+    Adapt, patch, replace commands, change ports, switch runtime, or add missing steps as needed.
+14. If no template is provided, generate a full execution plan with file creation, server start, and curl verification.
+15. If npm is unavailable, do not use npm start. Replace it with an available runtime such as python3 when possible.
+16. Never produce a plan whose only deployment action is diagnostics; a deployment plan must attempt to start and verify.
 
 ═══════════════════════════════════════════════════════
 ABSOLUTE SAFETY RULES — NEVER VIOLATE
@@ -2280,6 +2300,9 @@ async def generate_plan(
             "allow_write": context.get("allow_write", False),
             "task_mode": context.get("task_mode", "complex"),
             "memory": context.get("memory", []),
+            "capabilities": context.get("capabilities", {}),
+            "workspace_path": context.get("workspace_path", ""),
+            "template": context.get("template", {"matched": False}),
         },
         indent=2,
     )

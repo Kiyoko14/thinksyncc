@@ -21,6 +21,10 @@ def _ws_port_key(workspace_id: str) -> str:
     return f"ws:{workspace_id}:port"
 
 
+def _ws_pending_port_key(workspace_id: str) -> str:
+    return f"ws:{workspace_id}:pending_port"
+
+
 def _ws_type_key(workspace_id: str) -> str:
     return f"ws:{workspace_id}:type"
 
@@ -40,12 +44,14 @@ return 0
 _ALLOC_SCRIPT = """
 local existing = redis.call('GET', KEYS[1])
 if existing then return existing end
-local sz = redis.call('SCARD', KEYS[2])
+local pending = redis.call('GET', KEYS[2])
+if pending then return pending end
+local sz = redis.call('SCARD', KEYS[3])
 if tonumber(sz) == 0 then return false end
-local port = redis.call('SPOP', KEYS[2])
+local port = redis.call('SPOP', KEYS[3])
 if not port then return false end
-redis.call('SET', KEYS[1], port)
-redis.call('SADD', KEYS[3], port)
+redis.call('SET', KEYS[2], port, 'EX', 600)
+redis.call('SADD', KEYS[4], port)
 return port
 """
 
@@ -70,8 +76,9 @@ def allocate_port(workspace_id: str) -> int:
     _initialize_pool_if_needed(r)
 
     port_key = _ws_port_key(workspace_id)
+    pending_port_key = _ws_pending_port_key(workspace_id)
 
-    raw = r.eval(_ALLOC_SCRIPT, 3, port_key, _FREE_SET, _USED_SET)
+    raw = r.eval(_ALLOC_SCRIPT, 4, port_key, pending_port_key, _FREE_SET, _USED_SET)
     if not raw:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -80,11 +87,6 @@ def allocate_port(workspace_id: str) -> int:
 
     port = int(raw)
 
-    try:
-        r.sadd(_ACTIVE_SET, workspace_id)
-    except Exception:
-        pass
-
     logger.info("Allocated port %d for workspace %s", port, workspace_id)
     return port
 
@@ -92,7 +94,7 @@ def allocate_port(workspace_id: str) -> int:
 def get_port(workspace_id: str) -> Optional[int]:
     r = RedisService.get_sync_client()
     if r is None:
-        return None
+        raise RuntimeError("Redis unavailable")
     raw = r.get(_ws_port_key(workspace_id))
     return int(raw) if raw is not None else None
 
@@ -125,6 +127,13 @@ def mark_workspace_health(workspace_id: str, healthy: bool) -> None:
         logger.warning("Workspace %s marked unhealthy", workspace_id)
 
 
+def get_workspace_health(workspace_id: str) -> str | None:
+    r = RedisService.get_sync_client()
+    if r is None:
+        raise RuntimeError("Redis unavailable")
+    return r.get(_ws_health_key(workspace_id))
+
+
 def check_port_consistency(workspace_id: str) -> bool:
     """
     Verify ws:{id}:port is present in ports:used.
@@ -152,10 +161,10 @@ def remove_from_active(workspace_id: str) -> None:
     if r is None:
         return
     try:
-        r.srem(_ACTIVE_SET, workspace_id)
-        logger.info("Removed workspace %s from active set", workspace_id)
+        r.set(f"ws:{workspace_id}:health", "unhealthy", ex=300)
+        logger.info("Workspace %s marked unhealthy (grace eviction)", workspace_id)
     except Exception as exc:
-        logger.warning("Failed to remove workspace %s from active set: %s", workspace_id, exc)
+        logger.warning("Failed to mark workspace %s unhealthy: %s", workspace_id, exc)
 
 
 def release_port(workspace_id: str) -> None:
@@ -164,13 +173,15 @@ def release_port(workspace_id: str) -> None:
         return
 
     port_key = _ws_port_key(workspace_id)
-    raw = r.get(port_key)
+    pending_port_key = _ws_pending_port_key(workspace_id)
+    raw = r.get(port_key) or r.get(pending_port_key)
     if raw is None:
         return
 
     port = int(raw)
     pipeline = r.pipeline()
     pipeline.delete(port_key)
+    pipeline.delete(pending_port_key)
     pipeline.srem(_USED_SET, str(port))
     pipeline.sadd(_FREE_SET, str(port))
     pipeline.srem(_ACTIVE_SET, workspace_id)

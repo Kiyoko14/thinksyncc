@@ -853,6 +853,85 @@ async def universal_execute_python(
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+CommandType = str
+
+CHECK_COMMANDS: tuple[str, ...] = (
+    "grep",
+    "test",
+    "[",
+    "ss",
+    "ls",
+    "find",
+    "which",
+    "command",
+    "pgrep",
+    "lsof",
+)
+VERIFY_COMMANDS: tuple[str, ...] = ("curl", "wget")
+
+
+def _first_shell_word(command: str) -> str:
+    cleaned = (command or "").strip()
+    if not cleaned:
+        return ""
+    try:
+        parts = shlex.split(cleaned, comments=False, posix=True)
+    except ValueError:
+        parts = cleaned.split()
+    return (parts[0] if parts else "").strip().lower()
+
+
+def classify_command(command: str) -> CommandType:
+    """Classify a shell command by how its exit code should be interpreted."""
+    cleaned = (command or "").strip()
+    lowered = cleaned.lower()
+    if not lowered:
+        return "ACTION"
+    if re.search(r"(^|[;&|]\s*)(curl|wget)\b", lowered):
+        return "VERIFY"
+    if re.search(r"(^|[;&|]\s*)(grep|test|\[|ss|ls|find|which|command\s+-v|pgrep|lsof)\b", lowered):
+        return "CHECK"
+    first = _first_shell_word(cleaned)
+    if first in VERIFY_COMMANDS:
+        return "VERIFY"
+    if first in CHECK_COMMANDS:
+        return "CHECK"
+    return "ACTION"
+
+
+def command_success(command_type: CommandType, exit_code: int) -> bool:
+    """Return whether a classified command completed according to its semantics."""
+    normalized = (command_type or "ACTION").upper()
+    if normalized == "CHECK":
+        return exit_code in {0, 1}
+    return exit_code == 0
+
+
+def _tool_command(tool: ToolName, args: dict[str, Any]) -> str:
+    if tool == ToolName.RUN_COMMAND:
+        return str((args or {}).get("command") or "")
+    if tool == ToolName.CHECK_DISK:
+        return "df -h"
+    if tool == ToolName.CHECK_MEMORY:
+        return "free -m"
+    if tool == ToolName.READ_LOGS:
+        service_name = str((args or {}).get("service_name") or "")
+        lines = int((args or {}).get("lines") or 100)
+        return f"tail -n {lines} {service_name}" if service_name.startswith("/") else f"journalctl -u {service_name} -n {lines} --no-pager"
+    if tool == ToolName.RESTART_SERVICE:
+        return f"systemctl restart {str((args or {}).get('service_name') or '').strip()}"
+    if tool == ToolName.DEPLOY_APP:
+        return str((args or {}).get("deploy_command") or "")
+    return value_to_str(getattr(tool, "value", None) or tool)
+
+
+def _tool_command_type(tool: ToolName, command: str) -> CommandType:
+    if tool in {ToolName.CHECK_DISK, ToolName.CHECK_MEMORY, ToolName.READ_LOGS}:
+        return "CHECK"
+    if tool == ToolName.RUN_COMMAND:
+        return classify_command(command)
+    return "ACTION"
+
 
 async def _run_command(
     *,
@@ -881,8 +960,9 @@ async def _run_command(
         ),
     )
     _log_ssh_result(ToolName.RUN_COMMAND.value, resp.exit_code, resp.output)
-    if resp.exit_code == 0:
-        return {"stdout": resp.output or "", "stderr": "", "code": 0}
+    command_type = classify_command(command)
+    if command_success(command_type, int(resp.exit_code)):
+        return {"stdout": resp.output or "", "stderr": "", "code": int(resp.exit_code)}
     return {"stdout": "", "stderr": resp.output or "", "code": int(resp.exit_code)}
 
 
@@ -1138,12 +1218,16 @@ async def execute_tool(
             step=step_number,
             tool=tool_enum,
             args=args,
+            command=value_to_str(tool_name),
+            command_type="ACTION",
             stdout="",
             stderr=json.dumps(detail),
             exit_code=1,
             duration_ms=0,
             executed_at=executed_at,
             success=False,
+            validation_passed=False,
+            status="failed",
         )
 
     try:
@@ -1153,11 +1237,15 @@ async def execute_tool(
             step=step_number,
             tool=ToolName.RUN_COMMAND,
             args=args,
+            command=value_to_str(tool_name),
+            command_type="ACTION",
             stderr=f"Unknown tool: {tool_name!r}. Valid tools: {[t.value for t in ToolName]}",
             exit_code=1,
             duration_ms=0,
             executed_at=executed_at,
             success=False,
+            validation_passed=False,
+            status="failed",
         )
 
     fn = _TOOL_FN.get(tool)
@@ -1166,11 +1254,15 @@ async def execute_tool(
             step=step_number,
             tool=tool,
             args=args,
+            command=_tool_command(tool, args),
+            command_type="ACTION",
             stderr=f"Tool '{tool_name}' is registered but not implemented.",
             exit_code=1,
             duration_ms=0,
             executed_at=executed_at,
             success=False,
+            validation_passed=False,
+            status="failed",
         )
 
     start = time.monotonic()
@@ -1211,6 +1303,9 @@ async def execute_tool(
     stdout = res.get("stdout", "")
     stderr = res.get("stderr", "")
     exit_code = int(res.get("code", 1))
+    command = _tool_command(tool, args)
+    command_type = _tool_command_type(tool, command)
+    success = command_success(command_type, exit_code)
     duration_ms = int((time.monotonic() - start) * 1000)
     logger.info(
         "[tools] tool result | step=%s | tool=%s | exit_code=%s | stdout=%r | stderr=%r",
@@ -1224,12 +1319,16 @@ async def execute_tool(
         step=step_number,
         tool=tool,
         args=args,
+        command=command,
+        command_type=command_type,
         stdout=stdout,
         stderr=stderr,
         exit_code=exit_code,
         duration_ms=duration_ms,
         executed_at=executed_at,
-        success=(exit_code == 0),
+        success=success,
+        validation_passed=success,
+        status="validated" if success else "failed",
     )
 
 

@@ -19,8 +19,7 @@ def _domain_lookup_key(subdomain: str) -> str:
 def assign_domain(workspace_id: str, subdomain: str) -> str:
     r = RedisService.get_sync_client()
     if r is None:
-        logger.warning("Redis unavailable — domain not persisted for workspace %s", workspace_id)
-        return subdomain
+        raise RuntimeError("Redis unavailable")
 
     clean = subdomain.lower().strip()
     domain_key = _ws_domain_key(workspace_id)
@@ -48,7 +47,7 @@ def assign_domain(workspace_id: str, subdomain: str) -> str:
 def get_workspace_by_domain(subdomain: str) -> Optional[str]:
     r = RedisService.get_sync_client()
     if r is None:
-        return None
+        raise RuntimeError("Redis unavailable")
     return r.get(_domain_lookup_key(subdomain.lower().strip()))
 
 

@@ -75,7 +75,9 @@ class WorkspaceService:
 
         workspace["slug"] = slug
         workspace["path"] = workspace_path
-        workspace["url"] = WorkspaceService._workspace_url(str(workspace.get("domain") or ""))
+        normalized_name = WorkspaceService._sanitize_workspace_name(str(workspace.get("name") or name))
+        subdomain = f"{normalized_name}-{slug}"
+        workspace["url"] = WorkspaceService._workspace_url(f"{subdomain}.{WorkspaceService._base_domain()}")
         return workspace
 
     @staticmethod
