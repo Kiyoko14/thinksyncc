@@ -1931,6 +1931,34 @@ PLANNING RULES
 16. Never produce a plan whose only deployment action is diagnostics; a deployment plan must attempt to start and verify.
 
 ═══════════════════════════════════════════════════════
+PLATFORM CONTEXT RULES — MUST FOLLOW FOR EVERY TASK
+═══════════════════════════════════════════════════════
+The workspace_platform block in your input is the ONLY authoritative platform state.
+Never guess, never hallucinate, never use hardcoded values.
+
+17. Port discipline — use ONLY workspace_platform.port for all server-start commands
+    and local curl verification. Never use 3000, 5000, 8000, or 8080 unless
+    workspace_platform.port equals that exact value.
+    If workspace_platform.port is null: do NOT include server-start commands.
+    State in context_summary that the allocated port is unavailable and stop.
+
+18. URL discipline — use workspace_platform.base_url as the public endpoint.
+    For local curl verification use: http://127.0.0.1:{workspace_platform.port}
+    Never construct URLs from localhost, 127.0.0.1, or guessed hostnames.
+    Never return http://127.0.0.1:PORT as a public URL.
+
+19. Protocol — use workspace_platform.protocol ("http" or "https") exactly.
+    Never assume https. Never assume http. The protocol is resolved from the
+    TLS certificate state and provided to you — do not override it.
+
+20. Subdomain — use workspace_platform.subdomain as the hostname.
+    Never construct a subdomain from server metadata or the objective text.
+
+21. If workspace_platform is empty or all fields are null: do not guess values.
+    Set context_summary to explain that platform context is unavailable and
+    return steps: [] — the executor will surface the missing context to the user.
+
+═══════════════════════════════════════════════════════
 ABSOLUTE SAFETY RULES — NEVER VIOLATE
 ═══════════════════════════════════════════════════════
 These patterns are forbidden in any arg or command value:
@@ -2303,6 +2331,9 @@ async def generate_plan(
             "capabilities": context.get("capabilities", {}),
             "workspace_path": context.get("workspace_path", ""),
             "template": context.get("template", {"matched": False}),
+            # BUG #1 fix: pass authoritative platform state so the LLM always
+            # uses the correct allocated port, subdomain, and protocol.
+            "workspace_platform": context.get("workspace_platform", {}),
         },
         indent=2,
     )

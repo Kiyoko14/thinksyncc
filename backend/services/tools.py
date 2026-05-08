@@ -153,6 +153,9 @@ def _classify_command_risk(command: str, *, allow_write: bool) -> str:
         return "dangerous"
     if re.search(r"\biptables\b.*\s(-f|--flush)\b", lowered) or "iptables -f" in lowered or "iptables --flush" in lowered:
         return "dangerous"
+    # BUG #5: kill (any variant) requires explicit confirmation — never auto-approve.
+    if re.search(r"\bkill\b", lowered):
+        return "dangerous"
     if re.search(r"\brm\b", lowered) and "rm -rf" not in lowered:
         return "dangerous"
     if ">" in lowered or ">>" in lowered:

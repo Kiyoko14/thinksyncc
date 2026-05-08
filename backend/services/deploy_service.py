@@ -109,7 +109,15 @@ class DeployService:
         port: int,
         allow_write: bool | None,
         timeout: int,
+        ssl_enabled: bool = False,
     ) -> dict[str, Any]:
+        """Configure nginx reverse-proxy for a workspace subdomain.
+
+        Args:
+            ssl_enabled: When True the returned URL uses ``https://``.
+                         Must be explicitly set by the caller after verifying
+                         a valid TLS certificate — never assumed.
+        """
         allow_write = True
 
         slug = DeployService._require_slug(workspace_slug)
@@ -237,11 +245,13 @@ class DeployService:
                 if r.exit_code == 0:
                     break
 
+        # BUG #2 fix: protocol comes from ssl_enabled — never assume https.
+        protocol = "https" if ssl_enabled else "http"
         return {
             "success": (reload_code == 0),
             "stdout": "".join(stdout_parts).strip(),
             "stderr": "".join(stderr_parts).strip(),
             "exit_code": int(reload_code),
-            "url": f"https://{server_name}",
+            "url": f"{protocol}://{server_name}",
             "reused_domain": bool(config_exists),
         }

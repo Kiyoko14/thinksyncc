@@ -29,6 +29,7 @@ async def build_plan(
     server: dict[str, Any] | None = None,
     conversation_history: list[dict[str, str]] | None = None,
     memory: list[dict[str, Any]] | None = None,
+    workspace_context: Any | None = None,
 ) -> dict[str, Any]:
     """
     Build a structured plan.
@@ -71,6 +72,13 @@ async def build_plan(
         steps = agent_llm.build_simple_plan(objective=objective)
         return {"task_mode": "simple", "plan": [s.model_dump(mode="json") for s in steps], "context_summary": "Single-step server plan."}
 
+    # BUG #1 fix: inject authoritative platform context so the LLM always
+    # knows the allocated port, subdomain, protocol, and runtime type.
+    # workspace_context is a WorkspaceContext instance; use as_dict() if present.
+    workspace_platform: dict[str, Any] = {}
+    if workspace_context is not None and hasattr(workspace_context, "as_dict"):
+        workspace_platform = workspace_context.as_dict()
+
     context = {
         "server_metadata": {
             "host": server.get("host"),
@@ -84,6 +92,7 @@ async def build_plan(
         "task_mode": "complex",
         "capabilities": capabilities,
         "template": template_execution_hint(objective) or {"matched": False},
+        "workspace_platform": workspace_platform,
     }
     plan_result: AgentPlan = await agent_llm.generate_plan(objective=objective, context=context, max_steps=bounded_steps)
     steps: list[AgentStep] = plan_result.steps[:bounded_steps]

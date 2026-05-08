@@ -184,6 +184,7 @@ async def run_server_execution(
     on_decision: OnDecision | None = None,
     on_log_chunk: OnLogChunk | None = None,
     config: ExecutionConfig | None = None,
+    workspace_context: Any | None = None,
 ) -> ToolCallingLoopResult:
     """
     Autonomous server executor with self-healing:
@@ -219,7 +220,11 @@ async def run_server_execution(
         "template": template_execution_hint(objective) or {"matched": False},
     }
 
-    from services.capability_service import detect_capabilities
+    from services.capability_service import (
+        WorkspaceContext,
+        detect_capabilities,
+        load_workspace_context,
+    )
 
     capabilities = await detect_capabilities(server)
     coordinator_context["capabilities"] = capabilities
@@ -229,6 +234,38 @@ async def run_server_execution(
 
     r = RedisService.get_sync_client()
     r.set(f"ws:{workspace_id}:capabilities", json.dumps(capabilities), ex=3600)
+
+    # BUG #1 / #4 fix: load authoritative platform context (port, subdomain,
+    # SSL, gateway) from Redis + DB.  This is the ONLY source of truth for the
+    # allocated port — never hardcode, never extract from stdout.
+    if workspace_context is None:
+        try:
+            _ws_minimal: dict[str, Any] = {}
+            try:
+                from core.database import get_supabase
+                _db = get_supabase()
+                _ws_res = (
+                    _db.table("workspaces")
+                    .select("name,slug,domain")
+                    .eq("id", workspace_id)
+                    .limit(1)
+                    .execute()
+                )
+                _ws_minimal = (_ws_res.data or [{}])[0]
+            except Exception:
+                pass
+            workspace_context = await load_workspace_context(
+                workspace_id=workspace_id,
+                workspace=_ws_minimal,
+                server=server,
+                capabilities=capabilities,
+            )
+        except Exception as _ctx_exc:
+            logger.warning("[executor] workspace_context load failed: %s — using empty context", _ctx_exc)
+            workspace_context = WorkspaceContext(workspace_id=workspace_id)
+
+    coordinator_context["workspace_platform"] = workspace_context.as_dict()
+    logger.info("[executor] workspace_context | %s", workspace_context.as_dict())
 
     async def _run_contract_preflight() -> None:
         checks = [
@@ -516,14 +553,29 @@ async def run_server_execution(
         raise Exception("No execution performed — cannot return success")
 
     success = all(r.success for r in results)
-    if requires_validation and _is_deployment_objective(objective) and results:
-        # Failed attempts are allowed only if the recovery path later starts a
-        # server and proves it with curl.
-        success = True
+    # BUG #3 fix: removed premature success=True that was set here before any
+    # verification ran.  Success is now only granted after the full deployment
+    # contract (port-listening, local curl, optional gateway/subdomain checks).
     validation_url = ""
 
     async def _fallback_start_and_verify(reason: str) -> tuple[bool, str]:
-        fallback_port = 8000
+        # BUG #4 fix: use allocated workspace port; never a hardcoded default.
+        if workspace_context is None or workspace_context.port is None:
+            errors.append(
+                {
+                    "step": len(results) + 1,
+                    "tool": ToolName.RUN_COMMAND.value,
+                    "exit_code": 1,
+                    "stderr": (
+                        "No allocated port in platform context. "
+                        "Cannot start fallback server — never use a hardcoded port."
+                    ),
+                    "reason": reason,
+                    "timestamp": _now().isoformat(),
+                }
+            )
+            return False, ""
+        fallback_port = workspace_context.port
         if not capabilities.get("python"):
             errors.append(
                 {
@@ -589,76 +641,169 @@ async def run_server_execution(
             return False, ""
         return True, verify_url
 
-    if requires_validation and success:
-        port = _extract_validation_port(
-            objective,
-            [step.args for step in plan.steps],
-            [result.args for result in results],
-            [result.stdout for result in results],
-            [result.stderr for result in results],
-        )
-        if port is None:
-            success, validation_url = await _fallback_start_and_verify("No localhost port found for required server validation.")
-        else:
-            validation_url = f"http://127.0.0.1:{port}"
-            validation_step = AgentStep(
-                step=len(results) + 1,
-                tool=ToolName.RUN_COMMAND.value,
-                args={"command": f"curl -f {validation_url}"},
-                reason="Validate local server is serving traffic before returning success.",
-                risk_level="safe",
-            )
-            validation_result = await _run_validated_step(validation_step)
-            success = validation_result.validation_passed
-            if not validation_result.validation_passed:
-                errors.append(
-                    {
-                        "step": validation_result.step,
-                        "tool": ToolName.RUN_COMMAND.value,
-                        "command": validation_result.command,
-                        "command_type": validation_result.command_type,
-                        "exit_code": validation_result.exit_code,
-                        "stderr": validation_result.stderr[:1500],
-                        "stdout": validation_result.stdout[:1500],
-                        "validation_passed": validation_result.validation_passed,
-                        "status": validation_result.status,
-                        "reason": "Server validation failed.",
-                        "timestamp": _now().isoformat(),
-                    }
-                )
-                if _is_deployment_objective(objective):
-                    success, validation_url = await _fallback_start_and_verify("Initial curl verification failed; retrying with a Python HTTP server fallback.")
+    # BUG #3 / #4 fix: 5-stage deployment contract.  Uses only
+    # workspace_context.port (allocated by platform) — never extracts port
+    # from stdout, never uses a hardcoded default.
+    async def _run_deployment_contract() -> tuple[bool, str]:
+        """Run the full deployment verification contract.
 
-    if _is_deployment_objective(objective):
-        curl_ok = any(
-            result.success
-            and value_to_str(getattr(result, "tool", None)) == ToolName.RUN_COMMAND.value
-            and "curl" in str((result.args or {}).get("command") or "")
-            for result in results
-        )
-        start_seen = any(
-            value_to_str(getattr(result, "tool", None)) == ToolName.RUN_COMMAND.value
-            and any(token in str((result.args or {}).get("command") or "") for token in ("nohup", "uvicorn", "flask run", "http.server", "npm start", "node "))
-            for result in results
-        )
-        success = bool(success and curl_ok and start_seen)
-        if not success and not any(err.get("reason") == "Deployment execution contract was not satisfied." for err in errors):
+        Stages:
+          1. Port listening  — ``ss -tulnp | grep :{port}``
+          2. Local curl      — ``curl -f http://127.0.0.1:{port}``
+          3. Gateway route   — host-header curl through nginx port 80 (if gateway)
+          4. Public URL      — ``curl -f {protocol}://{subdomain}`` (if gateway)
+
+        Returns (ok: bool, public_url: str).
+        """
+        if workspace_context is None or workspace_context.port is None:
             errors.append(
                 {
                     "step": len(results) + 1,
                     "tool": ToolName.RUN_COMMAND.value,
                     "exit_code": 1,
-                    "stderr": "Deployment execution contract requires server start and successful curl verification.",
-                    "reason": "Deployment execution contract was not satisfied.",
+                    "stderr": "No allocated port in workspace_context — deployment contract cannot run.",
+                    "reason": "Deployment contract: missing platform port.",
                     "timestamp": _now().isoformat(),
                 }
             )
+            return False, ""
+
+        port = workspace_context.port
+        local_url = f"http://127.0.0.1:{port}"
+
+        # Stage 1: port is listening.
+        port_step = AgentStep(
+            step=len(results) + 1,
+            tool=ToolName.RUN_COMMAND.value,
+            args={"command": f"ss -tulnp | grep :{port}"},
+            reason=f"Verify port {port} is listening after server start.",
+            risk_level="safe",
+        )
+        port_result = await _run_validated_step(port_step)
+        port_listening = str(port) in (port_result.stdout or "")
+        if not port_listening:
+            logger.warning("[deploy_contract] stage1_port_not_listening | port=%s", port)
+            fb_ok, fb_url = await _fallback_start_and_verify(
+                f"Port {port} not listening after execution — attempting fallback."
+            )
+            return fb_ok, fb_url
+
+        # Stage 2: local HTTP response.
+        curl_step = AgentStep(
+            step=len(results) + 1,
+            tool=ToolName.RUN_COMMAND.value,
+            args={"command": f"curl -f --max-time 10 {local_url}"},
+            reason=f"Verify HTTP response on allocated port {port}.",
+            risk_level="safe",
+        )
+        curl_result = await _run_validated_step(curl_step)
+        if not curl_result.validation_passed:
+            errors.append(
+                {
+                    "step": curl_result.step,
+                    "tool": ToolName.RUN_COMMAND.value,
+                    "command": curl_result.command,
+                    "command_type": curl_result.command_type,
+                    "exit_code": curl_result.exit_code,
+                    "stderr": curl_result.stderr[:1500],
+                    "stdout": curl_result.stdout[:1500],
+                    "validation_passed": False,
+                    "status": "failed",
+                    "reason": f"Deployment contract stage 2 failed: curl {local_url} returned non-zero.",
+                    "timestamp": _now().isoformat(),
+                }
+            )
+            return False, ""
+
+        # BUG #2 fix: public URL comes from workspace_context — never 127.0.0.1.
+        public_url = workspace_context.base_url or ""
+
+        # Stage 3: gateway host-header route (optional — only if gateway is up).
+        if workspace_context.gateway_available and workspace_context.subdomain:
+            subdomain = workspace_context.subdomain
+            gw_step = AgentStep(
+                step=len(results) + 1,
+                tool=ToolName.RUN_COMMAND.value,
+                args={"command": f'curl -f --max-time 10 -H "Host: {subdomain}" http://127.0.0.1:80'},
+                reason=f"Verify gateway host-header routing for {subdomain}.",
+                risk_level="safe",
+            )
+            gw_result = await _run_validated_step(gw_step)
+            if not gw_result.validation_passed:
+                logger.warning(
+                    "[deploy_contract] stage3_gateway_failed | subdomain=%s | exit=%s",
+                    subdomain, gw_result.exit_code,
+                )
+                # Gateway failure is non-fatal — local curl already passed.
+
+            # Stage 4: public subdomain reachable.
+            if public_url:
+                pub_step = AgentStep(
+                    step=len(results) + 1,
+                    tool=ToolName.RUN_COMMAND.value,
+                    args={"command": f"curl -f --max-time 15 {public_url}"},
+                    reason=f"Verify public URL {public_url} returns HTTP 2xx.",
+                    risk_level="safe",
+                )
+                pub_result = await _run_validated_step(pub_step)
+                if not pub_result.validation_passed:
+                    logger.warning(
+                        "[deploy_contract] stage4_public_failed | url=%s | exit=%s",
+                        public_url, pub_result.exit_code,
+                    )
+                    # Public URL failure is non-fatal — local stages passed.
+
+        return True, public_url
+
+    if requires_validation and _is_deployment_objective(objective):
+        success, validation_url = await _run_deployment_contract()
+    elif requires_validation and success:
+        # Non-deployment objectives that still need server validation.
+        # Use workspace_context.port (BUG #4) instead of extracting from stdout.
+        port = workspace_context.port if workspace_context else None
+        if port is None:
+            success, validation_url = await _fallback_start_and_verify(
+                "No allocated port in platform context for server validation."
+            )
+        else:
+            local_url = f"http://127.0.0.1:{port}"
+            v_step = AgentStep(
+                step=len(results) + 1,
+                tool=ToolName.RUN_COMMAND.value,
+                args={"command": f"curl -f {local_url}"},
+                reason="Validate local server is serving traffic before returning success.",
+                risk_level="safe",
+            )
+            v_result = await _run_validated_step(v_step)
+            success = v_result.validation_passed
+            if not v_result.validation_passed:
+                errors.append(
+                    {
+                        "step": v_result.step,
+                        "tool": ToolName.RUN_COMMAND.value,
+                        "command": v_result.command,
+                        "command_type": v_result.command_type,
+                        "exit_code": v_result.exit_code,
+                        "stderr": v_result.stderr[:1500],
+                        "stdout": v_result.stdout[:1500],
+                        "validation_passed": False,
+                        "status": v_result.status,
+                        "reason": "Server validation failed.",
+                        "timestamp": _now().isoformat(),
+                    }
+                )
+            # BUG #2 fix: return platform URL, not localhost.
+            validation_url = (workspace_context.base_url or local_url) if success else ""
 
     if not success:
         validation_url = ""
 
+    # BUG #2 fix: summary URL is the public subdomain URL, not http://127.0.0.1.
+    public_summary_url = (workspace_context.base_url or validation_url) if success else ""
     status_label = "SUCCESS" if success else "FAILED"
-    summary = f"Steps executed: {len(results)}\nStatus: {status_label}\nURL: {validation_url}"
+    summary = f"Steps executed: {len(results)}\nStatus: {status_label}"
+    if public_summary_url:
+        summary += f"\nURL: {public_summary_url}"
 
     return ToolCallingLoopResult(
         task_mode=normalized_task_mode,
