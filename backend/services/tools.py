@@ -895,7 +895,6 @@ CommandType = str
 CHECK_COMMANDS: tuple[str, ...] = (
     "grep",
     "test",
-    "[',
     "ss",
     "ls",
     "find",
@@ -1548,7 +1547,7 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "description": (
                 "Read recent logs from a systemd service or a log file on the remote server. "
                 "For systemd services, uses 'journalctl -u <service> -n <lines>'. "
-                "For absolute file paths (starting with /), uses 'tail -n <lines> <path>'.'
+                "For absolute file paths (starting with /), uses 'tail -n <lines> <path>'."
             ),
             "parameters": {
                 "type": "object",
