@@ -39,6 +39,10 @@ class ToolName(str, Enum):
     READ_LOGS = "read_logs"
     DEPLOY_APP = "deploy_app"
     DEPLOY_NEXTJS_APP = "deploy_nextjs_app"
+    LIST_FILES = "list_files"
+    READ_FILE = "read_file"
+    WRITE_FILE = "write_file"
+    LIST_PROCESSES = "list_processes"
 
 
 class DecisionAction(str, Enum):

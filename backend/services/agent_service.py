@@ -33,13 +33,12 @@ from models.job import JobAccepted, JobCreate, JobResponse, JobStatus
 from services import agent_llm
 from services import logger as obs
 from services.chat_service import ChatService
-from services.capability_service import detect_capabilities
 from services.context_engine import ContextEngine
 from services.redis_service import RedisService
 from services.memory import MemoryStore
 from services.planner import build_plan
 from services.executor import run_server_execution
-from services.server_service import ServerService
+from services.server_service import ServerService, detect_capabilities
 from services import self_healing
 from services.ssh_service import SSHService
 from services.workspace_service import WorkspaceService
@@ -52,6 +51,7 @@ from services.tools import (
     file_exists_in_workspace,
     write_workspace_file,
 )
+from backend.agents.constitution import ConstitutionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +106,6 @@ def _deployment_verified_from_steps(steps: list[Any]) -> bool:
     Without this, "All set. Open: …" must never be emitted regardless of whether
     the tool steps individually succeeded.
     """
-    # Compile once — only stdout content is trusted; exit codes alone are not
-    # sufficient evidence (curl can exit 0 even for failed/redirected requests).
     _HTTP_OK_RE = re.compile(
         r"""
         (?:
@@ -137,7 +135,6 @@ def _clean_user_summary(text: str, *, fallback: str) -> str:
         return fallback
     if _looks_like_raw_error(cleaned):
         return fallback
-    # Keep it short and human-friendly.
     return cleaned[:1500].strip()
 
 
@@ -151,7 +148,6 @@ def _extract_message_from_json_summary(summary: str) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
-    # Legacy shapes: {"type": "...", "content": "..."} or {"type": "...", "message": "..."}
     for key in ("message", "content", "summary"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
@@ -240,7 +236,6 @@ def _db_update(job_id: str, patch: dict[str, Any]) -> None:
         patch["updated_at"] = _now_iso()
         get_supabase().table(_TABLE).update(patch).eq("id", job_id).execute()
     except APIError as exc:
-        # Backward compatibility if migrations haven't been applied yet.
         msg = str(exc)
         if any(token in msg for token in ("intent", "errors", "retries")) and ("column" in msg or "field" in msg):
             fallback = dict(patch)
@@ -268,7 +263,6 @@ def _workspace_name_from_objective(objective: str) -> str:
     cleaned = (objective or "").strip()
     if not cleaned:
         return "workspace"
-    # Use first line / sentence as a human-friendly name.
     first = cleaned.splitlines()[0].strip()
     first = re.sub(r"[\[\]\(\)\{\}<>:\"'`]", " ", first)
     first = re.sub(r"\s{2,}", " ", first).strip()
@@ -345,7 +339,6 @@ def clean_code_output(text: str) -> str:
 
 
 def normalize_python_booleans(code: str) -> str:
-    # Common LLM bug: JSON booleans in Python code (NameError: true/false).
     text = code or ""
     text = re.sub(r"\btrue\b", "True", text)
     text = re.sub(r"\bfalse\b", "False", text)
@@ -367,7 +360,6 @@ def _stdlib_modules() -> frozenset[str]:
     names = getattr(sys, "stdlib_module_names", None)
     if isinstance(names, (set, frozenset)):
         return frozenset(names)
-    # Fallback: common stdlib/builtins (non-exhaustive; prefer allow-install over blocking execution)
     return frozenset(
         {
             "abc",
@@ -425,7 +417,6 @@ def _is_stdlib_module(name: str) -> bool:
         return True
     if cleaned in _stdlib_modules():
         return True
-    # Some stdlib modules live under package namespaces (e.g. http.client)
     top = cleaned.split(".", 1)[0]
     return top in _stdlib_modules() or top in sys.builtin_module_names
 
@@ -441,7 +432,6 @@ def _extract_import_modules(code: str) -> list[str]:
         m1 = re.match(r"^\s*import\s+(.+)$", line)
         if m1:
             chunk = m1.group(1)
-            # "a, b as c"
             for part in chunk.split(","):
                 part = part.strip()
                 if not part:
@@ -464,7 +454,6 @@ def _extract_import_modules(code: str) -> list[str]:
                 modules.add(top)
             continue
 
-    # Avoid installing local project modules: only consider names that look like third-party candidates.
     return sorted(modules)
 
 
@@ -581,7 +570,6 @@ async def _run_code_execution(
     logger.info("Execution forced: allow_write=True")
     logger.info("[code] allow_write=%s | job=%s", allow_write, job_id)
 
-    # STEP 2: Resolve workspace
     workspace: dict[str, Any] | None = None
     workspace_id = payload.workspace_id
     if workspace_id:
@@ -633,7 +621,6 @@ async def _run_code_execution(
         timeout=5,
     )
 
-    # Ensure chat exists and persist user message now that workspace is known.
     ChatService.create_chat(workspace_id=workspace_id, user_id=user_id)
     ChatService.save_workspace_message(workspace_id=workspace_id, user_id=user_id, role="user", content=payload.objective)
 
@@ -642,7 +629,6 @@ async def _run_code_execution(
         logger.warning("[guardrails] blocked_workspace | job=%s | errors=%s", job_id, ws_validation.get("errors"))
         return {"type": "validation_error", "errors": ws_validation.get("errors") or ["invalid workspace path"]}
 
-    # Deterministic template/tool layer (pre-LLM).
     template = match_template(payload.objective or "")
     if template is not None:
         logger.info("[template] matched | name=%s | job=%s", template.name, job_id)
@@ -885,7 +871,6 @@ async def _run_code_execution(
             "total_time": max(0.0, time.perf_counter() - overall_t0),
         }
 
-    # STEP 1: Generate code
     code = await agent_llm.generate_code_response(
         payload.objective,
         conversation_history=conversation_history,
@@ -928,7 +913,6 @@ async def _run_code_execution(
         timeout=5,
     )
 
-    # STEP 3: Write file
     files_written: list[str] = ["main.py"]
     w_res = await write_workspace_file(
         server=server,
@@ -987,7 +971,6 @@ async def _run_code_execution(
         if prefix:
             result["logs"] = (prefix + "\n\n" + str(result.get("logs") or "")).strip()
 
-    # Workspace name should be slug, not absolute path.
     if isinstance(result, dict) and result.get("type") == "background":
         result["workspace"] = workspace_name
     if isinstance(result, dict) and not bool(result.get("success")) and result.get("type") != "background":
@@ -1116,6 +1099,7 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     trace_id = (trace_id or "").strip() or obs.new_trace_id()
     settings = get_settings()
     step_timeout = payload.step_timeout_seconds or settings.AGENT_STEP_TIMEOUT
+    constitution_engine = ConstitutionEngine()
 
     _db_update(job_id, {"status": JobStatus.RUNNING.value})
     obs.emit(level="INFO", layer="router", message="job_start", trace_id=trace_id, meta={"job_id": job_id, "mode": "job"})
@@ -1123,7 +1107,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
     requested_mode = (value_to_str(getattr(payload, "mode", None)) or "").strip().lower()
 
-    # Plan mode is chat-only. It must not execute code, touch servers, or write files.
     if requested_mode == "plan":
         try:
             response = await agent_llm.generate_chat_response(user_input=payload.objective, conversation_history=[])
@@ -1175,7 +1158,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         await _publish(job_id, {"type": "completed", "success": False, "summary": str(exc.detail), "step": 0, "tool": None, "trace_id": trace_id})
         return
 
-    # WORKSPACE DEFAULT: resolve/create workspace when missing.
     if not payload.workspace_id:
         try:
             workspace_name = _workspace_name_from_objective(payload.objective)
@@ -1197,7 +1179,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
     logger.info("[router] job=%s | allow_write=%s | workspace_id=%s", job_id, allow_write, payload.workspace_id)
 
-    # Conversation context is only available when a workspace exists.
     conversation_history: list[dict[str, str]] = []
     if payload.workspace_id:
         try:
@@ -1215,11 +1196,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
     memory: list[dict[str, Any]] = await _memory_store.load(user_id=user_id, workspace_id=payload.workspace_id)
 
-    # ---------------------------------------------------------------------
-    # Intent + task-mode routing (CRITICAL)
-    # - Tools may run ONLY when intent == "server"
-    # - Complex tasks must produce a plan
-    # ---------------------------------------------------------------------
     intent = (await agent_llm.classify_intent(user_input=payload.objective, conversation_history=conversation_history)).strip().lower()
     if intent not in {"chat", "code", "server"}:
         intent = "code"
@@ -1333,8 +1309,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             if isinstance(result, dict) and result.get("type") == "patch":
                 summary = json.dumps({"files": result.get("files") or []}, ensure_ascii=False)
             else:
-                # BUG #2 guard — only emit URL after verified HTTP evidence in steps.
-                # workspace_url existing in DB does not mean the deployment is live.
                 steps_evidence = result.get("steps") or [] if isinstance(result, dict) else []
                 if workspace_url and _deployment_verified_from_steps(steps_evidence):
                     summary = f"All set. Open: {workspace_url}"
@@ -1362,6 +1336,8 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             ChatService.save_workspace_message(workspace_id=payload.workspace_id, user_id=user_id, role="user", content=payload.objective)
         except Exception:
             pass
+
+    constitution_engine.check_objective(payload.objective, payload.objective)
 
     plan_bundle = await build_plan(
         intent=intent,
@@ -1417,7 +1393,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         )
 
     async def on_log_chunk(step_num: int, tool_name: str, stream: str, chunk: str) -> None:
-        # Production UX: never stream raw logs to the frontend.
         if not settings.DEBUG:
             return
         await _publish(
@@ -1568,6 +1543,9 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         await _publish(job_id, {"type": "completed", "success": False, "summary": summary, "step": 0, "tool": None})
         return
 
+    if loop_result.success:
+        constitution_engine.check_success_contract(loop_result.verification_results)
+
     final_status = JobStatus.COMPLETED if loop_result.success else JobStatus.FAILED
     final_summary = (
         _clean_user_summary(loop_result.summary, fallback=_GENERIC_FAILURE_MESSAGE)
@@ -1650,7 +1628,6 @@ class AgentService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="dry_run is disabled for the production execution pipeline.",
             )
-        # Workspace is resolved at execution time for code requests.
         if payload.workspace_id:
             workspace = WorkspaceService.get_workspace_by_id(id=payload.workspace_id, user_id=user_id)
             if workspace["server_id"] != payload.server_id:
@@ -1676,7 +1653,6 @@ class AgentService:
             "status": JobStatus.QUEUED.value,
             "allow_write": bool(allow_write),
             "dry_run": payload.dry_run,
-            # Safe defaults: classification will overwrite at runtime.
             "intent": "code",
             "task_mode": "simple",
             "plan": [],
@@ -1692,7 +1668,6 @@ class AgentService:
         try:
             result = get_supabase().table(_TABLE).insert(record).execute()
         except APIError as exc:
-            # Backward compatibility if DB migration hasn't been applied yet.
             msg = str(exc)
             if any(token in msg for token in ("intent", "errors", "retries")) and ("column" in msg or "field" in msg):
                 fallback = dict(record)
@@ -1821,7 +1796,6 @@ class AgentService:
         token = set_request_mode(selected)
         try:
             if selected == "plan":
-                # Plan mode must be chat-only: no remote execution, no job creation, no workspace/server touching.
                 message = await agent_llm.generate_chat_response(user_input=objective, conversation_history=[])
                 return {"type": "chat", "message": message}
 
@@ -1907,7 +1881,6 @@ class AgentService:
                     workspace_url = None
 
             if success:
-                # BUG #2 guard — only emit URL after verified HTTP evidence in steps.
                 steps_evidence = result.get("steps") or [] if isinstance(result, dict) else []
                 if workspace_url and _deployment_verified_from_steps(steps_evidence):
                     message = f"All set. Open: {workspace_url}"

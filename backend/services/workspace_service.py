@@ -1,8 +1,12 @@
+
 import logging
 import os
+import random
+import re
 import shlex
+import string
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
@@ -11,18 +15,147 @@ from postgrest.exceptions import APIError
 from core.config import get_settings
 from core.database import get_supabase
 from models.workspace import WorkspaceResponse
-from services.domain_service import assign_domain as _redis_assign_domain
-from services.port_allocator import allocate_port as _allocate_port, check_port_consistency as _check_consistency, release_port as _release_port
-from services.server_service import ServerService
-from services.slug_service import (
-    SlugService,
-    build_subdomain as _build_subdomain,
-    generate_random_slug as _generate_random_slug,
+from services.port_allocator import (
+    allocate_port as _allocate_port,
+    check_port_consistency as _check_consistency,
+    release_port as _release_port,
 )
+from services.redis_service import RedisService
+from services.server_service import ServerService
 from services.ssh_service import SSHService
 
-
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# Slug and domain generation helpers (from slug_service.py)
+# --------------------------------------------------------------------------
+
+_NORMALIZED_NAME_RE = re.compile(r"^[a-z0-9]+$")
+_RANDOM_SLUG_ALPHABET = string.ascii_lowercase + string.digits
+_RANDOM_SLUG_LENGTH = 6
+_MAX_NAME_LENGTH = 10
+_MAX_SUBDOMAIN_LENGTH = 63
+_VALID_SLUG_CHARS = set(string.ascii_lowercase + string.digits + "-")
+_MAX_SLUG_LENGTH = 50
+
+
+def normalize_name(name: str) -> str:
+    """Strict workspace name validator. Lowercase alphanumeric, max 10 chars."""
+    cleaned = (name or "").strip().lower()
+    if not _NORMALIZED_NAME_RE.match(cleaned):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only letters and numbers allowed",
+        )
+    if len(cleaned) > _MAX_NAME_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Max 10 characters"
+        )
+    return cleaned
+
+
+def generate_random_slug() -> str:
+    """Generate a 6-char [a-z0-9] random slug (uniqueness checked by caller)."""
+    return "".join(random.choices(_RANDOM_SLUG_ALPHABET, k=_RANDOM_SLUG_LENGTH))
+
+
+def build_subdomain(normalized_name: str, slug: str) -> str:
+    """Build {name}-{slug} subdomain and validate total length ≤ 63."""
+    subdomain = f"{normalized_name}-{slug}"
+    if len(subdomain) > _MAX_SUBDOMAIN_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Subdomain too long"
+        )
+    return subdomain
+
+
+def sanitize_name_for_slug(name: str) -> str:
+    """Sanitize workspace name for slug generation (no uniqueness)."""
+    cleaned = name.strip().lower()
+    cleaned = re.sub(r"\s+", "-", cleaned)
+    cleaned = "".join(c for c in cleaned if c in _VALID_SLUG_CHARS)
+    cleaned = cleaned.strip("-")
+    if not cleaned:
+        cleaned = "workspace"
+    return cleaned[:_MAX_SLUG_LENGTH].strip("-") or "workspace"
+
+
+def generate_slug_from_name(name: str) -> str:
+    """Generate a deterministic slug from workspace name (no uniqueness)."""
+    return sanitize_name_for_slug(name)
+
+
+def generate_domain_from_slug(
+    *, slug: str, workspace_id: str, base_domain: str = "thinksync.art"
+) -> str:
+    """Generate deploy domain using {slug}-{short_id}.{base_domain}."""
+    if not slug or not all(c in _VALID_SLUG_CHARS for c in slug):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid slug format"
+        )
+    short_id = (workspace_id or "").replace("-", "").lower()[:6] or "000000"
+    return f"{slug}-{short_id}.{base_domain}"
+
+
+# --------------------------------------------------------------------------
+# Redis-based domain assignment (from domain_service.py)
+# --------------------------------------------------------------------------
+
+
+def _ws_domain_key(workspace_id: str) -> str:
+    return f"ws:{workspace_id}:domain"
+
+
+def _domain_lookup_key(subdomain: str) -> str:
+    return f"ws_domain:{subdomain.lower().strip()}"
+
+
+def assign_domain(workspace_id: str, subdomain: str) -> str:
+    r = RedisService.get_sync_client()
+    if r is None:
+        raise RuntimeError("Redis unavailable")
+
+    clean = subdomain.lower().strip()
+    domain_key = _ws_domain_key(workspace_id)
+    lookup_key = _domain_lookup_key(clean)
+
+    existing_domain = r.get(domain_key)
+    if existing_domain is not None:
+        return existing_domain
+
+    owner = r.get(lookup_key)
+    if owner is not None and owner != workspace_id:
+        raise ValueError(
+            f"Subdomain '{clean}' is already assigned to workspace {owner}"
+        )
+
+    pipeline = r.pipeline()
+    pipeline.set(domain_key, clean)
+    pipeline.set(lookup_key, workspace_id)
+    pipeline.execute()
+
+    logger.info("Assigned subdomain '%s' to workspace %s", clean, workspace_id)
+    return clean
+
+
+def get_workspace_by_domain(subdomain: str) -> Optional[str]:
+    r = RedisService.get_sync_client()
+    if r is None:
+        raise RuntimeError("Redis unavailable")
+    return r.get(_domain_lookup_key(subdomain.lower().strip()))
+
+
+def get_domain(workspace_id: str) -> Optional[str]:
+    r = RedisService.get_sync_client()
+    if r is None:
+        return None
+    return r.get(_ws_domain_key(workspace_id))
+
+
+# --------------------------------------------------------------------------
+# Main WorkspaceService
+# --------------------------------------------------------------------------
 
 
 class WorkspaceService:
@@ -32,7 +165,6 @@ class WorkspaceService:
     def _workspaces_root() -> str:
         """
         Root folder for all workspaces on the remote server.
-
         Defaults to ~/workspaces (root: /root/workspaces) but can be overridden.
         """
         return "/root/workspaces"
@@ -47,9 +179,13 @@ class WorkspaceService:
         return cleaned[:10]
 
     @staticmethod
-    async def create_workspace_from_prompt(*, user_id: str, server_id: str, user_input: str) -> dict[str, Any]:
+    async def create_workspace_from_prompt(
+        *, user_id: str, server_id: str, user_input: str
+    ) -> dict[str, Any]:
         name = WorkspaceService._sanitize_workspace_name(user_input)
-        workspace = await WorkspaceService.resolve_workspace(user_id=user_id, server_id=server_id, name=name)
+        workspace = await WorkspaceService.resolve_workspace(
+            user_id=user_id, server_id=server_id, name=name
+        )
         slug = str(workspace.get("slug") or name).strip().lower() or "workspace"
         workspace_path = f"{WorkspaceService._workspaces_root()}/{slug}"
 
@@ -63,21 +199,29 @@ class WorkspaceService:
 
         try:
             server = ServerService.get_server(server_id=server_id, user_id=user_id)
-            await SSHService.execute(server=server, command=f"mkdir -p {shlex.quote(workspace_path)}")
+            await SSHService.execute(
+                server=server, command=f"mkdir -p {shlex.quote(workspace_path)}"
+            )
         except Exception:
             pass
 
         try:
             supabase = get_supabase()
-            supabase.table("workspaces").update({"path": workspace_path}).eq("id", str(workspace.get("id") or "")).execute()
+            supabase.table("workspaces").update({"path": workspace_path}).eq(
+                "id", str(workspace.get("id") or "")
+            ).execute()
         except Exception:
             pass
 
         workspace["slug"] = slug
         workspace["path"] = workspace_path
-        normalized_name = WorkspaceService._sanitize_workspace_name(str(workspace.get("name") or name))
+        normalized_name = WorkspaceService._sanitize_workspace_name(
+            str(workspace.get("name") or name)
+        )
         subdomain = f"{normalized_name}-{slug}"
-        workspace["url"] = WorkspaceService._workspace_url(f"{subdomain}.{WorkspaceService._base_domain()}")
+        workspace["url"] = WorkspaceService._workspace_url(
+            f"{subdomain}.{WorkspaceService._base_domain()}"
+        )
         return workspace
 
     @staticmethod
@@ -114,7 +258,6 @@ class WorkspaceService:
 
     @staticmethod
     def _workspace_path(slug: str) -> str:
-        # Deterministic project root for all workspaces.
         return f"{WorkspaceService._workspaces_root()}/{slug}"
 
     @staticmethod
@@ -125,7 +268,9 @@ class WorkspaceService:
         return f"https://{cleaned}"
 
     @staticmethod
-    def get_workspace_by_slug(*, user_id: str, server_id: str, slug: str) -> dict[str, Any] | None:
+    def get_workspace_by_slug(
+        *, user_id: str, server_id: str, slug: str
+    ) -> dict[str, Any] | None:
         WorkspaceService._validate_uuid(user_id, "user_id")
         WorkspaceService._validate_uuid(server_id, "server_id")
         cleaned_slug = (slug or "").strip().lower()
@@ -149,14 +294,14 @@ class WorkspaceService:
         if not result or not result.data:
             return None
         row = dict(result.data)
-        return WorkspaceService._ensure_workspace_fields(row, supabase=supabase, user_id=user_id)
+        return WorkspaceService._ensure_workspace_fields(
+            row, supabase=supabase, user_id=user_id
+        )
 
     @staticmethod
-    async def resolve_workspace(*, user_id: str, server_id: str, name: str) -> dict[str, Any]:
-        """
-        Resolve a workspace by deterministic slug (derived from name).
-        If it exists, return it. Otherwise create a new workspace.
-        """
+    async def resolve_workspace(
+        *, user_id: str, server_id: str, name: str
+    ) -> dict[str, Any]:
         WorkspaceService._validate_uuid(user_id, "user_id")
         WorkspaceService._validate_uuid(server_id, "server_id")
 
@@ -164,15 +309,15 @@ class WorkspaceService:
         if not cleaned_name:
             cleaned_name = "workspace"
 
-        slug = SlugService.generate_slug(cleaned_name)
-        existing = WorkspaceService.get_workspace_by_slug(user_id=user_id, server_id=server_id, slug=slug)
+        slug = generate_slug_from_name(cleaned_name)
+        existing = WorkspaceService.get_workspace_by_slug(
+            user_id=user_id, server_id=server_id, slug=slug
+        )
         if existing:
-            # Run consistency check on startup so port state is always valid.
             try:
                 _check_consistency(str(existing.get("id") or ""))
             except Exception:
                 pass
-            # Ensure remote folder exists for reliable writes/execution.
             try:
                 server = ServerService.get_server(server_id=server_id, user_id=user_id)
                 workspace_path = str(existing.get("path") or "").strip()
@@ -183,14 +328,15 @@ class WorkspaceService:
                 pass
             return existing
 
-        created = await WorkspaceService.create_workspace(user_id=user_id, server_id=server_id, name=cleaned_name)
+        created = await WorkspaceService.create_workspace(
+            user_id=user_id, server_id=server_id, name=cleaned_name
+        )
         return created.model_dump(mode="python")
 
     @staticmethod
     def _unique_random_slug(*, supabase) -> str:
-        """Generate a globally unique 6-char random slug."""
         for _ in range(WorkspaceService._MAX_UNIQUE_ATTEMPTS):
-            candidate = _generate_random_slug()
+            candidate = generate_random_slug()
             try:
                 result = (
                     supabase.table("workspaces")
@@ -215,7 +361,6 @@ class WorkspaceService:
             base = "workspace"
 
         def exists(candidate: str) -> bool:
-            # Keep server-scoped slug uniqueness for workspace lookup.
             try:
                 result = (
                     supabase.table("workspaces")
@@ -230,7 +375,6 @@ class WorkspaceService:
             except Exception:
                 pass
 
-            # Also ensure the derived subdomain is globally unique to avoid duplicate domains.
             derived_domain = f"{candidate}.{WorkspaceService._base_domain()}"
             try:
                 domain_result = (
@@ -242,7 +386,6 @@ class WorkspaceService:
                 )
                 return bool(domain_result.data)
             except Exception:
-                # Backward compatibility if the domain column doesn't exist yet.
                 return False
 
         if not exists(base):
@@ -259,7 +402,9 @@ class WorkspaceService:
         )
 
     @staticmethod
-    async def create_workspace(user_id: str, server_id: str, name: str) -> WorkspaceResponse:
+    async def create_workspace(
+        user_id: str, server_id: str, name: str
+    ) -> WorkspaceResponse:
         WorkspaceService._validate_uuid(user_id, "user_id")
         WorkspaceService._validate_uuid(server_id, "server_id")
 
@@ -273,15 +418,17 @@ class WorkspaceService:
         server = ServerService.get_server(server_id=server_id, user_id=user_id)
         supabase = get_supabase()
 
-        base_slug = SlugService.generate_slug(cleaned_name)
+        base_slug = generate_slug_from_name(cleaned_name)
 
-        # Idempotency / UX: if this workspace already exists (same user+server+slug), reuse it.
-        existing = WorkspaceService.get_workspace_by_slug(user_id=user_id, server_id=server_id, slug=base_slug)
+        existing = WorkspaceService.get_workspace_by_slug(
+            user_id=user_id, server_id=server_id, slug=base_slug
+        )
         if existing:
-            existing["url"] = WorkspaceService._workspace_url(str(existing.get("domain") or ""))
+            existing["url"] = WorkspaceService._workspace_url(
+                str(existing.get("domain") or "")
+            )
             return WorkspaceResponse(**existing)
 
-        # Also reuse by exact name (prevents accidental duplicates from double-clicks / retries).
         try:
             by_name = (
                 supabase.table("workspaces")
@@ -295,16 +442,20 @@ class WorkspaceService:
                 .execute()
             )
             if by_name and by_name.data:
-                row = WorkspaceService._ensure_workspace_fields(dict(by_name.data), supabase=supabase, user_id=user_id)
+                row = WorkspaceService._ensure_workspace_fields(
+                    dict(by_name.data), supabase=supabase, user_id=user_id
+                )
                 row["url"] = WorkspaceService._workspace_url(str(row.get("domain") or ""))
                 return WorkspaceResponse(**row)
         except Exception:
             pass
 
         workspace_id = str(uuid4())
-        normalized_name = WorkspaceService._sanitize_workspace_name(cleaned_name) or base_slug or "ws"
+        normalized_name = (
+            WorkspaceService._sanitize_workspace_name(cleaned_name) or base_slug or "ws"
+        )
         slug = WorkspaceService._unique_random_slug(supabase=supabase)
-        subdomain = _build_subdomain(normalized_name, slug)
+        subdomain = build_subdomain(normalized_name, slug)
         domain = f"{subdomain}.{WorkspaceService._base_domain()}"
         workspace_path = WorkspaceService._workspace_path(slug)
 
@@ -353,24 +504,32 @@ class WorkspaceService:
             )
 
         payload = dict(result.data[0])
-        payload["url"] = WorkspaceService._workspace_url(str(payload.get("domain") or ""))
+        payload["url"] = WorkspaceService._workspace_url(
+            str(payload.get("domain") or "")
+        )
 
-        # Allocate an immutable port for this workspace and persist the subdomain
-        # mapping in Redis so the gateway can resolve it.
         try:
             _allocate_port(workspace_id)
         except Exception:
-            logger.warning("Port allocation failed for workspace %s — Redis may be unavailable", workspace_id)
+            logger.warning(
+                "Port allocation failed for workspace %s — Redis may be unavailable",
+                workspace_id,
+            )
 
         try:
-            _redis_assign_domain(workspace_id, subdomain)
+            assign_domain(workspace_id, subdomain)
         except Exception:
-            logger.warning("Domain assignment failed for workspace %s — Redis may be unavailable", workspace_id)
+            logger.warning(
+                "Domain assignment failed for workspace %s — Redis may be unavailable",
+                workspace_id,
+            )
 
         return WorkspaceResponse(**payload)
 
     @staticmethod
-    def get_workspaces(user_id: str, server_id: str | None = None) -> list[WorkspaceResponse]:
+    def get_workspaces(
+        user_id: str, server_id: str | None = None
+    ) -> list[WorkspaceResponse]:
         WorkspaceService._validate_uuid(user_id, "user_id")
         if server_id is not None:
             WorkspaceService._validate_uuid(server_id, "server_id")
@@ -389,14 +548,19 @@ class WorkspaceService:
         rows = result.data or []
         hydrated: list[WorkspaceResponse] = []
         for row in rows:
-            repaired = WorkspaceService._ensure_workspace_fields(dict(row), supabase=supabase, user_id=user_id)
+            repaired = WorkspaceService._ensure_workspace_fields(
+                dict(row), supabase=supabase, user_id=user_id
+            )
             hydrated.append(WorkspaceResponse(**repaired))
         return hydrated
 
     @staticmethod
     def get_workspace_by_id(id: str, user_id: str) -> dict[str, Any]:
         if not isinstance(id, str) or not id.strip():
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "WORKSPACE_REQUIRED"})
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "WORKSPACE_REQUIRED"},
+            )
         WorkspaceService._validate_uuid(id, "workspace_id")
         WorkspaceService._validate_uuid(user_id, "user_id")
 
@@ -423,17 +587,14 @@ class WorkspaceService:
             )
 
         row = dict(result.data)
-        return WorkspaceService._ensure_workspace_fields(row, supabase=supabase, user_id=user_id)
+        return WorkspaceService._ensure_workspace_fields(
+            row, supabase=supabase, user_id=user_id
+        )
 
     @staticmethod
-    def ensure_workspace_domain(*, workspace_id: str, user_id: str, desired_domain: str) -> tuple[str, bool]:
-        """
-        Ensure a workspace has a persisted domain.
-
-        Returns: (domain, reused_domain)
-        - reused_domain=True when an existing domain was already present and reused.
-        - reused_domain=False when the domain was missing and was written.
-        """
+    def ensure_workspace_domain(
+        *, workspace_id: str, user_id: str, desired_domain: str
+    ) -> tuple[str, bool]:
         WorkspaceService._validate_uuid(workspace_id, "workspace_id")
         WorkspaceService._validate_uuid(user_id, "user_id")
 
@@ -469,14 +630,19 @@ class WorkspaceService:
 
         def domain_taken(value: str) -> bool:
             try:
-                check = supabase.table("workspaces").select("id").eq("domain", value).limit(1).execute()
+                check = (
+                    supabase.table("workspaces")
+                    .select("id")
+                    .eq("domain", value)
+                    .limit(1)
+                    .execute()
+                )
                 return bool(check.data)
             except Exception:
                 return False
 
         candidate = cleaned
         if domain_taken(candidate):
-            # Avoid duplicates by suffixing with a stable short id.
             left, _, rest = candidate.partition(".")
             short_id = (workspace_id or "").replace("-", "").lower()[:6] or "000000"
             if rest:
@@ -485,31 +651,34 @@ class WorkspaceService:
                 candidate = f"{left}-{short_id}"
 
         try:
-            supabase.table("workspaces").update({"domain": candidate}).eq("id", workspace_id).eq("user_id", user_id).execute()
+            supabase.table("workspaces").update({"domain": candidate}).eq(
+                "id", workspace_id
+            ).eq("user_id", user_id).execute()
         except APIError as exc:
             code = WorkspaceService._api_error_code(exc)
             if code == "23505" and candidate == cleaned:
                 left, _, rest = cleaned.partition(".")
                 short_id = (workspace_id or "").replace("-", "").lower()[:6] or "000000"
                 alt = f"{left}-{short_id}.{rest}" if rest else f"{left}-{short_id}"
-                supabase.table("workspaces").update({"domain": alt}).eq("id", workspace_id).eq("user_id", user_id).execute()
+                supabase.table("workspaces").update({"domain": alt}).eq(
+                    "id", workspace_id
+                ).eq("user_id", user_id).execute()
                 return alt, False
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "domain_conflict", "message": "Workspace domain already exists"},
+                detail={
+                    "code": "domain_conflict",
+                    "message": "Workspace domain already exists",
+                },
             )
         except Exception:
-            # If persistence fails, still return the candidate, but caller should treat deployment as best-effort.
             return candidate, False
 
         return candidate, False
 
     @staticmethod
     def _ensure_workspace_fields(
-        row: dict[str, Any],
-        *,
-        supabase,
-        user_id: str,
+        row: dict[str, Any], *, supabase, user_id: str
     ) -> dict[str, Any]:
         slug = (row.get("slug") or "").strip()
         domain = (row.get("domain") or "").strip()
@@ -520,7 +689,9 @@ class WorkspaceService:
                 path = WorkspaceService._workspace_path(slug)
                 patch = {"path": path}
                 try:
-                    supabase.table("workspaces").update(patch).eq("id", str(row.get("id") or "")).execute()
+                    supabase.table("workspaces").update(patch).eq(
+                        "id", str(row.get("id") or "")
+                    ).execute()
                 except Exception:
                     pass
                 row.update(patch)
@@ -533,8 +704,10 @@ class WorkspaceService:
 
         patch: dict[str, Any] = {}
         if not slug:
-            base_slug = SlugService.generate_slug(name)
-            slug = WorkspaceService._unique_slug(supabase=supabase, server_id=server_id, base_slug=base_slug)
+            base_slug = generate_slug_from_name(name)
+            slug = WorkspaceService._unique_slug(
+                supabase=supabase, server_id=server_id, base_slug=base_slug
+            )
             patch["slug"] = slug
 
         if not domain:
@@ -552,7 +725,6 @@ class WorkspaceService:
             try:
                 supabase.table("workspaces").update(patch).eq("id", workspace_id).execute()
             except Exception:
-                # Do not block reads; caller still gets a consistent view.
                 pass
             row.update(patch)
 

@@ -1,4 +1,4 @@
-"""
+'''
 ThinkSync Tool Registry.
 
 All tools execute REAL operations on remote servers via SSH.
@@ -7,7 +7,7 @@ Nothing is simulated or faked.
 Every tool function signature:
     async def <name>(*, server, args, workspace_path, allow_write, timeout) -> dict
     returns {"stdout": str, "stderr": str, "code": int}
-"""
+'''
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ _BLOCKED_LOCAL_PATHS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 _WRITE_OP_RE: re.Pattern[str] = re.compile(
-    r"""
+    r'''
     (?:
         >{1,2}                          # shell redirect  > or >>
         | \btee\b                       # tee file
@@ -93,19 +93,19 @@ _WRITE_OP_RE: re.Pattern[str] = re.compile(
         | \bmv\b                        # mv src dst
         # rm is intentionally excluded — requires explicit manual confirmation
     )
-    """,
+    ''',
     re.VERBOSE | re.IGNORECASE,
 )
 
 
 def _is_write_op(command: str) -> bool:
-    """Return True when a command performs a safe file-write / directory operation
+    '''Return True when a command performs a safe file-write / directory operation
     that can be auto-confirmed for ACTION-type plan steps.
 
     Excluded (require explicit confirm=true):
       rm, rm -rf, shutdown, reboot, kill, mkfs — all caught by _BLOCKED_PATTERNS
       or _classify_command_risk and never auto-approved here.
-    """
+    '''
     return bool(_WRITE_OP_RE.search(command))
 
 
@@ -136,11 +136,11 @@ _READ_ONLY_PREFIXES: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 def _classify_command_risk(command: str, *, allow_write: bool) -> str:
-    """
+    '''
     Risk classification for commands executed over SSH.
 
     Returns: "safe" | "moderate" | "dangerous"
-    """
+    '''
     lowered = (command or "").strip().lower()
     if not lowered:
         return "safe"
@@ -279,7 +279,7 @@ def _sanitize_app_name(raw: str) -> str:
 def _truncate_for_log(value: str, limit: int = 800) -> str:
     if len(value) <= limit:
         return value
-    return f"{value[:limit]}...<truncated>"
+    return f'{value[:limit]}...<truncated>'
 
 
 def _log_ssh_execution(tool_name: str, command: str) -> None:
@@ -593,7 +593,7 @@ def _extract_import_modules(code: str) -> list[str]:
             m2 = re.match(r"^\s*from\s+([a-zA-Z0-9_.]+)\s+import\b", line)
             if m2:
                 name = m2.group(1).strip()
-                if not name or name.startswith("."):
+                if not name or name.startswith("."): 
                     continue
                 modules.add(name.split(".", 1)[0])
 
@@ -895,7 +895,7 @@ CommandType = str
 CHECK_COMMANDS: tuple[str, ...] = (
     "grep",
     "test",
-    "[",
+    "[',
     "ss",
     "ls",
     "find",
@@ -919,7 +919,7 @@ def _first_shell_word(command: str) -> str:
 
 
 def classify_command(command: str) -> CommandType:
-    """Classify a shell command by how its exit code should be interpreted."""
+    '''Classify a shell command by how its exit code should be interpreted.'''
     cleaned = (command or "").strip()
     lowered = cleaned.lower()
     if not lowered:
@@ -937,7 +937,7 @@ def classify_command(command: str) -> CommandType:
 
 
 def command_success(command_type: CommandType, exit_code: int) -> bool:
-    """Return whether a classified command completed according to its semantics."""
+    '''Return whether a classified command completed according to its semantics.'''
     normalized = (command_type or "ACTION").upper()
     if normalized == "CHECK":
         return exit_code in {0, 1}
@@ -1153,7 +1153,7 @@ async def _deploy_app(
     step_number: int,
     on_output_chunk: OutputChunkCallback | None = None,
 ) -> ExecResult:
-    """Legacy deploy_app tool — runs a deploy command via SSH."""
+    '''Legacy deploy_app tool — runs a deploy command via SSH.'''
     allow_write = True
 
     app_name: str = args.get("app_name", "").strip()
@@ -1201,6 +1201,95 @@ async def _deploy_nextjs_app(
         "code": 1,
     }
 
+async def _list_files(
+    *,
+    server: dict[str, Any],
+    args: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool,
+    timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
+) -> ExecResult:
+    path = (args.get("path", ".") or ".").strip()
+    _validate_relative_path(path)
+    command = f"ls -laF {shlex.quote(path)}"
+    scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=command)
+    _log_ssh_execution(ToolName.LIST_FILES.value, scoped_command)
+    resp = await SSHService.execute(
+        server=server, command=scoped_command, command_timeout=timeout
+    )
+    _log_ssh_result(ToolName.LIST_FILES.value, resp.exit_code, resp.output)
+    return {"stdout": resp.output or "", "stderr": resp.stderr or "", "code": int(resp.exit_code)}
+
+
+async def _read_file(
+    *,
+    server: dict[str, Any],
+    args: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool,
+    timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
+) -> ExecResult:
+    path = (args.get("path", "") or "").strip()
+    if not path:
+        return {"stdout": "", "stderr": "read_file: 'path' argument is required", "code": 1}
+    rel_path = _validate_relative_path(path)
+    return await read_workspace_file(server=server, workspace_path=workspace_path, path=rel_path, timeout=timeout)
+
+
+async def _write_file(
+    *,
+    server: dict[str, Any],
+    args: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool | None,
+    timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
+) -> ExecResult:
+    if not allow_write:
+        return {"stdout": "", "stderr": "write_file: permission denied", "code": 1}
+    path = (args.get("path", "") or "").strip()
+    content = args.get("content", "")
+    if not path:
+        return {"stdout": "", "stderr": "write_file: 'path' argument is required", "code": 1}
+    
+    rel_path = _validate_relative_path(path)
+    res = await write_workspace_file(
+        server=server,
+        workspace_path=workspace_path,
+        path=rel_path,
+        content=content,
+        allow_write=True,
+        timeout=timeout,
+    )
+    if res["code"] == 0:
+        res["stdout"] = f"Successfully wrote {len(content)} bytes to {path}"
+    return res
+
+
+async def _list_processes(
+    *,
+    server: dict[str, Any],
+    args: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool,
+    timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
+) -> ExecResult:
+    command = "ps aux"
+    scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=command)
+    _log_ssh_execution(ToolName.LIST_PROCESSES.value, scoped_command)
+    resp = await SSHService.execute(
+        server=server, command=scoped_command, command_timeout=timeout
+    )
+    _log_ssh_result(ToolName.LIST_PROCESSES.value, resp.exit_code, resp.output)
+    return {"stdout": resp.output or "", "stderr": resp.stderr or "", "code": int(resp.exit_code)}
+
 
 # ---------------------------------------------------------------------------
 # Tool dispatch table
@@ -1214,6 +1303,10 @@ _TOOL_FN: dict[ToolName, Any] = {
     ToolName.RESTART_SERVICE: _restart_service,
     ToolName.DEPLOY_APP: _deploy_app,
     ToolName.DEPLOY_NEXTJS_APP: _deploy_nextjs_app,
+    ToolName.LIST_FILES: _list_files,
+    ToolName.READ_FILE: _read_file,
+    ToolName.WRITE_FILE: _write_file,
+    ToolName.LIST_PROCESSES: _list_processes,
 }
 
 
@@ -1229,10 +1322,10 @@ async def execute_tool(
     step_number: int = 0,
     on_output_chunk: OutputChunkCallback | None = None,
 ) -> StepResult:
-    """
+    '''
     Dispatch a named tool call to its implementation and return a StepResult.
     All execution is real — no simulation, no faking.
-    """
+    '''
     executed_at = datetime.now(timezone.utc)
     allow_write = True
     logger.info("Execution forced: allow_write=True")
@@ -1455,7 +1548,7 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "description": (
                 "Read recent logs from a systemd service or a log file on the remote server. "
                 "For systemd services, uses 'journalctl -u <service> -n <lines>'. "
-                "For absolute file paths (starting with /), uses 'tail -n <lines> <path>'."
+                "For absolute file paths (starting with /), uses 'tail -n <lines> <path>'.'
             ),
             "parameters": {
                 "type": "object",
@@ -1546,7 +1639,7 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "description": (
                             "Git repository URL. "
                             "HTTPS example: 'https://github.com/user/repo.git'. "
-                            "SSH example: 'git@github.com:user/repo.git'."
+                            "SSH example: 'git@github.com:user/repo.git'.'
                         ),
                     },
                     "branch": {
@@ -1565,7 +1658,7 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "description": (
                             "Unique name for the pm2 process. "
                             "Used to manage the app lifecycle. "
-                            "Default: 'ts-<port>'."
+                            "Default: 'ts-<port>'.'
                         ),
                     },
                 },
@@ -1574,16 +1667,80 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": ToolName.LIST_FILES,
+            "description": "List files and directories in a given path on the remote server.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The relative path of the directory to list. Defaults to the current workspace directory.",
+                        "default": "."
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": ToolName.READ_FILE,
+            "description": "Read the entire content of a file on the remote server.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The relative path of the file to read."
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": ToolName.WRITE_FILE,
+            "description": "Create or overwrite a file with new content. Requires write access.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The relative path of the file to create or overwrite."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The new content to write into the file."
+                    }
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": ToolName.LIST_PROCESSES,
+            "description": "List all running processes on the remote server to check their status.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 #: Write-only tools that are hidden when allow_write=False.
 _WRITE_ONLY_TOOLS: frozenset[str] = frozenset(
-    [ToolName.RESTART_SERVICE, ToolName.DEPLOY_NEXTJS_APP, ToolName.DEPLOY_APP]
+    [ToolName.RESTART_SERVICE, ToolName.DEPLOY_NEXTJS_APP, ToolName.DEPLOY_APP, ToolName.WRITE_FILE]
 )
 
 
 def get_tool_definitions(allow_write: bool) -> list[dict[str, Any]]:
-    """Return OpenAI tool definitions filtered by the caller's write permission."""
+    '''Return OpenAI tool definitions filtered by the caller's write permission.'''
     allow_write = True
     filtered = [
         td for td in OPENAI_TOOL_DEFINITIONS

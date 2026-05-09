@@ -1,21 +1,21 @@
-"use client";
+'use client';
 
-import { useEffect, useMemo, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
-import { ApiError, createWorkspace, getWorkspacesByServer, type Workspace } from "@/services/api";
-import { getToken, logout } from "@/services/auth";
+import { useEffect, useMemo, useState } from 'react';
+import { useParams, useRouter } from 'next/navigation';
+import { ApiError, createWorkspace, getWorkspacesByServer, type Workspace } from '@/services/api';
+import { getToken, logout } from '@/services/auth';
 
 export default function ServerPage() {
   const router = useRouter();
   const params = useParams();
-  const serverId = (params.id as string) ?? "";
+  const serverId = (params.id as string) ?? '';
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
 
-  const title = useMemo(() => "Server", []);
+  const title = useMemo(() => 'Server', []);
 
   const loadWorkspaces = async () => {
     const list = await getWorkspacesByServer(serverId);
@@ -24,11 +24,11 @@ export default function ServerPage() {
 
   useEffect(() => {
     if (!serverId) {
-      router.replace("/servers");
+      router.replace('/servers');
       return;
     }
     if (!getToken()) {
-      router.replace("/login");
+      router.replace('/login');
       return;
     }
 
@@ -43,10 +43,10 @@ export default function ServerPage() {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
           logout();
-          router.replace("/login");
+          router.replace('/login');
           return;
         }
-        setError(err instanceof Error ? err.message : "Failed to load workspaces");
+        setError(err instanceof Error ? err.message : 'Failed to load workspaces');
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -62,19 +62,24 @@ export default function ServerPage() {
 
   const handleNewWorkspace = async () => {
     if (creatingWorkspace) return;
+
+    const name = window.prompt('Enter a name for the new workspace:');
+    if (!name || name.trim().length === 0) {
+      return; // Abort if user cancels or enters an empty name
+    }
+
     setCreatingWorkspace(true);
     setError(null);
     try {
-      const nextIndex = (workspaces?.length ?? 0) + 1;
-      const ws = await createWorkspace(serverId, `Workspace ${nextIndex}`);
+      const ws = await createWorkspace(serverId, name.trim());
       setWorkspaces((prev) => [ws, ...prev.filter((w) => w.id !== ws.id)]);
     } catch (err: unknown) {
       if (err instanceof ApiError && err.status === 401) {
         logout();
-        router.replace("/login");
+        router.replace('/login');
         return;
       }
-      setError(err instanceof Error ? err.message : "Failed to create workspace");
+      setError(err instanceof Error ? err.message : 'Failed to create workspace');
     } finally {
       setCreatingWorkspace(false);
     }
@@ -95,7 +100,7 @@ export default function ServerPage() {
     <div className="min-h-screen bg-gray-950 text-white safe-top safe-bottom">
       <header className="flex h-14 items-center justify-between border-b border-gray-800 bg-gray-950/95 px-4 backdrop-blur">
         <button
-          onClick={() => router.push("/servers")}
+          onClick={() => router.push('/servers')}
           className="rounded-xl p-2 text-gray-400 transition hover:bg-gray-900/60 hover:text-white"
           aria-label="Back to servers"
         >
@@ -118,7 +123,7 @@ export default function ServerPage() {
           <button
             onClick={() => {
               logout();
-              router.replace("/login");
+              router.replace('/login');
             }}
             className="rounded-xl border border-gray-800 bg-gray-900/40 px-3 py-2 text-sm font-semibold text-gray-200 transition hover:bg-gray-900"
           >
