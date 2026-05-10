@@ -237,35 +237,22 @@ export default function ChatPage() {
   if (isLoading) return <Spinner />;
 
   return (
-    <div className="h-screen bg-gray-900 text-gray-100 flex">
-      {/* Left Sidebar */}
-      <div className="w-80 bg-gray-800 border-r border-gray-700 p-6 flex flex-col">
-        <WorkspaceSidebar workspace={workspace} />
-      </div>
-
-      {/* Center Panel */}
-      <div className="flex-1 flex flex-col min-w-0">
-        <Header workspace={workspace} router={useRouter()} />
-        {isRunning && <RunningBanner elapsedTime={elapsedTime} />}
-        {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
-        <div className="flex-1 overflow-y-auto p-6">
-          <div className="max-w-4xl mx-auto space-y-6">
-            {messages.map(msg => <ChatMessageItem key={msg.id} {...msg} />)}
-          </div>
-          <div ref={bottomRef} />
+    <div className="min-h-screen bg-white text-gray-900">
+      <WorkspaceHeader workspace={workspace} router={useRouter()} />
+      {isRunning && <RunningBanner elapsedTime={elapsedTime} />}
+      {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
+      <div className="max-w-4xl mx-auto px-4 py-6 pb-24">
+        <div className="space-y-6">
+          {messages.map(msg => <ChatMessageItem key={msg.id} {...msg} />)}
         </div>
-        <InputArea 
-          input={input} 
-          setInput={setInput} 
-          onSend={handleSend} 
-          disabled={isRunning || !input.trim()}
-        />
+        <div ref={bottomRef} />
       </div>
-
-      {/* Right Panel - Execution Console */}
-      <div className="w-96 bg-gray-800 border-l border-gray-700 p-6 flex flex-col">
-        <ExecutionConsole messages={messages} />
-      </div>
+      <StickyInputArea 
+        input={input} 
+        setInput={setInput} 
+        onSend={handleSend} 
+        disabled={isRunning || !input.trim()}
+      />
     </div>
   );
 }
@@ -299,43 +286,29 @@ const WorkspaceSidebar = ({ workspace }: { workspace: Workspace | null }) => (
 );
 
 const RunningBanner = ({ elapsedTime }: { elapsedTime: number }) => (
-  <div className="bg-blue-600/20 border-b border-blue-500/50 p-3 flex items-center gap-3">
-    <Loader2 className="animate-spin text-blue-400" size={16} />
-    <span className="text-sm font-medium">Agent is actively operating on this workspace</span>
-    <div className="flex items-center gap-1 text-xs text-gray-300 ml-auto">
-      <Clock size={12} />
-      <span>{Math.floor(elapsedTime / 60)}:{(elapsedTime % 60).toString().padStart(2, '0')}</span>
+  <div className="bg-green-50 border-b border-green-200 px-4 py-3">
+    <div className="flex items-center gap-3">
+      <Loader2 className="animate-spin text-green-600" size={16} />
+      <span className="text-sm font-medium text-green-800">Agent is actively operating</span>
+      <div className="flex items-center gap-1 text-xs text-green-700 ml-auto">
+        <Clock size={12} />
+        <span>{Math.floor(elapsedTime / 60)}:{(elapsedTime % 60).toString().padStart(2, '0')}</span>
+      </div>
     </div>
   </div>
 );
 
-const ExecutionConsole = ({ messages }: { messages: ChatMessage[] }) => {
-  const latestAssistantMessage = messages.filter(m => m.role === 'assistant').slice(-1)[0];
-  const steps = latestAssistantMessage?.steps || [];
-
-  return (
-    <div className="space-y-4">
-      <h2 className="text-lg font-semibold">Execution Timeline</h2>
-      {steps.length === 0 ? (
-        <p className="text-gray-400 text-sm">No execution steps yet</p>
-      ) : (
-        <div className="space-y-3">
-          {steps.map(step => <ExecutionStepCard key={step.step} {...step} />)}
-        </div>
-      )}
-    </div>
-  );
-};
-
-const ExecutionStepCard = (step: StepResult) => {
-  const getStateIcon = () => {
-    if (step.success) return <CheckCircle size={16} className="text-green-400" />;
-    return <XCircle size={16} className="text-red-400" />;
+const InlineStepCard = (step: StepResult) => {
+  const getStepIcon = () => {
+    if (step.success) return <CheckCircle size={16} className="text-green-600" />;
+    return <XCircle size={16} className="text-red-500" />;
   };
 
-  const getStateText = () => {
-    if (step.success) return 'validated';
-    return 'failed';
+  const getStepTitle = () => formatToolName(step.tool);
+
+  const getStepStatus = () => {
+    if (step.success) return 'Completed';
+    return `Failed (exit ${step.exit_code})`;
   };
 
   const formatDuration = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
@@ -343,159 +316,134 @@ const ExecutionStepCard = (step: StepResult) => {
   const command = `${step.tool} ${Object.entries(step.args).map(([k, v]) => `--${k} ${v}`).join(' ')}`.trim();
 
   return (
-    <details className="bg-gray-700/50 rounded-lg p-3 border border-gray-600/50">
-      <summary className="flex justify-between items-center cursor-pointer text-sm font-medium">
-        <div className="flex items-center gap-2">
-          {getStateIcon()}
-          <span>Step {step.step}: {formatToolName(step.tool)}</span>
+    <details className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+      <summary className="flex items-center justify-between p-3 cursor-pointer hover:bg-gray-50 transition-colors">
+        <div className="flex items-center gap-3">
+          {getStepIcon()}
+          <div>
+            <h4 className="text-sm font-medium text-gray-900">{getStepTitle()}</h4>
+            <p className="text-xs text-gray-500">{getStepStatus()} • {formatDuration(step.duration_ms)}</p>
+          </div>
         </div>
-        <span className={`px-2 py-1 rounded text-xs ${step.success ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`}>
-          {getStateText()}
-        </span>
+        <div className="text-xs text-gray-400">
+          Step {step.step}
+        </div>
       </summary>
-      <div className="mt-3 space-y-2 text-xs">
+      <div className="px-3 pb-3 space-y-3">
         {command && (
           <div>
-            <h4 className="font-semibold text-gray-300 mb-1">Executed Command</h4>
-            <pre className="bg-gray-900 rounded p-2 text-gray-200 font-mono text-xs overflow-x-auto">{command}</pre>
+            <h5 className="text-xs font-semibold text-gray-700 mb-1">Command</h5>
+            <pre className="bg-gray-50 rounded p-2 text-xs text-gray-800 font-mono overflow-x-auto">{command}</pre>
           </div>
         )}
-        <div>
-          <h4 className="font-semibold text-gray-300 mb-1">Duration</h4>
-          <p className="text-gray-200">{formatDuration(step.duration_ms)}</p>
-        </div>
         {step.stdout && (
           <div>
-            <h4 className="font-semibold text-green-300 mb-1">STDOUT</h4>
-            <pre className="bg-gray-900 rounded p-2 text-gray-200 max-h-32 overflow-y-auto font-mono text-xs whitespace-pre-wrap">{step.stdout}</pre>
+            <h5 className="text-xs font-semibold text-gray-700 mb-1">Output</h5>
+            <pre className="bg-gray-50 rounded p-2 text-xs text-gray-800 max-h-32 overflow-y-auto whitespace-pre-wrap font-mono">{step.stdout}</pre>
           </div>
         )}
         {step.stderr && (
           <div>
-            <h4 className="font-semibold text-red-300 mb-1">STDERR</h4>
-            <pre className="bg-gray-900 rounded p-2 text-red-200 max-h-32 overflow-y-auto font-mono text-xs whitespace-pre-wrap">{step.stderr}</pre>
+            <h5 className="text-xs font-semibold text-red-700 mb-1">Errors</h5>
+            <pre className="bg-red-50 rounded p-2 text-xs text-red-800 max-h-32 overflow-y-auto whitespace-pre-wrap font-mono">{step.stderr}</pre>
           </div>
         )}
-        <div>
-          <h4 className="font-semibold text-gray-300 mb-1">Validation Result</h4>
-          <p className={`font-medium ${step.success ? 'text-green-300' : 'text-red-300'}`}>
-            {step.success ? 'Success' : `Exit code: ${step.exit_code}`}
-          </p>
-        </div>
       </div>
     </details>
   );
 };
 
-const Header = ({ workspace, router }: { workspace: Workspace | null, router: any }) => (
-  <header className="flex-shrink-0 border-b border-gray-700 bg-gray-800 p-4 flex items-center justify-center shadow-md">
-    <h1 className="text-lg font-bold">{workspace?.name || 'Chat'}</h1>
+const WorkspaceHeader = ({ workspace, router }: { workspace: Workspace | null, router: any }) => (
+  <header className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between shadow-sm">
+    <div className="flex items-center gap-3">
+      <button onClick={() => router.back()} className="p-2 rounded-lg hover:bg-gray-100 transition-colors">
+        <ArrowLeft size={20} className="text-gray-600" />
+      </button>
+      <h1 className="text-xl font-semibold text-gray-900">{workspace?.name || 'Chat'}</h1>
+    </div>
+    <div className="text-sm text-gray-500">
+      {workspace?.domain && <span className="px-2 py-1 bg-gray-100 rounded-md">{workspace.domain}</span>}
+    </div>
   </header>
 );
 
 const ChatMessageItem = (msg: ChatMessage) => (
-  <div className={`flex items-start gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-    {msg.role === 'assistant' && <Bot className="w-8 h-8 flex-shrink-0 text-blue-400 mt-1" />}
-    <div className={`max-w-2xl rounded-lg px-4 py-2.5 shadow ${msg.role === 'user' ? 'bg-blue-600 text-white rounded-br-none' : msg.isError ? 'bg-red-800/50 border border-red-700 rounded-bl-none' : 'bg-gray-700 rounded-bl-none'}`}>
-        <p className="whitespace-pre-wrap">{msg.content}</p>
+  <div className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+    {msg.role === 'assistant' && <Bot className="w-8 h-8 flex-shrink-0 text-green-600 mt-1" />}
+    <div className={`max-w-2xl ${msg.role === 'user' ? 'order-first' : ''}`}>
+      <div className={`rounded-2xl px-4 py-3 shadow-sm border ${
+        msg.role === 'user' 
+          ? 'bg-green-600 text-white rounded-br-md' 
+          : msg.isError 
+            ? 'bg-red-50 border-red-200 rounded-bl-md' 
+            : 'bg-gray-50 border-gray-200 rounded-bl-md'
+      }`}>
+        <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
         {msg.status && msg.status !== 'completed' && (
-            <div className="flex items-center gap-2 mt-2 text-xs text-gray-400">
-                <Loader2 className="animate-spin" size={14}/>
-                <span>{msg.status.charAt(0).toUpperCase() + msg.status.slice(1)}...</span>
-            </div>
+          <div className="flex items-center gap-2 mt-3 text-xs text-gray-500">
+            <Loader2 className="animate-spin" size={14}/>
+            <span>{msg.status.charAt(0).toUpperCase() + msg.status.slice(1)}...</span>
+          </div>
         )}
+      </div>
+      {msg.steps && msg.steps.length > 0 && (
+        <div className="mt-4 space-y-2">
+          {msg.steps.map(step => <InlineStepCard key={step.step} {...step} />)}
+        </div>
+      )}
     </div>
-    {msg.role === 'user' && <User className="w-8 h-8 flex-shrink-0 bg-gray-600 p-1.5 rounded-full mt-1" />}
+    {msg.role === 'user' && <User className="w-8 h-8 flex-shrink-0 bg-gray-300 p-1.5 rounded-full mt-1" />}
   </div>
 );
 
-const StepCard = (step: StepResult) => {
-    const executedCommand = `${step.tool} ${Object.entries(step.args).map(([k, v]) => `--${k} ${JSON.stringify(v)}`).join(' ')}`.trim();
-    const validatorResult = step.success ? 'Passed' : `Failed (exit code: ${step.exit_code})`;
-    const retryCount = 0; // Placeholder, as not in data
-
-    return (
-        <details className="bg-gray-800/50 rounded-lg p-3 border border-gray-600/70 overflow-hidden">
-            <summary className="flex justify-between items-center cursor-pointer text-sm font-semibold">
-                <div className="flex items-center gap-2">
-                    <Terminal size={16} className="text-gray-400"/>
-                    <span>Step {step.step}: {formatToolName(step.tool)}</span>
-                </div>
-                <span className={`px-2 py-1 rounded-md text-xs font-bold ${step.success ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`}>
-                    {step.success ? 'Success' : `Exit ${step.exit_code}`}
-                </span>
-            </summary>
-            <div className="mt-3 pt-3 border-t border-gray-600/50 space-y-3">
-                {executedCommand && (
-                    <div>
-                        <h4 className="text-xs font-semibold text-gray-400 mb-1">Executed Command</h4>
-                        <pre className="bg-gray-900 rounded p-2 text-xs text-gray-300 max-h-40 overflow-y-auto whitespace-pre-wrap font-mono">{executedCommand}</pre>
-                    </div>
-                )}
-                {/* Reasoning not available in StepResult */}
-                {step.stdout && (
-                    <div>
-                        <h4 className="text-xs font-semibold text-gray-400 mb-1">STDOUT</h4>
-                        <pre className="bg-gray-900 rounded p-2 text-xs text-gray-300 max-h-60 overflow-y-auto whitespace-pre-wrap font-mono">{step.stdout}</pre>
-                    </div>
-                )}
-                {step.stderr && (
-                    <div className="mt-2">
-                        <h4 className="text-xs font-semibold text-red-400 mb-1">STDERR</h4>
-                        <pre className="bg-gray-900 rounded p-2 text-xs text-red-300 max-h-40 overflow-y-auto whitespace-pre-wrap font-mono">{step.stderr}</pre>
-                    </div>
-                )}
-                <div>
-                    <h4 className="text-xs font-semibold text-gray-400 mb-1">Validator Result</h4>
-                    <p className="text-xs text-gray-300">{validatorResult}</p>
-                </div>
-                <div>
-                    <h4 className="text-xs font-semibold text-gray-400 mb-1">Retry Count</h4>
-                    <p className="text-xs text-gray-300">{retryCount}</p>
-                </div>
-            </div>
-        </details>
-    );
-};
-
-const InputArea = ({ input, setInput, onSend, disabled }: any) => (
-  <div className="flex-shrink-0 border-t border-gray-700 bg-gray-800 p-4">
-    <div className="flex items-center gap-2 max-w-4xl mx-auto bg-gray-700 rounded-lg p-3">
-      <textarea
-        value={input}
-        onChange={e => setInput(e.target.value)}
-        onKeyDown={e => {if(e.key === 'Enter' && !e.shiftKey && !disabled) {e.preventDefault(); onSend();}}}
-        placeholder="Ask the agent to do something... (e.g., 'list all running processes')"
-        className="flex-1 bg-transparent resize-none outline-none text-base placeholder:text-gray-400 disabled:opacity-50"
-        rows={1}
-        disabled={disabled}
-      />
-      <button onClick={onSend} disabled={!input.trim() || disabled} className="bg-blue-600 p-3 rounded-lg text-white hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed">
-        <Send size={20} />
-      </button>
+const StickyInputArea = ({ input, setInput, onSend, disabled }: any) => (
+  <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 p-4">
+    <div className="max-w-4xl mx-auto">
+      <div className="flex items-end gap-3 bg-gray-50 rounded-2xl p-3 border border-gray-200">
+        <textarea
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => {if(e.key === 'Enter' && !e.shiftKey && !disabled) {e.preventDefault(); onSend();}}}
+          placeholder="Ask the agent to do something... (e.g., 'list all running processes')"
+          className="flex-1 bg-transparent resize-none outline-none text-base placeholder:text-gray-400 disabled:opacity-50 min-h-[20px] max-h-32"
+          rows={1}
+          disabled={disabled}
+        />
+        <button 
+          onClick={onSend} 
+          disabled={!input.trim() || disabled} 
+          className="bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed p-3 rounded-xl text-white transition-colors"
+        >
+          <Send size={20} />
+        </button>
+      </div>
     </div>
   </div>
 );
 
 const Spinner = () => (
-  <div className="flex items-center justify-center h-screen bg-gray-900">
-    <Loader2 className="w-10 h-10 text-blue-500 animate-spin" />
+  <div className="flex items-center justify-center min-h-screen bg-white">
+    <Loader2 className="w-10 h-10 text-green-600 animate-spin" />
   </div>
 );
 
 const ErrorDisplay = ({ message, onClose }: { message: string, onClose: () => void }) => (
-    <div className="bg-red-800/50 border-b border-red-700 p-4 flex justify-between items-start">
-        <div className="flex items-start gap-3">
-            <AlertTriangle size={20} className="text-red-300 mt-0.5" />
-            <div>
-              <h3 className="text-sm font-semibold text-red-200 mb-1">Execution Failed</h3>
-              <p className="text-sm text-red-100 mb-2">{message}</p>
-              <div className="text-xs text-red-300">
-                <p><strong>Root Cause:</strong> {message}</p>
-                <p><strong>Suggested Recovery:</strong> Check agent logs and retry with modified objective</p>
-              </div>
-            </div>
+  <div className="bg-red-50 border-b border-red-200 px-4 py-4">
+    <div className="flex justify-between items-start">
+      <div className="flex items-start gap-3">
+        <AlertTriangle size={20} className="text-red-500 mt-0.5" />
+        <div>
+          <h3 className="text-sm font-semibold text-red-800 mb-1">Execution Failed</h3>
+          <p className="text-sm text-red-700 mb-2">{message}</p>
+          <div className="text-xs text-red-600">
+            <p><strong>Root Cause:</strong> {message}</p>
+            <p><strong>Suggested Recovery:</strong> Check agent logs and retry with modified objective</p>
+          </div>
         </div>
-        <button onClick={onClose} className="text-red-200 hover:text-white">&times;</button>
+      </div>
+      <button onClick={onClose} className="text-red-500 hover:text-red-700 p-1">
+        <span className="text-lg">&times;</span>
+      </button>
     </div>
+  </div>
 );
