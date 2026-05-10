@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from fastapi import HTTPException, status
 
@@ -44,10 +45,67 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _compare_and_release_lock(redis_client, key: str, token: str) -> None:
+    # Only release the lock if we still own it.
+    if redis_client.get(key) == token:
+        redis_client.delete(key)
+
+
+def _refresh_lock_ttl(redis_client, key: str, token: str) -> None:
+    if redis_client.get(key) != token:
+        raise WorkspaceBusyError(f"Workspace lock lost for {key}")
+    if not redis_client.expire(key, LOCK_TIMEOUT_SECONDS):
+        raise WorkspaceBusyError(f"Workspace lock could not be refreshed for {key}")
+
+
 @dataclass(frozen=True)
 class ExecutionConfig:
     max_heal_attempts: int = 1
     max_parallel_diagnostics: int = 3
+
+
+def _log_step_execution(
+    *,
+    workspace_id: str,
+    job_id: str,
+    step_number: int,
+    tool_name: str,
+    start_time: datetime,
+    finish_time: datetime,
+    validator_command: str | None,
+    validator_result: bool | None,
+    retry_count: int,
+    final_decision: str,
+    exit_code: int | None = None,
+    validation_passed: bool | None = None,
+    command: str | None = None,
+    command_type: str | None = None,
+) -> None:
+    """Structured logging for every execution step with production-grade observability."""
+    duration_ms = int((finish_time - start_time).total_seconds() * 1000)
+    
+    log_data = {
+        "workspace_id": workspace_id,
+        "job_id": job_id,
+        "step_number": step_number,
+        "tool_name": tool_name,
+        "start_time": start_time.isoformat(),
+        "finish_time": finish_time.isoformat(),
+        "duration_ms": duration_ms,
+        "validator_command": validator_command,
+        "validator_result": validator_result,
+        "retry_count": retry_count,
+        "final_decision": final_decision,
+        "exit_code": exit_code,
+        "validation_passed": validation_passed,
+        "command": command,
+        "command_type": command_type,
+    }
+    
+    # Remove None values for cleaner logs
+    filtered_log = {k: v for k, v in log_data.items() if v is not None}
+    
+    logger.info("[step_execution] %s", json.dumps(filtered_log, ensure_ascii=False))
 
 
 LOCK_TIMEOUT_SECONDS = 300
@@ -214,6 +272,7 @@ async def run_server_execution(
     on_log_chunk: OnLogChunk | None = None,
     config: ExecutionConfig | None = None,
     workspace_context: Any | None = None,
+    job_id: str | None = None,
 ) -> ToolCallingLoopResult:
     """
     Autonomous server executor with self-healing:
@@ -238,7 +297,8 @@ async def run_server_execution(
     if normalized_task_mode not in {"simple", "complex"}:
         normalized_task_mode = "complex"
 
-    if not redis.set(lock_key, _now().isoformat(), ex=LOCK_TIMEOUT_SECONDS, nx=True):
+    lock_token = str(uuid4())
+    if not redis.set(lock_key, lock_token, ex=LOCK_TIMEOUT_SECONDS, nx=True):
         logger.warning("[executor] workspace_busy | workspace_id=%s", workspace_id)
         raise WorkspaceBusyError(f"Workspace {workspace_id} is locked by another job.")
 
@@ -265,9 +325,10 @@ async def run_server_execution(
             config=_,
             workspace_context=workspace_context,
             constitution_engine=constitution_engine,
+            lock_token=lock_token,
         )
     finally:
-        redis.delete(lock_key)
+        _compare_and_release_lock(redis, lock_key, lock_token)
         logger.info("[executor] lock_released | workspace_id=%s", workspace_id)
 
 
@@ -294,6 +355,7 @@ async def _execute_with_lock(
     config: ExecutionConfig,
     workspace_context: Any | None,
     constitution_engine: ConstitutionEngine,
+    lock_token: str | None = None,
 ) -> ToolCallingLoopResult:
     requires_validation = _requires_real_server_validation(objective)
     supported_tools = [ "run_command", "check_disk", "check_memory", "read_logs", "restart_service", "deploy_app" ]
@@ -538,11 +600,54 @@ async def _execute_with_lock(
             agent_reasoning=reason,
         )
 
-    async def _run_validated_step(step: AgentStep) -> StepResult:
-        result = await _exec_step(step)
-        result = await _validate_result(step, result)
-        await _record_result(result)
-        return result
+    async def _run_validated_step(step: AgentStep, retry_count: int = 0, job_id: str | None = None) -> StepResult:
+        start_time = _now()
+        tool_name = value_to_str(getattr(step, "tool", None))
+        command = _command_for_step(step)
+        
+        try:
+            result = await _exec_step(step)
+            result = await _validate_result(step, result)
+            await _record_result(result)
+            
+            # Determine final decision based on result
+            final_decision = "success" if result.validation_passed else "failed"
+            
+            # Log the step execution
+            _log_step_execution(
+                workspace_id=workspace_id,
+                job_id=job_id or "",
+                step_number=step.step,
+                tool_name=tool_name,
+                start_time=start_time,
+                finish_time=_now(),
+                validator_command=_action_validator_command(step, result),
+                validator_result=result.validation_passed,
+                retry_count=retry_count,
+                final_decision=final_decision,
+                exit_code=result.exit_code,
+                validation_passed=result.validation_passed,
+                command=command,
+                command_type=result.command_type,
+            )
+            
+            return result
+        except Exception:
+            finish_time = _now()
+            _log_step_execution(
+                workspace_id=workspace_id,
+                job_id=job_id or "",
+                step_number=step.step,
+                tool_name=tool_name,
+                start_time=start_time,
+                finish_time=finish_time,
+                validator_command=None,
+                validator_result=False,
+                retry_count=retry_count,
+                final_decision="exception",
+                command=command,
+            )
+            raise
 
     if _is_deployment_objective(objective):
         await _run_contract_preflight()
@@ -576,16 +681,35 @@ async def _execute_with_lock(
 
         attempt = 0
         while True:
+            if lock_token is not None:
+                _refresh_lock_ttl(redis, lock_key, lock_token)
+
             # Refresh context before critical actions
             tool_name = value_to_str(getattr(step, "tool", None))
             critical_tool = tool_name in {ToolName.DEPLOY_APP.value, ToolName.RESTART_SERVICE.value}
             if critical_tool or (step.step == len(plan.steps) and _is_deployment_objective(objective)):
                  await _refresh_context()
 
-            result = await _run_validated_step(step)
+            result = await _run_validated_step(step, retry_count=attempt, job_id=job_id)
             decision = await _evaluate(step, result, attempt + 1) # Use 1-based attempt for eval
             decisions.append(decision)
             logger.info("[executor] decision | step=%s | action=%s | reason=%r", step.step, value_to_str(getattr(decision, "action", None)), decision.reason)
+            _log_step_execution(
+                workspace_id=workspace_id,
+                job_id=job_id or "",
+                step_number=step.step,
+                tool_name=value_to_str(getattr(step, "tool", None)),
+                start_time=result.executed_at,
+                finish_time=_now(),
+                validator_command=_action_validator_command(step, result),
+                validator_result=result.validation_passed,
+                retry_count=attempt,
+                final_decision=value_to_str(getattr(decision, "action", None)),
+                exit_code=result.exit_code,
+                validation_passed=result.validation_passed,
+                command=result.command,
+                command_type=result.command_type,
+            )
             if on_decision:
                 try:
                     await on_decision(decision)
@@ -745,6 +869,12 @@ async def _execute_with_lock(
     if public_summary_url:
         summary += f"\nURL: {public_summary_url}"
 
+    verification_results = {
+        "success": success,
+        "url": validation_url or public_summary_url,
+        "objective": objective,
+    }
+
     return ToolCallingLoopResult(
         task_mode=task_mode,
         plan=plan.steps,
@@ -755,4 +885,5 @@ async def _execute_with_lock(
         summary=summary,
         success=success,
         steps_taken=len(results),
+        verification_results=verification_results,
     )

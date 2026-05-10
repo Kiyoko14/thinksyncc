@@ -29,15 +29,15 @@ export default function LoginForm() {
 
   return (
     <div className="w-full max-w-md">
-      <div className="rounded-3xl border border-gray-800 bg-gray-900/60 p-6 shadow-2xl shadow-black/40 backdrop-blur">
+      <div className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-[0_20px_80px_-40px_rgba(15,23,42,0.15)]">
         <div className="mb-6">
-          <h1 className="text-2xl font-semibold tracking-tight text-white">ThinkSync</h1>
-          <p className="mt-1 text-sm text-gray-400">Sign in to continue</p>
+          <h1 className="text-3xl font-semibold tracking-tight text-slate-900">ThinkSync</h1>
+          <p className="mt-2 text-sm text-slate-500">Sign in to your AI DevOps workspace.</p>
         </div>
 
-        <form onSubmit={onSubmit} className="space-y-4">
+        <form onSubmit={onSubmit} className="space-y-5">
           <div>
-            <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-gray-400">
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
               Email
             </label>
             <input
@@ -47,13 +47,13 @@ export default function LoginForm() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
-              className="w-full rounded-2xl border border-gray-800 bg-gray-950/40 px-4 py-3 text-white placeholder:text-gray-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              className="w-full rounded-3xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-100"
               required
             />
           </div>
 
           <div>
-            <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-gray-400">
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
               Password
             </label>
             <input
@@ -62,13 +62,13 @@ export default function LoginForm() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
-              className="w-full rounded-2xl border border-gray-800 bg-gray-950/40 px-4 py-3 text-white placeholder:text-gray-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              className="w-full rounded-3xl border border-slate-200 bg-slate-50 px-4 py-3 text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-100"
               required
             />
           </div>
 
           {error ? (
-            <div className="rounded-2xl border border-red-900/60 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+            <div className="rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
               {error}
             </div>
           ) : null}
@@ -76,7 +76,7 @@ export default function LoginForm() {
           <button
             type="submit"
             disabled={loading}
-            className="inline-flex w-full items-center justify-center rounded-2xl bg-blue-600 px-4 py-3 font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex w-full items-center justify-center rounded-3xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white shadow-sm shadow-emerald-200/50 transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {loading ? (
               <span className="inline-flex items-center gap-2">
@@ -91,13 +91,13 @@ export default function LoginForm() {
             )}
           </button>
 
-          <div className="flex items-center justify-between pt-1 text-sm">
-            <Link href="/signup" className="text-gray-300 hover:text-white">
+          <div className="flex items-center justify-between pt-2 text-sm text-slate-500">
+            <Link href="/signup" className="text-emerald-600 hover:text-emerald-700 font-semibold">
               Register
             </Link>
             <button
               type="button"
-              className="text-gray-400 hover:text-gray-200"
+              className="text-slate-500 transition hover:text-slate-700"
               onClick={() => setError("Forgot password is not implemented yet.")}
             >
               Forgot password

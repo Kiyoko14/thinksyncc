@@ -195,6 +195,7 @@ class ToolCallingLoopResult(BaseModel):
     summary: str = ""
     success: bool = True
     steps_taken: int = 0
+    verification_results: dict[str, Any] = Field(default_factory=dict)
 
 
 class ForgeV2RunRequest(BaseModel):

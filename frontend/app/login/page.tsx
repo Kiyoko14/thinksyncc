@@ -4,8 +4,8 @@ import LoginForm from "@/components/LoginForm";
 
 export default function LoginPage() {
   return (
-    <div className="min-h-screen bg-gray-950 text-white safe-top safe-bottom">
-      <div className="mx-auto flex min-h-screen max-w-6xl items-center justify-center px-6 py-12">
+    <div className="min-h-screen bg-slate-50 text-slate-900 safe-top safe-bottom">
+      <div className="mx-auto flex min-h-screen max-w-2xl items-center justify-center px-4 py-10 sm:px-6">
         <LoginForm />
       </div>
     </div>

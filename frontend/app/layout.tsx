@@ -10,8 +10,8 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
+  maximumScale: 5,
+  userScalable: true,
   viewportFit: "cover",
 };
 
@@ -21,8 +21,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body>
+    <html lang="en" className="scroll-smooth bg-slate-50">
+      <body className="min-h-screen bg-slate-50 text-slate-900 antialiased">
         <AuthBootstrap>{children}</AuthBootstrap>
       </body>
     </html>

@@ -234,19 +234,53 @@ export default function ChatPage() {
 
   // ===== RENDER =====
 
+  const latestAssistantMessage = [...messages].reverse().find((msg) => msg.role === 'assistant');
+  const allSteps = latestAssistantMessage?.steps || [];
+
   if (isLoading) return <Spinner />;
 
   return (
-    <div className="min-h-screen bg-white text-gray-900">
+    <div className="min-h-screen bg-slate-50 text-slate-900">
       <WorkspaceHeader workspace={workspace} router={useRouter()} />
       {isRunning && <RunningBanner elapsedTime={elapsedTime} />}
       {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
-      <div className="max-w-4xl mx-auto px-4 py-6 pb-24">
-        <div className="space-y-6">
-          {messages.map(msg => <ChatMessageItem key={msg.id} {...msg} />)}
+
+      <main className="mx-auto grid max-w-7xl gap-6 px-4 py-6 lg:grid-cols-[280px_minmax(0,360px)] lg:px-6">
+        <div className="hidden lg:block">
+          <WorkspaceSidebar workspace={workspace} />
         </div>
-        <div ref={bottomRef} />
-      </div>
+
+        <section className="min-w-0">
+          <div className="rounded-[32px] border border-slate-200 bg-white p-4 shadow-sm shadow-slate-200/40">
+            <div className="flex flex-col gap-3 border-b border-slate-200 pb-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Workspace Chat</p>
+                <p className="mt-1 text-sm text-slate-500">Ask your agent and review execution progress inline.</p>
+              </div>
+              <span className="inline-flex items-center rounded-full border border-emerald-100 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+                {workspace?.name || 'Loading workspace'}
+              </span>
+            </div>
+
+            <div className="space-y-4 py-4">
+              {messages.map((msg) => (
+                <ChatMessageItem key={msg.id} {...msg} />
+              ))}
+              <div ref={bottomRef} />
+            </div>
+          </div>
+
+          <div className="mt-4 space-y-3 lg:hidden">
+            <WorkspacePanelMobile workspace={workspace} />
+            <TimelinePanelMobile steps={allSteps} />
+          </div>
+        </section>
+
+        <aside className="hidden lg:block">
+          <ExecutionTimelinePanel steps={allSteps} />
+        </aside>
+      </main>
+
       <StickyInputArea 
         input={input} 
         setInput={setInput} 
@@ -256,6 +290,68 @@ export default function ChatPage() {
     </div>
   );
 }
+
+const ExecutionTimelinePanel = ({ steps }: { steps: StepResult[] }) => (
+  <div className="rounded-[32px] border border-slate-200 bg-white p-4 shadow-sm shadow-slate-200/40">
+    <div className="mb-4 flex items-center justify-between gap-3">
+      <div>
+        <p className="text-sm font-semibold text-slate-900">Execution timeline</p>
+        <p className="text-sm text-slate-500">Live step progress and status.</p>
+      </div>
+      <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">{steps.length} steps</span>
+    </div>
+    <div className="space-y-3">
+      {steps.length === 0 ? (
+        <div className="rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+          No execution steps yet.
+        </div>
+      ) : (
+        steps.map((step) => <InlineStepCard key={step.step} {...step} />)
+      )}
+    </div>
+  </div>
+);
+
+const WorkspacePanelMobile = ({ workspace }: { workspace: Workspace | null }) => (
+  <details className="rounded-[32px] border border-slate-200 bg-white p-4 shadow-sm shadow-slate-200/40">
+    <summary className="flex cursor-pointer items-center justify-between gap-3 text-sm font-semibold text-slate-900">
+      Workspace info
+      <span className="text-slate-400">Expand</span>
+    </summary>
+    <div className="mt-4 space-y-3 text-sm text-slate-700">
+      <div>
+        <p className="text-slate-500">Name</p>
+        <p className="font-medium text-slate-900">{workspace?.name || 'Loading...'}</p>
+      </div>
+      <div>
+        <p className="text-slate-500">Subdomain</p>
+        <p className="font-medium text-slate-900">{workspace?.domain || 'N/A'}</p>
+      </div>
+      <div>
+        <p className="text-slate-500">Path</p>
+        <p className="font-medium text-slate-900 truncate">{workspace?.path || 'N/A'}</p>
+      </div>
+    </div>
+  </details>
+);
+
+const TimelinePanelMobile = ({ steps }: { steps: StepResult[] }) => (
+  <details className="rounded-[32px] border border-slate-200 bg-white p-4 shadow-sm shadow-slate-200/40">
+    <summary className="flex cursor-pointer items-center justify-between gap-3 text-sm font-semibold text-slate-900">
+      Execution timeline
+      <span className="text-slate-400">Expand</span>
+    </summary>
+    <div className="mt-4 space-y-3">
+      {steps.length === 0 ? (
+        <div className="rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+          No execution steps yet.
+        </div>
+      ) : (
+        steps.map((step) => <InlineStepCard key={step.step} {...step} />)
+      )}
+    </div>
+  </details>
+);
 
 // ===== SUB-COMPONENTS =====
 

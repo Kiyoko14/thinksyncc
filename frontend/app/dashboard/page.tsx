@@ -20,82 +20,70 @@ export default function DashboardPage() {
   if (!ready) return null;
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white pb-20">
-      {/* Header */}
-      <header className="sticky top-0 z-30 bg-gray-950/95 backdrop-blur border-b border-gray-800 safe-top">
-        <div className="flex items-center justify-between px-4 h-14">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <div className="min-h-screen bg-slate-50 text-slate-900 safe-top pb-24">
+      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur-sm">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6">
+          <div className="flex items-center gap-3">
+            <div className="grid h-11 w-11 place-items-center rounded-2xl bg-emerald-50 text-emerald-700 shadow-sm shadow-emerald-200/60">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                 <polyline points="4 17 10 11 4 5" />
                 <line x1="12" y1="19" x2="20" y2="19" />
               </svg>
             </div>
-            <span className="font-bold text-white text-base tracking-tight">ThinkSync</span>
+            <div>
+              <p className="text-sm font-semibold text-slate-900">ThinkSync</p>
+              <p className="text-sm text-slate-500">AI DevOps Platform</p>
+            </div>
           </div>
           <button
             onClick={() => { logout(); router.replace("/login"); }}
-            className="text-gray-500 hover:text-gray-300 transition-colors p-1"
+            className="inline-flex items-center rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50"
             aria-label="Logout"
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-              <polyline points="16 17 21 12 16 7" />
-              <line x1="21" y1="12" x2="9" y2="12" />
-            </svg>
+            Logout
           </button>
         </div>
       </header>
 
-      <main className="px-4 pt-6 space-y-4">
-        <div>
-          <h1 className="text-2xl font-bold text-white">Dashboard</h1>
-          <p className="text-gray-500 text-sm mt-0.5">AI-powered DevOps Platform</p>
-        </div>
-
-        {/* Quick actions */}
-        <div className="grid grid-cols-1 gap-3">
-          <a
-            href="/servers"
-            className="bg-gray-900 border border-gray-800 rounded-2xl p-5 active:scale-[0.98] transition-transform"
-          >
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 rounded-xl bg-blue-600/10 border border-blue-600/20 flex items-center justify-center flex-shrink-0">
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="2" y="2" width="20" height="8" rx="2" />
-                  <rect x="2" y="14" width="20" height="8" rx="2" />
-                  <circle cx="6" cy="6" r="1" fill="#60a5fa" stroke="none" />
-                  <circle cx="6" cy="18" r="1" fill="#60a5fa" stroke="none" />
-                </svg>
-              </div>
+      <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+        <div className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+          <section className="rounded-[32px] border border-slate-200 bg-white p-6 shadow-sm shadow-slate-200/60">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
               <div>
-                <p className="font-semibold text-white">Servers</p>
-                <p className="text-gray-500 text-sm mt-0.5">Manage SSH-connected servers</p>
+                <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Dashboard</h1>
+                <p className="mt-2 text-sm text-slate-500">AI-powered DevOps workspaces, servers, and agent workflows.</p>
               </div>
-              <svg className="ml-auto text-gray-600" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
+              <a
+                href="/servers"
+                className="inline-flex items-center justify-center rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white shadow-sm shadow-emerald-200/40 transition hover:bg-emerald-700"
+              >
+                Manage servers
+              </a>
             </div>
-          </a>
-        </div>
+          </section>
 
-        {/* Info cards */}
-        <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
-          <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-3">How it works</p>
-          <div className="space-y-3">
-            {[
-              { n: "1", text: "Add a server with SSH credentials" },
-              { n: "2", text: "Create a workspace (project) for the server" },
-              { n: "3", text: "Open the workspace to start chatting" },
-            ].map(({ n, text }) => (
-              <div key={n} className="flex items-start gap-3">
-                <span className="w-5 h-5 rounded-full bg-blue-600/20 text-blue-400 text-[11px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5">
-                  {n}
-                </span>
-                <p className="text-gray-300 text-sm">{text}</p>
-              </div>
-            ))}
-          </div>
+          <section className="rounded-[32px] border border-slate-200 bg-white p-6 shadow-sm shadow-slate-200/60">
+            <p className="text-sm font-semibold text-slate-900">Quick start</p>
+            <div className="mt-4 space-y-3">
+              {[
+                { label: "1", title: "Add a server", description: "Connect a host with SSH credentials." },
+                { label: "2", title: "Create a workspace", description: "Provision a project for your server." },
+                { label: "3", title: "Open chat", description: "Send prompts and run agent workflows." },
+              ].map((item) => (
+                <div key={item.label} className="rounded-3xl border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex items-start gap-4">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-700 font-semibold">
+                      {item.label}
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">{item.title}</p>
+                      <p className="mt-1 text-sm text-slate-500">{item.description}</p>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
         </div>
       </main>
 
