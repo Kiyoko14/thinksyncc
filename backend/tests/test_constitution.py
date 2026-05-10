@@ -1,5 +1,5 @@
 import unittest
-from backend.agents.constitution import (
+from agents.constitution import (
     ConstitutionEngine,
     ObjectiveMismatchError,
     RuntimeStateViolationError,

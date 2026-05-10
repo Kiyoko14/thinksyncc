@@ -11,7 +11,7 @@ import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
-from services.domain_service import get_workspace_by_domain
+from services.workspace_service import get_workspace_by_domain
 from services.http_client import get_http_client
 from services.port_allocator import get_port, get_workspace_health, mark_workspace_health
 from services.redis_service import RedisService

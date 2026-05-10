@@ -13,6 +13,7 @@ import {
   type JobStreamEvent,
   type StepResult,
   type StoredChatMessage,
+  type ChatRole,
   type Workspace,
 } from '@/services/api';
 import { getToken, logout } from '@/services/auth';
@@ -24,10 +25,10 @@ const POLL_INTERVAL_MS = 2500;
 
 interface ChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: ChatRole;
   content: string;
   createdAt: string;
-  status?: 'running' | 'completed' | 'failed' | 'queued';
+  status?: string;
   steps?: StepResult[];
   isError?: boolean;
 }

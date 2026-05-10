@@ -38,7 +38,8 @@ from services.redis_service import RedisService
 from services.memory import MemoryStore
 from services.planner import build_plan
 from services.executor import run_server_execution
-from services.server_service import ServerService, detect_capabilities
+from services.server_service import ServerService
+from services.capability_service import detect_capabilities
 from services import self_healing
 from services.ssh_service import SSHService
 from services.workspace_service import WorkspaceService
@@ -51,7 +52,7 @@ from services.tools import (
     file_exists_in_workspace,
     write_workspace_file,
 )
-from backend.agents.constitution import ConstitutionEngine
+from agents.constitution import ConstitutionEngine
 
 logger = logging.getLogger(__name__)
 
