@@ -8,8 +8,10 @@ import {
   getJobWebSocketUrl,
   getWorkspace,
   getWorkspaceChat,
+  getWorkspaceJobs,
   runForgeV2,
   type ForgeV2JobResponse,
+  type JobRecord,
   type JobStreamEvent,
   type StepResult,
   type StoredChatMessage,
@@ -55,7 +57,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(true);
-  const [isSending, setIsSending] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
   const socketRef = useRef<WebSocket | null>(null);
@@ -72,9 +74,10 @@ export default function ChatPage() {
     setIsLoading(true);
     setError(null);
     try {
-      const [ws, chat] = await Promise.all([
+      const [ws, chat, jobs] = await Promise.all([
         getWorkspace(id),
         getWorkspaceChat(id),
+        getWorkspaceJobs(id),
       ]);
       setWorkspace(ws);
       setMessages(chat.messages.map(m => ({
@@ -84,6 +87,8 @@ export default function ChatPage() {
         createdAt: m.created_at,
         status: 'completed',
       })));
+      const hasActiveJob = jobs.some(job => job.status === 'running' || job.status === 'queued' || job.status === 'waiting_for_llm');
+      setIsRunning(hasActiveJob);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         logout();
@@ -118,7 +123,7 @@ export default function ChatPage() {
             ...msg,
             content: job.run?.summary || msg.content,
             status: job.status,
-            steps: job.run?.results,
+            steps: job.run?.results ? [...(msg.steps || []), ...job.run?.results.filter(s => !(msg.steps || []).some(existing => existing.step === s.step))] : msg.steps,
             isError: job.status === 'failed',
           }
         : msg
@@ -127,7 +132,7 @@ export default function ChatPage() {
     if (job.status === 'completed' || job.status === 'failed') {
       socketRef.current?.close();
       if(timeoutRef.current) clearTimeout(timeoutRef.current);
-      setIsSending(false);
+      setIsRunning(false);
     }
   };
 
@@ -140,7 +145,7 @@ export default function ChatPage() {
       } 
     } catch {
         setError("Connection lost. Could not update agent status.");
-        setIsSending(false);
+        setIsRunning(false);
     }
   }, []);
 
@@ -149,7 +154,23 @@ export default function ChatPage() {
 
     socketRef.current.onmessage = (event) => {
         const data: JobStreamEvent = JSON.parse(event.data);
-        if(data.type === 'completed' || data.type === 'step_result') {
+        if(data.type === 'completed' || data.type === 'failed' || data.type === 'cancelled') {
+            // Stop polling and close
+            if(timeoutRef.current) clearTimeout(timeoutRef.current);
+            socketRef.current?.close();
+            setIsRunning(false);
+            // Update status
+            setMessages(prev => prev.map(msg => 
+              msg.id === messageId 
+                ? {
+                    ...msg,
+                    status: data.type as any,
+                    content: data.summary || msg.content,
+                    isError: data.type === 'failed',
+                  }
+                : msg
+            ));
+        } else if(data.type === 'step_result') {
              // To get the full summary, we still need to poll
              pollJobStatus(jobId, messageId);
         }
@@ -163,7 +184,12 @@ export default function ChatPage() {
   // ===== UI ACTIONS =====
 
   const handleSend = async () => {
-    if (!input.trim() || !workspace || isSending) return;
+    if (!input.trim() || !workspace || isRunning) return;
+
+    if (isRunning) {
+      setError("Agent is already running in this workspace.");
+      return;
+    }
 
     const userMessage: ChatMessage = {
       id: createId(),
@@ -184,7 +210,7 @@ export default function ChatPage() {
 
     setMessages(prev => [...prev, userMessage, assistantMessage]);
     setInput('');
-    setIsSending(true);
+    setIsRunning(true);
     setError(null);
 
     try {
@@ -201,7 +227,7 @@ export default function ChatPage() {
       const errorMessage = err instanceof Error ? err.message : 'Failed to start the agent.';
       setMessages(prev => prev.map(m => m.id === assistantId ? {...m, content: errorMessage, status: 'failed', isError: true } : m));
       setError(errorMessage);
-      setIsSending(false);
+      setIsRunning(false);
     }
   };
 
@@ -223,7 +249,7 @@ export default function ChatPage() {
         input={input} 
         setInput={setInput} 
         onSend={handleSend} 
-        disabled={isSending}
+        disabled={isRunning}
       />
     </div>
   );
@@ -261,33 +287,54 @@ const ChatMessageItem = (msg: ChatMessage) => (
   </div>
 );
 
-const StepCard = (step: StepResult) => (
-    <details className="bg-gray-800/50 rounded-lg p-3 border border-gray-600/70 overflow-hidden">
-        <summary className="flex justify-between items-center cursor-pointer text-sm font-semibold">
-            <div className="flex items-center gap-2">
-                <Terminal size={16} className="text-gray-400"/>
-                <span>Step {step.step}: {formatToolName(step.tool)}</span>
-            </div>
-            <span className={`px-2 py-1 rounded-md text-xs font-bold ${step.success ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`}>
-                {step.success ? 'Success' : `Exit ${step.exit_code}`}
-            </span>
-        </summary>
-        <div className="mt-3 pt-3 border-t border-gray-600/50">
-            {step.stdout && (
+const StepCard = (step: StepResult) => {
+    const executedCommand = `${step.tool} ${Object.entries(step.args).map(([k, v]) => `--${k} ${JSON.stringify(v)}`).join(' ')}`.trim();
+    const validatorResult = step.success ? 'Passed' : `Failed (exit code: ${step.exit_code})`;
+    const retryCount = 0; // Placeholder, as not in data
+
+    return (
+        <details className="bg-gray-800/50 rounded-lg p-3 border border-gray-600/70 overflow-hidden">
+            <summary className="flex justify-between items-center cursor-pointer text-sm font-semibold">
+                <div className="flex items-center gap-2">
+                    <Terminal size={16} className="text-gray-400"/>
+                    <span>Step {step.step}: {formatToolName(step.tool)}</span>
+                </div>
+                <span className={`px-2 py-1 rounded-md text-xs font-bold ${step.success ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`}>
+                    {step.success ? 'Success' : `Exit ${step.exit_code}`}
+                </span>
+            </summary>
+            <div className="mt-3 pt-3 border-t border-gray-600/50 space-y-3">
+                {executedCommand && (
+                    <div>
+                        <h4 className="text-xs font-semibold text-gray-400 mb-1">Executed Command</h4>
+                        <pre className="bg-gray-900 rounded p-2 text-xs text-gray-300 max-h-40 overflow-y-auto whitespace-pre-wrap font-mono">{executedCommand}</pre>
+                    </div>
+                )}
+                {/* Reasoning not available in StepResult */}
+                {step.stdout && (
+                    <div>
+                        <h4 className="text-xs font-semibold text-gray-400 mb-1">STDOUT</h4>
+                        <pre className="bg-gray-900 rounded p-2 text-xs text-gray-300 max-h-60 overflow-y-auto whitespace-pre-wrap font-mono">{step.stdout}</pre>
+                    </div>
+                )}
+                {step.stderr && (
+                    <div className="mt-2">
+                        <h4 className="text-xs font-semibold text-red-400 mb-1">STDERR</h4>
+                        <pre className="bg-gray-900 rounded p-2 text-xs text-red-300 max-h-40 overflow-y-auto whitespace-pre-wrap font-mono">{step.stderr}</pre>
+                    </div>
+                )}
                 <div>
-                    <h4 className="text-xs font-semibold text-gray-400 mb-1">STDOUT</h4>
-                    <pre className="bg-gray-900 rounded p-2 text-xs text-gray-300 max-h-60 overflow-y-auto whitespace-pre-wrap font-mono">{step.stdout}</pre>
+                    <h4 className="text-xs font-semibold text-gray-400 mb-1">Validator Result</h4>
+                    <p className="text-xs text-gray-300">{validatorResult}</p>
                 </div>
-            )}
-            {step.stderr && (
-                <div className="mt-2">
-                    <h4 className="text-xs font-semibold text-red-400 mb-1">STDERR</h4>
-                    <pre className="bg-gray-900 rounded p-2 text-xs text-red-300 max-h-40 overflow-y-auto whitespace-pre-wrap font-mono">{step.stderr}</pre>
+                <div>
+                    <h4 className="text-xs font-semibold text-gray-400 mb-1">Retry Count</h4>
+                    <p className="text-xs text-gray-300">{retryCount}</p>
                 </div>
-            )}
-        </div>
-    </details>
-);
+            </div>
+        </details>
+    );
+};
 
 const InputArea = ({ input, setInput, onSend, disabled }: any) => (
   <div className="flex-shrink-0 border-t border-gray-700 bg-gray-800 p-4">
@@ -295,7 +342,7 @@ const InputArea = ({ input, setInput, onSend, disabled }: any) => (
       <textarea
         value={input}
         onChange={e => setInput(e.target.value)}
-        onKeyDown={e => {if(e.key === 'Enter' && !e.shiftKey) {e.preventDefault(); onSend();}}}
+        onKeyDown={e => {if(e.key === 'Enter' && !e.shiftKey && !disabled) {e.preventDefault(); onSend();}}}
         placeholder="Ask the agent to do something... (e.g., 'list all running processes')"
         className="flex-1 bg-transparent resize-none outline-none p-2 text-base placeholder:text-gray-400 disabled:opacity-50"
         rows={1}
