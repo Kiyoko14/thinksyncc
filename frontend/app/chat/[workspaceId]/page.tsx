@@ -10,6 +10,7 @@ import {
   getWorkspaceChat,
   getWorkspaceJobs,
   runForgeV2,
+  type AgentJobStatus,
   type ForgeV2JobResponse,
   type JobRecord,
   type JobStreamEvent,
@@ -18,7 +19,7 @@ import {
   type Workspace,
 } from '@/services/api';
 import { getToken, logout } from '@/services/auth';
-import { ArrowLeft, Send, Bot, User, Loader2, AlertTriangle, Terminal } from 'lucide-react';
+import { ArrowLeft, Send, Bot, User, Loader2, AlertTriangle, Terminal, Clock, CheckCircle, XCircle, AlertCircle, Play, Pause } from 'lucide-react';
 
 // ===== UTILITY & TYPE DEFINITIONS =====
 
@@ -29,7 +30,7 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   createdAt: string;
-  status?: 'running' | 'completed' | 'failed' | 'queued';
+  status?: AgentJobStatus;
   steps?: StepResult[];
   isError?: boolean;
 }
@@ -58,6 +59,8 @@ export default function ChatPage() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
+  const [jobStartTime, setJobStartTime] = useState<Date | null>(null);
+  const [elapsedTime, setElapsedTime] = useState(0);
   const [error, setError] = useState<string | null>(null);
   
   const socketRef = useRef<WebSocket | null>(null);
@@ -80,9 +83,9 @@ export default function ChatPage() {
         getWorkspaceJobs(id),
       ]);
       setWorkspace(ws);
-      setMessages(chat.messages.map(m => ({
+      setMessages(chat.messages.filter(m => m.role !== 'system').map(m => ({
         id: m.id,
-        role: m.role,
+        role: m.role as 'user' | 'assistant',
         content: m.content,
         createdAt: m.created_at,
         status: 'completed',
@@ -111,7 +114,17 @@ export default function ChatPage() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isSending]);
+  }, [messages, isRunning]);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (isRunning && jobStartTime) {
+      interval = setInterval(() => {
+        setElapsedTime(Math.floor((Date.now() - jobStartTime.getTime()) / 1000));
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isRunning, jobStartTime]);
 
 
   // ===== REAL-TIME JOB HANDLING =====
@@ -133,6 +146,7 @@ export default function ChatPage() {
       socketRef.current?.close();
       if(timeoutRef.current) clearTimeout(timeoutRef.current);
       setIsRunning(false);
+      setJobStartTime(null);
     }
   };
 
@@ -146,6 +160,7 @@ export default function ChatPage() {
     } catch {
         setError("Connection lost. Could not update agent status.");
         setIsRunning(false);
+        setJobStartTime(null);
     }
   }, []);
 
@@ -154,23 +169,7 @@ export default function ChatPage() {
 
     socketRef.current.onmessage = (event) => {
         const data: JobStreamEvent = JSON.parse(event.data);
-        if(data.type === 'completed' || data.type === 'failed' || data.type === 'cancelled') {
-            // Stop polling and close
-            if(timeoutRef.current) clearTimeout(timeoutRef.current);
-            socketRef.current?.close();
-            setIsRunning(false);
-            // Update status
-            setMessages(prev => prev.map(msg => 
-              msg.id === messageId 
-                ? {
-                    ...msg,
-                    status: data.type as any,
-                    content: data.summary || msg.content,
-                    isError: data.type === 'failed',
-                  }
-                : msg
-            ));
-        } else if(data.type === 'step_result') {
+        if(data.type === 'completed' || data.type === 'step_result') {
              // To get the full summary, we still need to poll
              pollJobStatus(jobId, messageId);
         }
@@ -211,6 +210,7 @@ export default function ChatPage() {
     setMessages(prev => [...prev, userMessage, assistantMessage]);
     setInput('');
     setIsRunning(true);
+    setJobStartTime(new Date());
     setError(null);
 
     try {
@@ -236,32 +236,158 @@ export default function ChatPage() {
   if (isLoading) return <Spinner />;
 
   return (
-    <div className="flex h-screen flex-col bg-gray-900 text-gray-100">
-      <Header workspace={workspace} router={useRouter()} />
-      {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
-      <main className="flex-1 overflow-y-auto p-4">
-        <div className="mx-auto max-w-4xl space-y-6">
-          {messages.map(msg => <ChatMessageItem key={msg.id} {...msg} />)}
+    <div className="h-screen bg-gray-900 text-gray-100 flex">
+      {/* Left Sidebar */}
+      <div className="w-80 bg-gray-800 border-r border-gray-700 p-6 flex flex-col">
+        <WorkspaceSidebar workspace={workspace} />
+      </div>
+
+      {/* Center Panel */}
+      <div className="flex-1 flex flex-col min-w-0">
+        <Header workspace={workspace} router={useRouter()} />
+        {isRunning && <RunningBanner elapsedTime={elapsedTime} />}
+        {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
+        <div className="flex-1 overflow-y-auto p-6">
+          <div className="max-w-4xl mx-auto space-y-6">
+            {messages.map(msg => <ChatMessageItem key={msg.id} {...msg} />)}
+          </div>
+          <div ref={bottomRef} />
         </div>
-        <div ref={bottomRef} />
-      </main>
-      <InputArea 
-        input={input} 
-        setInput={setInput} 
-        onSend={handleSend} 
-        disabled={isRunning}
-      />
+        <InputArea 
+          input={input} 
+          setInput={setInput} 
+          onSend={handleSend} 
+          disabled={isRunning || !input.trim()}
+        />
+      </div>
+
+      {/* Right Panel - Execution Console */}
+      <div className="w-96 bg-gray-800 border-l border-gray-700 p-6 flex flex-col">
+        <ExecutionConsole messages={messages} />
+      </div>
     </div>
   );
 }
 
 // ===== SUB-COMPONENTS =====
 
+const WorkspaceSidebar = ({ workspace }: { workspace: Workspace | null }) => (
+  <div className="space-y-6">
+    <div>
+      <h2 className="text-lg font-semibold mb-4">Workspace</h2>
+      <div className="space-y-3 text-sm">
+        <div>
+          <span className="text-gray-400">Name:</span>
+          <p className="font-medium">{workspace?.name || 'Loading...'}</p>
+        </div>
+        <div>
+          <span className="text-gray-400">Subdomain:</span>
+          <p className="font-medium">{workspace?.domain || 'N/A'}</p>
+        </div>
+        <div>
+          <span className="text-gray-400">Path:</span>
+          <p className="font-medium text-xs">{workspace?.path || 'N/A'}</p>
+        </div>
+        <div>
+          <span className="text-gray-400">Status:</span>
+          <p className="font-medium text-green-400">Active</p>
+        </div>
+      </div>
+    </div>
+  </div>
+);
+
+const RunningBanner = ({ elapsedTime }: { elapsedTime: number }) => (
+  <div className="bg-blue-600/20 border-b border-blue-500/50 p-3 flex items-center gap-3">
+    <Loader2 className="animate-spin text-blue-400" size={16} />
+    <span className="text-sm font-medium">Agent is actively operating on this workspace</span>
+    <div className="flex items-center gap-1 text-xs text-gray-300 ml-auto">
+      <Clock size={12} />
+      <span>{Math.floor(elapsedTime / 60)}:{(elapsedTime % 60).toString().padStart(2, '0')}</span>
+    </div>
+  </div>
+);
+
+const ExecutionConsole = ({ messages }: { messages: ChatMessage[] }) => {
+  const latestAssistantMessage = messages.filter(m => m.role === 'assistant').slice(-1)[0];
+  const steps = latestAssistantMessage?.steps || [];
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-lg font-semibold">Execution Timeline</h2>
+      {steps.length === 0 ? (
+        <p className="text-gray-400 text-sm">No execution steps yet</p>
+      ) : (
+        <div className="space-y-3">
+          {steps.map(step => <ExecutionStepCard key={step.step} {...step} />)}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ExecutionStepCard = (step: StepResult) => {
+  const getStateIcon = () => {
+    if (step.success) return <CheckCircle size={16} className="text-green-400" />;
+    return <XCircle size={16} className="text-red-400" />;
+  };
+
+  const getStateText = () => {
+    if (step.success) return 'validated';
+    return 'failed';
+  };
+
+  const formatDuration = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+  const command = `${step.tool} ${Object.entries(step.args).map(([k, v]) => `--${k} ${v}`).join(' ')}`.trim();
+
+  return (
+    <details className="bg-gray-700/50 rounded-lg p-3 border border-gray-600/50">
+      <summary className="flex justify-between items-center cursor-pointer text-sm font-medium">
+        <div className="flex items-center gap-2">
+          {getStateIcon()}
+          <span>Step {step.step}: {formatToolName(step.tool)}</span>
+        </div>
+        <span className={`px-2 py-1 rounded text-xs ${step.success ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`}>
+          {getStateText()}
+        </span>
+      </summary>
+      <div className="mt-3 space-y-2 text-xs">
+        {command && (
+          <div>
+            <h4 className="font-semibold text-gray-300 mb-1">Executed Command</h4>
+            <pre className="bg-gray-900 rounded p-2 text-gray-200 font-mono text-xs overflow-x-auto">{command}</pre>
+          </div>
+        )}
+        <div>
+          <h4 className="font-semibold text-gray-300 mb-1">Duration</h4>
+          <p className="text-gray-200">{formatDuration(step.duration_ms)}</p>
+        </div>
+        {step.stdout && (
+          <div>
+            <h4 className="font-semibold text-green-300 mb-1">STDOUT</h4>
+            <pre className="bg-gray-900 rounded p-2 text-gray-200 max-h-32 overflow-y-auto font-mono text-xs whitespace-pre-wrap">{step.stdout}</pre>
+          </div>
+        )}
+        {step.stderr && (
+          <div>
+            <h4 className="font-semibold text-red-300 mb-1">STDERR</h4>
+            <pre className="bg-gray-900 rounded p-2 text-red-200 max-h-32 overflow-y-auto font-mono text-xs whitespace-pre-wrap">{step.stderr}</pre>
+          </div>
+        )}
+        <div>
+          <h4 className="font-semibold text-gray-300 mb-1">Validation Result</h4>
+          <p className={`font-medium ${step.success ? 'text-green-300' : 'text-red-300'}`}>
+            {step.success ? 'Success' : `Exit code: ${step.exit_code}`}
+          </p>
+        </div>
+      </div>
+    </details>
+  );
+};
+
 const Header = ({ workspace, router }: { workspace: Workspace | null, router: any }) => (
-  <header className="flex-shrink-0 border-b border-gray-700 bg-gray-800 p-4 flex items-center shadow-md">
-    <button onClick={() => router.back()} className="p-2 rounded-full hover:bg-gray-700 mr-4">
-      <ArrowLeft size={20} />
-    </button>
+  <header className="flex-shrink-0 border-b border-gray-700 bg-gray-800 p-4 flex items-center justify-center shadow-md">
     <h1 className="text-lg font-bold">{workspace?.name || 'Chat'}</h1>
   </header>
 );
@@ -275,11 +401,6 @@ const ChatMessageItem = (msg: ChatMessage) => (
             <div className="flex items-center gap-2 mt-2 text-xs text-gray-400">
                 <Loader2 className="animate-spin" size={14}/>
                 <span>{msg.status.charAt(0).toUpperCase() + msg.status.slice(1)}...</span>
-            </div>
-        )}
-        {msg.steps && msg.steps.length > 0 && (
-            <div className="mt-4 border-t border-gray-600 pt-3 space-y-3">
-                {msg.steps.map(step => <StepCard key={step.step} {...step} />)}
             </div>
         )}
     </div>
@@ -338,13 +459,13 @@ const StepCard = (step: StepResult) => {
 
 const InputArea = ({ input, setInput, onSend, disabled }: any) => (
   <div className="flex-shrink-0 border-t border-gray-700 bg-gray-800 p-4">
-    <div className="flex items-center gap-2 max-w-4xl mx-auto bg-gray-700 rounded-lg p-2">
+    <div className="flex items-center gap-2 max-w-4xl mx-auto bg-gray-700 rounded-lg p-3">
       <textarea
         value={input}
         onChange={e => setInput(e.target.value)}
         onKeyDown={e => {if(e.key === 'Enter' && !e.shiftKey && !disabled) {e.preventDefault(); onSend();}}}
         placeholder="Ask the agent to do something... (e.g., 'list all running processes')"
-        className="flex-1 bg-transparent resize-none outline-none p-2 text-base placeholder:text-gray-400 disabled:opacity-50"
+        className="flex-1 bg-transparent resize-none outline-none text-base placeholder:text-gray-400 disabled:opacity-50"
         rows={1}
         disabled={disabled}
       />
@@ -362,10 +483,17 @@ const Spinner = () => (
 );
 
 const ErrorDisplay = ({ message, onClose }: { message: string, onClose: () => void }) => (
-    <div className="bg-red-800/50 border-b border-red-700 p-3 flex justify-between items-center">
-        <div className="flex items-center gap-2">
-            <AlertTriangle size={20} className="text-red-300"/>
-            <p className="text-sm text-red-200">{message}</p>
+    <div className="bg-red-800/50 border-b border-red-700 p-4 flex justify-between items-start">
+        <div className="flex items-start gap-3">
+            <AlertTriangle size={20} className="text-red-300 mt-0.5" />
+            <div>
+              <h3 className="text-sm font-semibold text-red-200 mb-1">Execution Failed</h3>
+              <p className="text-sm text-red-100 mb-2">{message}</p>
+              <div className="text-xs text-red-300">
+                <p><strong>Root Cause:</strong> {message}</p>
+                <p><strong>Suggested Recovery:</strong> Check agent logs and retry with modified objective</p>
+              </div>
+            </div>
         </div>
         <button onClick={onClose} className="text-red-200 hover:text-white">&times;</button>
     </div>
