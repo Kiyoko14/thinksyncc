@@ -145,19 +145,6 @@ def _action_validator_command(step: AgentStep, result: StepResult) -> str | None
         service_name = str((step.args or {}).get("service_name") or "").strip()
         return f"systemctl is-active --quiet {service_name}" if service_name else None
 
-    # File/package operations do not need runtime validators.
-    if any(token in lowered for token in (
-        "mkdir ",
-        "touch ",
-        "cat >",
-        "echo ",
-        "chmod ",
-        "pip install",
-        "npm install",
-        "yarn install",
-    )):
-        return None
-
     port = _extract_validation_port(command, step.args, result.stdout, result.stderr)
     if port is not None and any(token in lowered for token in ("nohup", "uvicorn", "flask run", "http.server", "npm start", "node ")):
         return f"ss -tulnp | grep :{port}"
@@ -453,8 +440,6 @@ async def _execute_with_lock(
             except Exception:
                 pass
         
-        logger.info("[executor] step=%s | command=%s", step.step, command)
-
         result = await execute_tool(
             tool_name=tool_name,
             args=step.args,
@@ -476,10 +461,8 @@ async def _execute_with_lock(
         command_type = _step_command_type(step)
         exit_code = int(result.exit_code)
 
-        
         if command_type == "CHECK":
             return _set_step_status(
-
                 result,
                 command=command,
                 command_type=command_type,
@@ -514,8 +497,6 @@ async def _execute_with_lock(
                 validation_passed=True,
                 agent_reasoning="ACTION command exited 0; no stronger deterministic validator was inferred.",
             )
-
-        logger.info("[validator] step=%s | validator=%s", step.step, validator)
 
         validation_result = await execute_tool(
             tool_name=ToolName.RUN_COMMAND.value,

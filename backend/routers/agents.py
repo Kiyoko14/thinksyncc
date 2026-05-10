@@ -22,8 +22,6 @@ from models.agent import (
 )
 from models.job import JobCreate
 from services.agent_service import AgentService, to_forge_v2_response
-from services.emergent_agent_service import EmergentE1Service
-from services.forge_v2 import ForgeV2Service
 from services import logger as obs
 from services.workspace_service import WorkspaceService
 
@@ -179,16 +177,6 @@ async def forge_v2_ws(job_id: str, websocket: WebSocket) -> None:
 
 
 # ── Legacy alias (hidden from docs) ──────────────────────────────────────
-
-@router.post("/e1/run", response_model=AgentRunResponse, include_in_schema=False)
-async def run_emergent_e1_legacy(
-    payload: AgentRunRequest,
-    current_user: dict[str, Any] = Depends(get_current_user),
-) -> AgentRunResponse:
-    raise HTTPException(
-        status_code=status.HTTP_410_GONE,
-        detail="e1 is disabled. Use the unified forge-v2 pipeline.",
-    )
 
 
 @router.post("/route")

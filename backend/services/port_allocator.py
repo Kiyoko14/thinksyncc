@@ -86,6 +86,9 @@ def allocate_port(workspace_id: str) -> int:
         )
 
     port = int(raw)
+    # pending allocation -> final allocation
+    r.set(port_key, port)
+    r.delete(pending_port_key)
 
     logger.info("Allocated port %d for workspace %s", port, workspace_id)
     return port

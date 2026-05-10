@@ -1635,11 +1635,11 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {
                     "repo_url": {
                         "type": "string",
-                        "description": (
-                            "Git repository URL. "
-                            "HTTPS example: 'https://github.com/user/repo.git'. "
-                            "SSH example: 'git@github.com:user/repo.git'.'
-                        ),
+                       "description": (
+                          "Git repository URL. "
+                          "HTTPS example: 'https://github.com/user/repo.git'. "
+                          "SSH example: 'git@github.com:user/repo.git'."
+                      ),
                     },
                     "branch": {
                         "type": "string",
@@ -1657,7 +1657,7 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "description": (
                             "Unique name for the pm2 process. "
                             "Used to manage the app lifecycle. "
-                            "Default: 'ts-<port>'.'
+                            "Default: 'ts-<port>'."
                         ),
                     },
                 },
