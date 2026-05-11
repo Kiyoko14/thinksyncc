@@ -7,7 +7,6 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
-from uuid import uuid4
 
 from fastapi import HTTPException, status
 
@@ -45,29 +44,18 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _compare_and_release_lock(redis_client, key: str, token: str) -> None:
-    # Only release the lock if we still own it.
-    if redis_client.get(key) == token:
-        redis_client.delete(key)
-
-
-def _refresh_lock_ttl(redis_client, key: str, token: str) -> None:
-    if redis_client.get(key) != token:
-        raise WorkspaceBusyError(f"Workspace lock lost for {key}")
-    if not redis_client.expire(key, LOCK_TIMEOUT_SECONDS):
-        raise WorkspaceBusyError(f"Workspace lock could not be refreshed for {key}")
-
-
 @dataclass(frozen=True)
 class ExecutionConfig:
     max_heal_attempts: int = 1
     max_parallel_diagnostics: int = 3
+    max_execution_seconds: int = 3600  # 1 hour max per job
+    max_step_timeout: int = 600  # 10 min timeout per step
 
 
 def _log_step_execution(
     *,
     workspace_id: str,
-    job_id: str,
+    job_id: str | None = None,
     step_number: int,
     tool_name: str,
     start_time: datetime,
@@ -244,9 +232,25 @@ def _set_step_status(
     result.command = command
     result.command_type = command_type
     result.validation_passed = validation_passed
-    result.success = validation_passed
     result.status = "validated" if validation_passed else "failed"
     result.agent_reasoning = agent_reasoning
+    
+    # Determine success based on execution + validation
+    # For CHECK commands: exit_code in {0, 1} is acceptable; validation_passed determines success
+    # For ACTION/VERIFY: exit_code MUST be 0 AND validation_passed MUST be True
+    exit_was_success = result.exit_code == 0
+    
+    if command_type == "CHECK":
+        # CHECK commands: 0 = true condition, 1 = false condition (both valid)
+        # Success = validation_passed (logical result of check)
+        result.success = validation_passed
+    elif command_type in {"ACTION", "VERIFY"}:
+        # ACTION/VERIFY: must exit 0 AND pass validation
+        result.success = exit_was_success and validation_passed
+    else:
+        # Default: rely on validation
+        result.success = validation_passed
+    
     return result
 
 
@@ -259,6 +263,7 @@ async def run_server_execution(
     plan_context_summary: str | None = None,
     server: dict[str, Any],
     workspace_id: str,
+    job_id: str | None = None,
     workspace_path: str,
     allow_write: bool | None,
     max_steps: int,
@@ -272,7 +277,6 @@ async def run_server_execution(
     on_log_chunk: OnLogChunk | None = None,
     config: ExecutionConfig | None = None,
     workspace_context: Any | None = None,
-    job_id: str | None = None,
 ) -> ToolCallingLoopResult:
     """
     Autonomous server executor with self-healing:
@@ -297,8 +301,7 @@ async def run_server_execution(
     if normalized_task_mode not in {"simple", "complex"}:
         normalized_task_mode = "complex"
 
-    lock_token = str(uuid4())
-    if not redis.set(lock_key, lock_token, ex=LOCK_TIMEOUT_SECONDS, nx=True):
+    if not redis.set(lock_key, _now().isoformat(), ex=LOCK_TIMEOUT_SECONDS, nx=True):
         logger.warning("[executor] workspace_busy | workspace_id=%s", workspace_id)
         raise WorkspaceBusyError(f"Workspace {workspace_id} is locked by another job.")
 
@@ -325,10 +328,9 @@ async def run_server_execution(
             config=_,
             workspace_context=workspace_context,
             constitution_engine=constitution_engine,
-            lock_token=lock_token,
         )
     finally:
-        _compare_and_release_lock(redis, lock_key, lock_token)
+        redis.delete(lock_key)
         logger.info("[executor] lock_released | workspace_id=%s", workspace_id)
 
 
@@ -355,7 +357,6 @@ async def _execute_with_lock(
     config: ExecutionConfig,
     workspace_context: Any | None,
     constitution_engine: ConstitutionEngine,
-    lock_token: str | None = None,
 ) -> ToolCallingLoopResult:
     requires_validation = _requires_real_server_validation(objective)
     supported_tools = [ "run_command", "check_disk", "check_memory", "read_logs", "restart_service", "deploy_app" ]
@@ -424,7 +425,7 @@ async def _execute_with_lock(
             AgentStep(step=3, tool=ToolName.RUN_COMMAND.value, args={"command": "npm -v || true"}, reason="Check npm version before choosing runtime commands.", risk_level="safe"),
         ]
         for step in checks:
-            await _run_validated_step(step)
+            await _run_validated_step(step, 0, job_id)
 
     def _signature(step: AgentStep) -> str:
         tool_name = value_to_str(getattr(step, "tool", None))
@@ -579,19 +580,43 @@ async def _execute_with_lock(
 
         logger.info("[validator] step=%s | validator=%s", step.step, validator)
 
-        validation_result = await execute_tool(
-            tool_name=ToolName.RUN_COMMAND.value,
-            args={"command": validator},
-            intent="server",
-            server=server,
-            workspace_path=workspace_path,
-            allow_write=allow_write,
-            timeout=step_timeout,
-            step_number=step.step,
-            on_output_chunk=None,
-        )
-        validation_passed = int(validation_result.exit_code) == 0
-        reason = f"ACTION validator `{validator}` {'passed' if validation_passed else 'failed'}."
+        # For port-related validators, retry with exponential backoff
+        is_port_validator = "ss -tulnp" in validator or "grep :" in validator
+        max_validator_retries = 3 if is_port_validator else 1
+        validation_passed = False
+        validator_attempt = 0
+        
+        for validator_attempt in range(max_validator_retries):
+            try:
+                validation_result = await execute_tool(
+                    tool_name=ToolName.RUN_COMMAND.value,
+                    args={"command": validator},
+                    intent="server",
+                    server=server,
+                    workspace_path=workspace_path,
+                    allow_write=allow_write,
+                    timeout=min(step_timeout, 30),  # Cap validator timeout at 30s
+                    step_number=step.step,
+                    on_output_chunk=None,
+                )
+                validation_passed = int(validation_result.exit_code) == 0
+                
+                if validation_passed:
+                    logger.info("[validator_passed] step=%s | attempt=%s/%s", step.step, validator_attempt + 1, max_validator_retries)
+                    break
+                
+                if validator_attempt < max_validator_retries - 1:
+                    wait_secs = 2 ** validator_attempt  # Exponential backoff: 1s, 2s, 4s
+                    logger.info("[validator_retry] step=%s | attempt=%s | waiting_secs=%s", step.step, validator_attempt + 1, wait_secs)
+                    await asyncio.sleep(wait_secs)
+            except Exception as exc:
+                logger.warning("[validator_error] step=%s | attempt=%s | error=%s", step.step, validator_attempt + 1, str(exc))
+                if validator_attempt == max_validator_retries - 1:
+                    validation_passed = False
+                    break
+                await asyncio.sleep(1)
+
+        reason = f"ACTION validator `{validator}` {'passed' if validation_passed else f'failed after {validator_attempt + 1} attempts'}."
         return _set_step_status(
             result,
             command=command,
@@ -616,7 +641,7 @@ async def _execute_with_lock(
             # Log the step execution
             _log_step_execution(
                 workspace_id=workspace_id,
-                job_id=job_id or "",
+                job_id=job_id,
                 step_number=step.step,
                 tool_name=tool_name,
                 start_time=start_time,
@@ -632,11 +657,11 @@ async def _execute_with_lock(
             )
             
             return result
-        except Exception:
+        except Exception as exc:
             finish_time = _now()
             _log_step_execution(
                 workspace_id=workspace_id,
-                job_id=job_id or "",
+                job_id=job_id,
                 step_number=step.step,
                 tool_name=tool_name,
                 start_time=start_time,
@@ -666,11 +691,14 @@ async def _execute_with_lock(
                 reason=f"ACTION step failed validation; retry {attempt + 1}/{MAX_STEP_RETRIES} is allowed.",
                 summary_so_far="",
             )
-        if command_type == "ACTION" and attempt >= MAX_STEP_RETRIES:
-            raise StepRetryExhaustedError(f"Step {step.step} failed after {MAX_STEP_RETRIES} retries.")
+        # Action failed max retries OR non-retryable failure
         return AgentDecision(
             action=DecisionAction.ABORT,
-            reason=f"{command_type} step failed validation; retries are not allowed for this command type.",
+            reason=(
+                f"ACTION step failed after {MAX_STEP_RETRIES} retries."
+                if command_type == "ACTION" and attempt >= MAX_STEP_RETRIES
+                else f"{command_type} step failed validation; retries not allowed for this type."
+            ),
             summary_so_far="",
         )
 
@@ -681,35 +709,16 @@ async def _execute_with_lock(
 
         attempt = 0
         while True:
-            if lock_token is not None:
-                _refresh_lock_ttl(redis, lock_key, lock_token)
-
             # Refresh context before critical actions
             tool_name = value_to_str(getattr(step, "tool", None))
             critical_tool = tool_name in {ToolName.DEPLOY_APP.value, ToolName.RESTART_SERVICE.value}
             if critical_tool or (step.step == len(plan.steps) and _is_deployment_objective(objective)):
                  await _refresh_context()
 
-            result = await _run_validated_step(step, retry_count=attempt, job_id=job_id)
+            result = await _run_validated_step(step, attempt, job_id)
             decision = await _evaluate(step, result, attempt + 1) # Use 1-based attempt for eval
             decisions.append(decision)
             logger.info("[executor] decision | step=%s | action=%s | reason=%r", step.step, value_to_str(getattr(decision, "action", None)), decision.reason)
-            _log_step_execution(
-                workspace_id=workspace_id,
-                job_id=job_id or "",
-                step_number=step.step,
-                tool_name=value_to_str(getattr(step, "tool", None)),
-                start_time=result.executed_at,
-                finish_time=_now(),
-                validator_command=_action_validator_command(step, result),
-                validator_result=result.validation_passed,
-                retry_count=attempt,
-                final_decision=value_to_str(getattr(decision, "action", None)),
-                exit_code=result.exit_code,
-                validation_passed=result.validation_passed,
-                command=result.command,
-                command_type=result.command_type,
-            )
             if on_decision:
                 try:
                     await on_decision(decision)
@@ -800,14 +809,14 @@ async def _execute_with_lock(
 
         # Stage 1: port is listening.
         port_step = AgentStep(step=len(results) + 1, tool=ToolName.RUN_COMMAND.value, args={"command": f"ss -tulnp | grep :{port}"}, reason=f"Verify port {port} is listening.", risk_level="safe")
-        port_result = await _run_validated_step(port_step)
+        port_result = await _run_validated_step(port_step, 0, job_id)
         if not port_result.validation_passed:
             logger.warning("[deploy_contract] stage1_port_not_listening | port=%s", port)
             return False, ""
 
         # Stage 2: local HTTP response.
         curl_step = AgentStep(step=len(results) + 1, tool=ToolName.RUN_COMMAND.value, args={"command": f"curl -f --max-time 10 {local_url}"}, reason=f"Verify HTTP response on port {port}.", risk_level="safe")
-        curl_result = await _run_validated_step(curl_step)
+        curl_result = await _run_validated_step(curl_step, 0, job_id)
         if not curl_result.validation_passed:
             errors.append({
                 "step": curl_result.step, "tool": ToolName.RUN_COMMAND.value, "command": curl_result.command,
@@ -823,7 +832,7 @@ async def _execute_with_lock(
         if workspace_context.gateway_available and workspace_context.subdomain:
             subdomain = workspace_context.subdomain
             gw_step = AgentStep(step=len(results) + 1, tool=ToolName.RUN_COMMAND.value, args={"command": f'curl -f --max-time 10 -H "Host: {subdomain}" http://127.0.0.1:80'}, reason=f"Verify gateway routing for {subdomain}.", risk_level="safe")
-            gw_result = await _run_validated_step(gw_step)
+            gw_result = await _run_validated_step(gw_step, 0, job_id)
             if not gw_result.validation_passed:
                 logger.error("[deploy_contract] stage3_gateway_failed | subdomain=%s | exit=%s", subdomain, gw_result.exit_code)
                 errors.append({
@@ -836,7 +845,7 @@ async def _execute_with_lock(
             # Stage 4: public subdomain reachable.
             if public_url:
                 pub_step = AgentStep(step=len(results) + 1, tool=ToolName.RUN_COMMAND.value, args={"command": f"curl -f --max-time 15 {public_url}"}, reason=f"Verify public URL {public_url}.", risk_level="safe")
-                pub_result = await _run_validated_step(pub_step)
+                pub_result = await _run_validated_step(pub_step, 0, job_id)
                 if not pub_result.validation_passed:
                     logger.error("[deploy_contract] stage4_public_failed | url=%s | exit=%s", public_url, pub_result.exit_code)
                     errors.append({
@@ -856,7 +865,7 @@ async def _execute_with_lock(
         if port:
             local_url = f"http://127.0.0.1:{port}"
             v_step = AgentStep(step=len(results) + 1, tool=ToolName.RUN_COMMAND.value, args={"command": f"curl -f {local_url}"}, reason="Validate local server traffic.", risk_level="safe")
-            v_result = await _run_validated_step(v_step)
+            v_result = await _run_validated_step(v_step, 0, job_id)
             success = v_result.validation_passed
             validation_url = (workspace_context.base_url or local_url) if success else ""
 
@@ -869,12 +878,6 @@ async def _execute_with_lock(
     if public_summary_url:
         summary += f"\nURL: {public_summary_url}"
 
-    verification_results = {
-        "success": success,
-        "url": validation_url or public_summary_url,
-        "objective": objective,
-    }
-
     return ToolCallingLoopResult(
         task_mode=task_mode,
         plan=plan.steps,
@@ -885,5 +888,4 @@ async def _execute_with_lock(
         summary=summary,
         success=success,
         steps_taken=len(results),
-        verification_results=verification_results,
     )

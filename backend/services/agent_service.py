@@ -1470,23 +1470,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             payload.workspace_id = str(resolved_workspace.get("id") or "") or None
             _db_update(job_id, {"workspace_id": payload.workspace_id})
 
-        if payload.workspace_id:
-            duplicate_check = (
-                get_supabase()
-                .table(_TABLE)
-                .select("id")
-                .eq("workspace_id", payload.workspace_id)
-                .neq("id", job_id)
-                .in_("status", [JobStatus.QUEUED.value, JobStatus.RUNNING.value, JobStatus.WAITING_FOR_LLM.value])
-                .limit(1)
-                .execute()
-            )
-            if duplicate_check and duplicate_check.data:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={"code": "WORKSPACE_BUSY", "message": "An active agent job is already running for this workspace."},
-                )
-
         forced_workspace_name = str(resolved_workspace.get("slug") or "").strip().lower() or _sanitize_workspace_name(payload.objective)
         forced_workspace_path = f"/root/workspaces/{forced_workspace_name}"
         if not forced_workspace_path.startswith("/root/workspaces"):
@@ -1517,6 +1500,7 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             plan_context_summary=str(plan_bundle.get("context_summary") or ""),
             server=server,
             workspace_id=str(payload.workspace_id),
+            job_id=job_id,
             workspace_path=forced_workspace_path,
             allow_write=allow_write,
             max_steps=payload.max_steps,
@@ -1528,7 +1512,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             on_log_chunk=on_log_chunk,
             on_plan=on_plan,
             on_decision=on_decision,
-            job_id=job_id,
         )
         logger.info("[agent] server_execution_result | job=%s | success=%s | summary=%s | errors=%s", job_id, loop_result.success, loop_result.summary, loop_result.errors)
     except HTTPException as exc:
@@ -1653,20 +1636,6 @@ class AgentService:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="workspace_id does not belong to the provided server_id",
-                )
-            active_jobs = (
-                get_supabase()
-                .table(_TABLE)
-                .select("id")
-                .eq("workspace_id", payload.workspace_id)
-                .in_("status", [JobStatus.QUEUED.value, JobStatus.RUNNING.value, JobStatus.WAITING_FOR_LLM.value])
-                .limit(1)
-                .execute()
-            )
-            if active_jobs and active_jobs.data:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={"code": "WORKSPACE_BUSY", "message": "An active agent job is already running for this workspace."},
                 )
         return AgentService.create_job(user_id=user_id, payload=payload, trace_id=trace_id)
 

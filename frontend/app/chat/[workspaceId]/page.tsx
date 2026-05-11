@@ -121,7 +121,16 @@ export default function ChatPage() {
     let interval: NodeJS.Timeout;
     if (isRunning && jobStartTime) {
       interval = setInterval(() => {
-        setElapsedTime(Math.floor((Date.now() - jobStartTime.getTime()) / 1000));
+        const elapsed = Math.floor((Date.now() - jobStartTime.getTime()) / 1000);
+        setElapsedTime(elapsed);
+        // Force stop after 30 minutes to prevent stuck state
+        if (elapsed > 30 * 60) {
+          setError("Job timed out after 30 minutes.");
+          setIsRunning(false);
+          setJobStartTime(null);
+          socketRef.current?.close();
+          if (timeoutRef.current) clearTimeout(timeoutRef.current);
+        }
       }, 1000);
     }
     return () => clearInterval(interval);
@@ -240,12 +249,18 @@ export default function ChatPage() {
   if (isLoading) return <Spinner />;
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
+    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
       <WorkspaceHeader workspace={workspace} router={useRouter()} />
       {isRunning && <RunningBanner elapsedTime={elapsedTime} />}
       {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
 
-      <main className="mx-auto grid max-w-7xl gap-6 px-4 py-6 lg:grid-cols-[280px_minmax(0,360px)] lg:px-6">
+      {/* Mobile info panels - fixed at top */}
+      <div className="lg:hidden px-4 py-3 space-y-2 bg-white border-b border-slate-200 shadow-sm">
+        <WorkspacePanelMobile workspace={workspace} />
+        <TimelinePanelMobile steps={allSteps} />
+      </div>
+
+      <main className="flex-1 mx-auto grid max-w-7xl gap-6 px-4 py-6 lg:grid-cols-[280px_minmax(0,360px)] lg:px-6 w-full pb-24">
         <div className="hidden lg:block">
           <WorkspaceSidebar workspace={workspace} />
         </div>
@@ -268,11 +283,6 @@ export default function ChatPage() {
               ))}
               <div ref={bottomRef} />
             </div>
-          </div>
-
-          <div className="mt-4 space-y-3 lg:hidden">
-            <WorkspacePanelMobile workspace={workspace} />
-            <TimelinePanelMobile steps={allSteps} />
           </div>
         </section>
 
@@ -310,47 +320,6 @@ const ExecutionTimelinePanel = ({ steps }: { steps: StepResult[] }) => (
       )}
     </div>
   </div>
-);
-
-const WorkspacePanelMobile = ({ workspace }: { workspace: Workspace | null }) => (
-  <details className="rounded-[32px] border border-slate-200 bg-white p-4 shadow-sm shadow-slate-200/40">
-    <summary className="flex cursor-pointer items-center justify-between gap-3 text-sm font-semibold text-slate-900">
-      Workspace info
-      <span className="text-slate-400">Expand</span>
-    </summary>
-    <div className="mt-4 space-y-3 text-sm text-slate-700">
-      <div>
-        <p className="text-slate-500">Name</p>
-        <p className="font-medium text-slate-900">{workspace?.name || 'Loading...'}</p>
-      </div>
-      <div>
-        <p className="text-slate-500">Subdomain</p>
-        <p className="font-medium text-slate-900">{workspace?.domain || 'N/A'}</p>
-      </div>
-      <div>
-        <p className="text-slate-500">Path</p>
-        <p className="font-medium text-slate-900 truncate">{workspace?.path || 'N/A'}</p>
-      </div>
-    </div>
-  </details>
-);
-
-const TimelinePanelMobile = ({ steps }: { steps: StepResult[] }) => (
-  <details className="rounded-[32px] border border-slate-200 bg-white p-4 shadow-sm shadow-slate-200/40">
-    <summary className="flex cursor-pointer items-center justify-between gap-3 text-sm font-semibold text-slate-900">
-      Execution timeline
-      <span className="text-slate-400">Expand</span>
-    </summary>
-    <div className="mt-4 space-y-3">
-      {steps.length === 0 ? (
-        <div className="rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-4 py-6 text-sm text-slate-500">
-          No execution steps yet.
-        </div>
-      ) : (
-        steps.map((step) => <InlineStepCard key={step.step} {...step} />)
-      )}
-    </div>
-  </details>
 );
 
 // ===== SUB-COMPONENTS =====
@@ -492,30 +461,77 @@ const ChatMessageItem = (msg: ChatMessage) => (
   </div>
 );
 
-const StickyInputArea = ({ input, setInput, onSend, disabled }: any) => (
-  <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 p-4">
-    <div className="max-w-4xl mx-auto">
-      <div className="flex items-end gap-3 bg-gray-50 rounded-2xl p-3 border border-gray-200">
-        <textarea
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={e => {if(e.key === 'Enter' && !e.shiftKey && !disabled) {e.preventDefault(); onSend();}}}
-          placeholder="Ask the agent to do something... (e.g., 'list all running processes')"
-          className="flex-1 bg-transparent resize-none outline-none text-base placeholder:text-gray-400 disabled:opacity-50 min-h-[20px] max-h-32"
-          rows={1}
-          disabled={disabled}
-        />
-        <button 
-          onClick={onSend} 
-          disabled={!input.trim() || disabled} 
-          className="bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed p-3 rounded-xl text-white transition-colors"
-        >
-          <Send size={20} />
-        </button>
-      </div>
+const WorkspacePanelMobile = ({ workspace }: { workspace: Workspace | null }) => (
+  <div className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm shadow-slate-200/20">
+    <p className="text-xs font-semibold text-slate-900 mb-2">Workspace: {workspace?.name || 'Loading'}</p>
+    <div className="text-xs text-slate-600 space-y-1">
+      {workspace?.domain && <p>🌐 {workspace.domain}</p>}
+      {workspace?.server_id && <p>🖥️ Server ready</p>}
     </div>
   </div>
 );
+
+const TimelinePanelMobile = ({ steps }: { steps: StepResult[] }) => {
+  const recentSteps = steps.slice(-2);
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm shadow-slate-200/20">
+      <p className="text-xs font-semibold text-slate-900 mb-2">Progress: {steps.length} steps</p>
+      <div className="space-y-1">
+        {recentSteps.length === 0 ? (
+          <div className="text-xs text-slate-400">Waiting for execution...</div>
+        ) : (
+          recentSteps.map(step => (
+            <div key={step.step} className="text-xs text-slate-600 flex items-center gap-2">
+              <span className={step.success ? 'text-emerald-600' : 'text-red-600'}>{step.success ? '✓' : '✗'}</span>
+              <span>{formatToolName(step.tool)}</span>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+};
+
+const StickyInputArea = ({ input, setInput, onSend, disabled }: any) => {
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (inputRef.current && !disabled) {
+        inputRef.current.focus({ preventScroll: false });
+      }
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [disabled]);
+
+  return (
+    <div className="fixed bottom-0 left-0 right-0 z-50 bg-white border-t border-slate-200">
+      <div className="max-w-7xl mx-auto px-4 py-4 lg:px-6 pb-safe">
+        <div className="flex items-end gap-3 bg-slate-50 rounded-3xl p-4 border border-slate-200">
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => {if(e.key === 'Enter' && !e.shiftKey && !disabled) {e.preventDefault(); onSend();}}}
+            placeholder="Ask the agent to do something..."
+            className="flex-1 bg-transparent resize-none outline-none text-sm sm:text-base placeholder:text-slate-400 disabled:opacity-50 min-h-[24px] max-h-32 py-2 px-2 focus:ring-2 focus:ring-emerald-300 rounded-2xl"
+            rows={1}
+            disabled={disabled}
+            inputMode="text"
+          />
+          <button 
+            onClick={onSend} 
+            disabled={!input.trim() || disabled} 
+            className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 disabled:cursor-not-allowed p-3 rounded-2xl text-white transition-colors flex-shrink-0"
+            type="button"
+          >
+            <Send size={18} className="sm:w-5 sm:h-5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const Spinner = () => (
   <div className="flex items-center justify-center min-h-screen bg-white">
