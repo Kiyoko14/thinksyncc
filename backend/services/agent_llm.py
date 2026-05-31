@@ -9,6 +9,7 @@ Public functions:
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import json
@@ -40,8 +41,26 @@ from models.agent import (
     ToolName,
 )
 from services.guardrails import apply_text_patches, validate_patched_files
+from agents.constitution import ConstitutionEngine
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LLM Timeout Wrapper
+# ---------------------------------------------------------------------------
+
+async def _with_llm_timeout(coro: Any, timeout_secs: int = 45, timeout_response: dict[str, Any] | None = None) -> Any:
+    """Wrap LLM calls with timeout. Returns deterministic failure on timeout."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_secs)
+    except asyncio.TimeoutError:
+        logger.error("[llm_timeout] LLM call timed out after %s seconds", timeout_secs)
+        if timeout_response is not None:
+            return timeout_response
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"LLM request timed out after {timeout_secs} seconds"
+        )
 
 # ---------------------------------------------------------------------------
 # Intent classification (chat/code/server)
@@ -278,14 +297,18 @@ async def classify_intent_with_confidence(text: str) -> dict[str, Any]:
 
     payload = {"message": cleaned, "intents": list(_INTENT_VALUES)}
     try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _INTENT_CONFIDENCE_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
+        response = await _with_llm_timeout(
+            client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": ConstitutionEngine.build_prompt("chat")},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            ),
+            timeout_secs=45,
+            timeout_response={"intent": "chat", "confidence": 0.50}
         )
         raw = (response.choices[0].message.content or "").strip()
         obj = json.loads(raw) if raw else {}
@@ -372,7 +395,7 @@ async def detect_task_mode(
         model = settings.OPENAI_MODEL_CLASSIFIER or settings.OPENAI_MODEL
         result = await _chat_json(
             messages=[
-                {"role": "system", "content": _TASK_MODE_SYSTEM_PROMPT},
+                {"role": "system", "content": ConstitutionEngine.build_prompt("evaluation")},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             schema=_TASK_MODE_SCHEMA,
@@ -512,11 +535,7 @@ async def generate_chat_response(
     if not cleaned:
         return ""
 
-    system_prompt = (
-        "You are a helpful assistant. "
-        "Reply in the same language as the user (English, Uzbek, or Russian). "
-        "Be concise and friendly. Do not mention internal tools or SSH."
-    )
+    system_prompt = ConstitutionEngine.build_prompt("chat")
     messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
     for msg in (conversation_history or [])[-12:]:
         role = msg.get("role")
@@ -525,12 +544,19 @@ async def generate_chat_response(
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": cleaned})
 
-    response = await client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=messages,  # type: ignore[arg-type]
-        temperature=0.3,
-    )
-    return (response.choices[0].message.content or "").strip()
+    try:
+        response = await _with_llm_timeout(
+            client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=0.3,
+            ),
+            timeout_secs=45,
+            timeout_response=None
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
 
 
 async def generate_code_response(
@@ -576,12 +602,19 @@ async def generate_code_response(
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": f"Task:\n{cleaned}\n"})
 
-    response = await client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=messages,  # type: ignore[arg-type]
-        temperature=0.2,
-    )
-    content = (response.choices[0].message.content or "").strip()
+    try:
+        response = await _with_llm_timeout(
+            client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=0.2,
+            ),
+            timeout_secs=45,
+            timeout_response=None
+        )
+        content = (response.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
     if not content:
         return ""
 
@@ -1649,21 +1682,7 @@ async def regenerate_on_error(
     settings = get_settings()
     client = _get_openai_client()
 
-    strict_rules = (
-        "You are a senior Python engineer.\n"
-        "You MUST output ONLY raw Python code. No markdown. No explanations.\n"
-        "The previous output was INVALID. Fix it.\n\n"
-        "HARD RULES:\n"
-        "- NEVER use asyncio.run(...)\n"
-        "- NEVER define async def main(...)\n"
-        "- NEVER await app.run_polling()\n"
-        "- For Telegram bots: use python-telegram-bot v20+ only (ApplicationBuilder, filters).\n"
-        "- DO NOT use Updater, Filters (capital F), CallbackContext.\n"
-        "- Use this top-level pattern (not inside async):\n"
-        "  app = ApplicationBuilder().token(TOKEN).build()\n"
-        "  app.add_handler(...)\n"
-        "  app.run_polling()\n"
-    )
+    strict_rules = ConstitutionEngine.build_prompt("code")
 
     kind_hint = f"task_kind={task_kind}" if task_kind else "task_kind=unknown"
     reason_text = ", ".join(reasons) if reasons else "unknown"
@@ -1684,12 +1703,19 @@ async def regenerate_on_error(
     rewrite_messages.append({"role": "user", "content": user_payload})
 
     logger.info("[codegen] regeneration attempt=2")
-    rewrite = await client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=rewrite_messages,  # type: ignore[arg-type]
-        temperature=0.1,
-    )
-    rewritten = (rewrite.choices[0].message.content or "").strip()
+    try:
+        rewrite = await _with_llm_timeout(
+            client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=rewrite_messages,  # type: ignore[arg-type]
+                temperature=0.1,
+            ),
+            timeout_secs=45,
+            timeout_response=None
+        )
+        rewritten = (rewrite.choices[0].message.content or "").strip()
+    except Exception:
+        return invalid_code
     if not rewritten:
         return invalid_code
 
@@ -1847,11 +1873,15 @@ async def _chat_json(
     client = _get_openai_client()
 
     try:
-        response = await client.chat.completions.create(
-            model=model or settings.OPENAI_MODEL,
-            messages=messages,  # type: ignore[arg-type]
-            response_format={"type": "json_object"},
-            temperature=0.0,
+        response = await _with_llm_timeout(
+            client.chat.completions.create(
+                model=model or settings.OPENAI_MODEL,
+                messages=messages,  # type: ignore[arg-type]
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            ),
+            timeout_secs=45,
+            timeout_response=None
         )
     except Exception as exc:
         logger.error("OpenAI call failed: %s", exc)

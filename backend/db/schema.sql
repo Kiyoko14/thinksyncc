@@ -71,9 +71,33 @@ create table if not exists public.jobs (
     plan jsonb not null default '[]'::jsonb,
     steps jsonb not null default '[]'::jsonb,
     decisions jsonb not null default '[]'::jsonb,
+    errors jsonb not null default '[]'::jsonb,
+    retries jsonb not null default '[]'::jsonb,
     summary text,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
+);
+
+create table if not exists public.job_state_transitions (
+    id uuid primary key default gen_random_uuid(),
+    job_id uuid not null references public.jobs(id) on delete cascade,
+    from_status text check (from_status in ('queued', 'running', 'waiting_for_llm', 'completed', 'failed')),
+    to_status text not null check (to_status in ('queued', 'running', 'waiting_for_llm', 'completed', 'failed')),
+    step integer,
+    tool text,
+    trace_id text,
+    reason text,
+    created_at timestamptz not null default now()
+);
+
+create table if not exists public.job_events (
+    id uuid primary key default gen_random_uuid(),
+    job_id uuid not null references public.jobs(id) on delete cascade,
+    workspace_id uuid references public.workspaces(id) on delete set null,
+    sequence bigint not null default 0,
+    event_type text not null,
+    payload jsonb not null,
+    created_at timestamptz not null default now()
 );
 
 create table if not exists public.workspace_files (
@@ -122,6 +146,9 @@ create index if not exists idx_jobs_user_id on public.jobs (user_id);
 create index if not exists idx_jobs_workspace_id on public.jobs (workspace_id, created_at desc);
 create index if not exists idx_jobs_server_id on public.jobs (server_id);
 create index if not exists idx_jobs_status on public.jobs (status);
+create index if not exists idx_job_state_transitions_job_id on public.job_state_transitions (job_id, created_at desc);
+create index if not exists idx_job_events_job_id on public.job_events (job_id, created_at desc);
+create unique index if not exists idx_job_events_job_sequence on public.job_events (job_id, sequence);
 create unique index if not exists idx_workspace_files_workspace_path_unique on public.workspace_files (workspace_id, path);
 create index if not exists idx_workspace_files_workspace_id on public.workspace_files (workspace_id, updated_at desc);
 create index if not exists idx_agent_context_logs_workspace_id on public.agent_context_logs (workspace_id, timestamp desc);
@@ -232,6 +259,44 @@ on public.jobs
 for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);
+
+drop policy if exists "Users manage own job state transitions" on public.job_state_transitions;
+create policy "Users manage own job state transitions"
+on public.job_state_transitions
+for all
+using (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_state_transitions.job_id
+          and j.user_id = auth.uid()
+    )
+)
+with check (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_state_transitions.job_id
+          and j.user_id = auth.uid()
+    )
+);
+
+drop policy if exists "Users manage own job events" on public.job_events;
+create policy "Users manage own job events"
+on public.job_events
+for all
+using (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_events.job_id
+          and j.user_id = auth.uid()
+    )
+)
+with check (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_events.job_id
+          and j.user_id = auth.uid()
+    )
+);
 
 drop policy if exists "Users manage own workspace files" on public.workspace_files;
 create policy "Users manage own workspace files"

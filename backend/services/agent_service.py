@@ -232,10 +232,59 @@ def _get_semaphore() -> asyncio.Semaphore:
     return _semaphore
 
 
+def _record_job_event(job_id: str, event: dict[str, Any], workspace_id: str | None = None) -> None:
+    """Persist job event to database for audit trail. Continues on failure to avoid blocking execution."""
+    try:
+        record = {
+            "job_id": job_id,
+            "workspace_id": workspace_id,
+            "sequence": event.get("sequence"),
+            "event_type": event.get("type", "unknown"),
+            "payload": event,
+            "created_at": event.get("timestamp") or _now_iso(),
+        }
+        get_supabase().table("job_events").insert(record).execute()
+    except Exception as exc:
+        logger.warning("Failed to persist job event for job=%s: %s", job_id, exc)
+
+
+def _record_status_transition(job_id: str, new_status: str, step: int | None = None, tool: str | None = None, trace_id: str | None = None) -> None:
+    """Record state transition for audit trail. Continues on failure to avoid blocking execution."""
+    try:
+        result = get_supabase().table(_TABLE).select("status").eq("id", job_id).maybe_single().execute()
+        if not result or not result.data:
+            return
+        previous_status = result.data.get("status")
+        if previous_status == new_status:
+            return
+        transition = {
+            "job_id": job_id,
+            "from_status": previous_status,
+            "to_status": new_status,
+            "step": step,
+            "tool": tool,
+            "trace_id": trace_id,
+            "reason": f"transitioned from {previous_status} to {new_status}",
+            "created_at": _now_iso(),
+        }
+        get_supabase().table("job_state_transitions").insert(transition).execute()
+    except Exception as exc:
+        logger.warning("Failed to persist job state transition for job=%s: %s", job_id, exc)
+
+
 def _db_update(job_id: str, patch: dict[str, Any]) -> None:
     try:
         patch["updated_at"] = _now_iso()
-        get_supabase().table(_TABLE).update(patch).eq("id", job_id).execute()
+        result = get_supabase().table(_TABLE).update(patch).eq("id", job_id).execute()
+        if "status" in patch and isinstance(patch["status"], str):
+            _record_status_transition(
+                job_id,
+                patch["status"],
+                step=patch.get("step"),
+                tool=value_to_str(patch.get("tool")),
+                trace_id=value_to_str(patch.get("trace_id")),
+            )
+        return
     except APIError as exc:
         msg = str(exc)
         if any(token in msg for token in ("intent", "errors", "retries")) and ("column" in msg or "field" in msg):
@@ -244,7 +293,15 @@ def _db_update(job_id: str, patch: dict[str, Any]) -> None:
             fallback.pop("errors", None)
             fallback.pop("retries", None)
             try:
-                get_supabase().table(_TABLE).update(fallback).eq("id", job_id).execute()
+                result = get_supabase().table(_TABLE).update(fallback).eq("id", job_id).execute()
+                if "status" in fallback and isinstance(fallback["status"], str):
+                    _record_status_transition(
+                        job_id,
+                        fallback["status"],
+                        step=fallback.get("step"),
+                        tool=value_to_str(fallback.get("tool")),
+                        trace_id=value_to_str(fallback.get("trace_id")),
+                    )
                 return
             except APIError as exc2:
                 logger.warning("jobs UPDATE failed (fallback, job=%s): %s", job_id, exc2)
@@ -1043,9 +1100,9 @@ def _row_to_response(row: dict[str, Any]) -> JobResponse:
         task_mode=value_to_str(row.get("task_mode") or "complex"),
         plan=row.get("plan") or [],
         steps=_redact_step_outputs(row.get("steps") or []),
-        decisions=[],
-        errors=[],
-        retries=[],
+        decisions=row.get("decisions") or [],
+        errors=row.get("errors") or [],
+        retries=row.get("retries") or [],
         summary=_extract_message_from_json_summary(str(row.get("summary") or "")) or str(row.get("summary") or ""),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -1064,7 +1121,12 @@ async def _next_event_sequence(job_id: str) -> int:
     return next_value
 
 
-async def _publish(job_id: str, event: dict[str, Any]) -> None:
+async def _publish(job_id: str, event: dict[str, Any], workspace_id: str | None = None) -> None:
+    """Publish event to Redis for live streaming and persist to DB for audit trail.
+    
+    This is the primary mechanism for execution observability. All significant execution
+    events must flow through this function to ensure durable audit trail.
+    """
     settings = get_settings()
     enriched = {
         "timestamp": event.get("timestamp") or _now_iso(),
@@ -1086,6 +1148,7 @@ async def _publish(job_id: str, event: dict[str, Any]) -> None:
         except Exception as exc:
             logger.warning("Redis publish failed for job=%s: %s", job_id, exc)
 
+    _record_job_event(job_id, enriched, workspace_id=workspace_id)
     history = _local_event_history.setdefault(job_id, [])
     history.append(enriched)
     history[:] = history[-settings.REDIS_JOB_EVENT_MAX_ITEMS:]
@@ -1691,6 +1754,39 @@ class AgentService:
         _local_subscribers[job_id] = set()
         _local_event_history[job_id] = []
         _local_event_seq[job_id] = 0
+
+        try:
+            get_supabase().table("job_state_transitions").insert(
+                {
+                    "job_id": job_id,
+                    "from_status": None,
+                    "to_status": JobStatus.QUEUED.value,
+                    "step": 0,
+                    "tool": None,
+                    "trace_id": trace_id,
+                    "created_at": now,
+                }
+            ).execute()
+            get_supabase().table("job_events").insert(
+                {
+                    "job_id": job_id,
+                    "sequence": 1,
+                    "event_type": "status_update",
+                    "payload": {
+                        "type": "status_update",
+                        "status": JobStatus.QUEUED.value,
+                        "step": 0,
+                        "tool": None,
+                        "trace_id": trace_id,
+                        "timestamp": now,
+                        "sequence": 1,
+                    },
+                    "created_at": now,
+                }
+            ).execute()
+        except Exception:
+            pass
+
         return JobAccepted(id=job_id)
 
     @staticmethod
@@ -1728,9 +1824,18 @@ class AgentService:
         if redis is not None:
             try:
                 raw_items = await redis.lrange(f"job_events:{job_id}", 0, -1)
-                return [json.loads(item) for item in raw_items]
+                if raw_items:
+                    return [json.loads(item) for item in raw_items]
             except Exception as exc:
                 logger.warning("Failed to fetch Redis event history for job=%s: %s", job_id, exc)
+
+        try:
+            result = get_supabase().table("job_events").select("payload").eq("job_id", job_id).order("sequence", desc=False).execute()
+            if result and result.data:
+                return [row.get("payload") for row in result.data if isinstance(row, dict) and row.get("payload")]
+        except Exception as exc:
+            logger.warning("Failed to fetch DB event history for job=%s: %s", job_id, exc)
+
         return list(_local_event_history.get(job_id, []))
 
     @staticmethod
