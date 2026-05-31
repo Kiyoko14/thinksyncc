@@ -52,6 +52,10 @@ from services.tools import (
     file_exists_in_workspace,
     write_workspace_file,
 )
+from services.execution_event_service import ExecutionEventService
+from services.execution_repository import save_step, save_decision, save_retry, save_errors
+from services.job_queue import JobQueue
+from services.job_recovery import JobRecovery
 from agents.constitution import ConstitutionEngine
 
 logger = logging.getLogger(__name__)
@@ -1168,6 +1172,12 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     _db_update(job_id, {"status": JobStatus.RUNNING.value})
     obs.emit(level="INFO", layer="router", message="job_start", trace_id=trace_id, meta={"job_id": job_id, "mode": "job"})
     await _publish(job_id, {"type": "status_update", "status": JobStatus.RUNNING.value, "step": 0, "tool": None, "trace_id": trace_id})
+    # Reliability Sprint: emit state transition and execution event
+    await ExecutionEventService.state_transition(
+        job_id, JobStatus.QUEUED.value, JobStatus.RUNNING.value,
+        trace_id=trace_id, reason="job_claimed_by_worker",
+    )
+    await ExecutionEventService.execution_started(job_id, trace_id=trace_id, task_mode=value_to_str(payload.mode))
 
     requested_mode = (value_to_str(getattr(payload, "mode", None)) or "").strip().lower()
 
@@ -1403,6 +1413,7 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
     constitution_engine.check_objective(payload.objective, payload.objective)
 
+    await ExecutionEventService.planning_started(job_id, trace_id=trace_id)
     plan_bundle = await build_plan(
         intent=intent,
         task_mode=task_mode,
@@ -1416,6 +1427,7 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     planned_task_mode = str(plan_bundle.get("task_mode") or task_mode)
     planned_plan = plan_bundle.get("plan") or []
     _db_update(job_id, {"plan": planned_plan, "task_mode": planned_task_mode})
+    await ExecutionEventService.planning_completed(job_id, trace_id=trace_id, plan=[s.model_dump(mode="json") for s in planned_plan] if isinstance(planned_plan, list) else [])
     await _publish(
         job_id,
         {
@@ -1477,6 +1489,8 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         record = _step_to_record(result)
         accumulated_steps.append(record)
         _db_update(job_id, {"steps": accumulated_steps, "status": JobStatus.RUNNING.value})
+        # Reliability Sprint: persist step to dedicated table
+        save_step(job_id, result)
         await _publish(
             job_id,
             {
@@ -1499,6 +1513,8 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         record = _decision_to_record(decision)
         accumulated_decisions.append(record)
         _db_update(job_id, {"decisions": accumulated_decisions, "status": JobStatus.WAITING_FOR_LLM.value})
+        # Reliability Sprint: persist decision to dedicated table
+        save_decision(job_id, decision, step_number=len(accumulated_steps))
         await _publish(
             job_id,
             {
@@ -1674,6 +1690,19 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             "task_mode": value_to_str(loop_result.task_mode),
         },
     )
+    # Reliability Sprint: emit completion event and state transition
+    await ExecutionEventService.state_transition(
+        job_id, JobStatus.RUNNING.value, final_status.value,
+        trace_id=trace_id, reason="execution_complete",
+    )
+    if loop_result.success:
+        await ExecutionEventService.execution_completed(
+            job_id, trace_id=trace_id, success=True, summary=final_summary,
+        )
+    else:
+        await ExecutionEventService.execution_failed(
+            job_id, trace_id=trace_id, reason="execution_failed", error=final_summary,
+        )
 
 
 async def _run_agent_loop(*, job_id: str, payload: JobCreate, user_id: str, trace_id: str | None = None) -> None:
@@ -1754,6 +1783,17 @@ class AgentService:
         _local_subscribers[job_id] = set()
         _local_event_history[job_id] = []
         _local_event_seq[job_id] = 0
+
+        try:
+            # Reliability Sprint: emit job creation event
+            import asyncio
+            asyncio.create_task(
+                ExecutionEventService.job_created(
+                    job_id, workspace_id=payload.workspace_id, trace_id=trace_id, objective=payload.objective
+                )
+            )
+        except Exception:
+            pass
 
         try:
             get_supabase().table("job_state_transitions").insert(

@@ -730,16 +730,29 @@ async def _execute_with_lock(
 
             if decision.action == DecisionAction.RETRY:
                 attempt += 1
-                retries.append(
-                    {
-                        "step": step.step,
-                        "command": result.command,
-                        "command_type": result.command_type,
-                        "attempt": attempt,
-                        "timestamp": _now().isoformat(),
-                        "reason": decision.reason,
-                    }
-                )
+                retry_record = {
+                    "step": step.step,
+                    "command": result.command,
+                    "command_type": result.command_type,
+                    "attempt": attempt,
+                    "timestamp": _now().isoformat(),
+                    "reason": decision.reason,
+                }
+                retries.append(retry_record)
+                # Reliability Sprint: persist retry to dedicated table
+                try:
+                    from services.execution_repository import save_retry
+                    if job_id:
+                        save_retry(
+                            job_id=job_id,
+                            step_number=step.step,
+                            attempt=attempt,
+                            command=result.command,
+                            command_type=result.command_type,
+                            reason=decision.reason,
+                        )
+                except Exception:
+                    pass
                 await asyncio.sleep(2 ** (attempt - 1)) # Exponential backoff
                 continue
 
@@ -780,6 +793,19 @@ async def _execute_with_lock(
 
     success = all(r.success for r in results)
     validation_url = ""
+
+    # Reliability Sprint: emit execution_started event
+    if job_id:
+        try:
+            from services.execution_event_service import ExecutionEventService
+            import asyncio
+            asyncio.create_task(
+                ExecutionEventService.execution_started(
+                    job_id, workspace_id=workspace_id, trace_id=job_id, task_mode=task_mode
+                )
+            )
+        except Exception:
+            pass
 
     async def _fallback_start_and_verify(reason: str) -> tuple[bool, str]:
         if workspace_context is None or workspace_context.port is None:

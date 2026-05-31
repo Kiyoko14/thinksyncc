@@ -72,6 +72,41 @@ class ExecutionAudit:
                 .execute()
             )
 
+            # Fetch new normalized tables for full timeline
+            steps_result = (
+                get_supabase()
+                .table("job_steps")
+                .select("*")
+                .eq("job_id", job_id)
+                .order("step_number", desc=False)
+                .execute()
+            )
+            decisions_result = (
+                get_supabase()
+                .table("job_decisions")
+                .select("*")
+                .eq("job_id", job_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            retries_result = (
+                get_supabase()
+                .table("job_retries")
+                .select("*")
+                .eq("job_id", job_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            errors_result = (
+                get_supabase()
+                .table("job_execution_details")
+                .select("*")
+                .eq("job_id", job_id)
+                .eq("detail_type", "error")
+                .order("created_at", desc=False)
+                .execute()
+            )
+
             timeline = {
                 "job_id": job_id,
                 "status": job_data.get("status"),
@@ -88,9 +123,22 @@ class ExecutionAudit:
                     }
                     for e in (events_result.data or [])
                 ],
-                "can_reconstruct": bool(events_result.data),
+                "steps": steps_result.data or [],
+                "decisions": decisions_result.data or [],
+                "retries": retries_result.data or [],
+                "errors": errors_result.data or [],
+                "can_reconstruct": bool(
+                    events_result.data
+                    or steps_result.data
+                    or decisions_result.data
+                    or retries_result.data
+                ),
                 "event_count": len(events_result.data or []),
                 "transition_count": len(transitions_result.data or []),
+                "step_count": len(steps_result.data or []),
+                "decision_count": len(decisions_result.data or []),
+                "retry_count": len(retries_result.data or []),
+                "error_count": len(errors_result.data or []),
             }
             return timeline
         except Exception as exc:

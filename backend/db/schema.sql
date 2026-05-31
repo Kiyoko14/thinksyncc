@@ -97,6 +97,62 @@ create table if not exists public.job_events (
     sequence bigint not null default 0,
     event_type text not null,
     payload jsonb not null,
+    trace_id text,
+    created_at timestamptz not null default now()
+);
+
+-- =============================================================================
+-- Execution metadata separation (Reliability Sprint v1)
+-- =============================================================================
+
+create table if not exists public.job_steps (
+    id uuid primary key default gen_random_uuid(),
+    job_id uuid not null references public.jobs(id) on delete cascade,
+    step_number int not null,
+    tool text not null,
+    args jsonb not null default '{}'::jsonb,
+    command text,
+    command_type text,
+    stdout text,
+    stderr text,
+    exit_code int,
+    duration_ms int,
+    success boolean not null default false,
+    validation_passed boolean not null default false,
+    status text,
+    agent_reasoning text,
+    executed_at timestamptz not null default now(),
+    created_at timestamptz not null default now()
+);
+
+create table if not exists public.job_decisions (
+    id uuid primary key default gen_random_uuid(),
+    job_id uuid not null references public.jobs(id) on delete cascade,
+    step_number int,
+    action text not null,
+    reason text,
+    summary_so_far text,
+    modified_step jsonb,
+    created_at timestamptz not null default now()
+);
+
+create table if not exists public.job_retries (
+    id uuid primary key default gen_random_uuid(),
+    job_id uuid not null references public.jobs(id) on delete cascade,
+    step_number int not null,
+    attempt int not null,
+    command text,
+    command_type text,
+    reason text,
+    created_at timestamptz not null default now()
+);
+
+create table if not exists public.job_execution_details (
+    id uuid primary key default gen_random_uuid(),
+    job_id uuid not null references public.jobs(id) on delete cascade,
+    detail_type text not null check (detail_type in ('error','metadata','analysis','contract')),
+    step_number int,
+    payload jsonb not null default '{}'::jsonb,
     created_at timestamptz not null default now()
 );
 
@@ -149,6 +205,15 @@ create index if not exists idx_jobs_status on public.jobs (status);
 create index if not exists idx_job_state_transitions_job_id on public.job_state_transitions (job_id, created_at desc);
 create index if not exists idx_job_events_job_id on public.job_events (job_id, created_at desc);
 create unique index if not exists idx_job_events_job_sequence on public.job_events (job_id, sequence);
+create index if not exists idx_job_events_workspace_id on public.job_events (workspace_id, created_at desc);
+create index if not exists idx_job_events_trace_id on public.job_events (trace_id);
+
+create index if not exists idx_job_steps_job_id on public.job_steps (job_id, step_number);
+create index if not exists idx_job_steps_executed_at on public.job_steps (job_id, executed_at desc);
+create index if not exists idx_job_decisions_job_id on public.job_decisions (job_id, created_at desc);
+create index if not exists idx_job_retries_job_id on public.job_retries (job_id, created_at desc);
+create index if not exists idx_job_retries_job_step on public.job_retries (job_id, step_number);
+create index if not exists idx_job_execution_details_job_id on public.job_execution_details (job_id, detail_type, created_at desc);
 create unique index if not exists idx_workspace_files_workspace_path_unique on public.workspace_files (workspace_id, path);
 create index if not exists idx_workspace_files_workspace_id on public.workspace_files (workspace_id, updated_at desc);
 create index if not exists idx_agent_context_logs_workspace_id on public.agent_context_logs (workspace_id, timestamp desc);
@@ -297,6 +362,102 @@ with check (
           and j.user_id = auth.uid()
     )
 );
+
+-- Reliability Sprint v1: new audit tables
+
+alter table public.job_steps enable row level security;
+
+drop policy if exists "Users manage own job steps" on public.job_steps;
+create policy "Users manage own job steps"
+on public.job_steps
+for all
+using (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_steps.job_id
+          and j.user_id = auth.uid()
+    )
+)
+with check (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_steps.job_id
+          and j.user_id = auth.uid()
+    )
+);
+
+alter table public.job_decisions enable row level security;
+
+drop policy if exists "Users manage own job decisions" on public.job_decisions;
+create policy "Users manage own job decisions"
+on public.job_decisions
+for all
+using (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_decisions.job_id
+          and j.user_id = auth.uid()
+    )
+)
+with check (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_decisions.job_id
+          and j.user_id = auth.uid()
+    )
+);
+
+alter table public.job_retries enable row level security;
+
+drop policy if exists "Users manage own job retries" on public.job_retries;
+create policy "Users manage own job retries"
+on public.job_retries
+for all
+using (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_retries.job_id
+          and j.user_id = auth.uid()
+    )
+)
+with check (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_retries.job_id
+          and j.user_id = auth.uid()
+    )
+);
+
+alter table public.job_execution_details enable row level security;
+
+drop policy if exists "Users manage own job execution details" on public.job_execution_details;
+create policy "Users manage own job execution details"
+on public.job_execution_details
+for all
+using (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_execution_details.job_id
+          and j.user_id = auth.uid()
+    )
+)
+with check (
+    exists (
+        select 1 from public.jobs j
+        where j.id = job_execution_details.job_id
+          and j.user_id = auth.uid()
+    )
+);
+
+-- Soft-delete and recovery support on jobs
+
+alter table public.jobs
+    add column if not exists deleted_at timestamptz,
+    add column if not exists recoverable boolean not null default false,
+    add column if not exists recovery_reason text;
+
+create index if not exists idx_jobs_deleted_at on public.jobs (deleted_at) where deleted_at is null;
+create index if not exists idx_jobs_recoverable on public.jobs (recoverable, status) where deleted_at is null;
 
 drop policy if exists "Users manage own workspace files" on public.workspace_files;
 create policy "Users manage own workspace files"
