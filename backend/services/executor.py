@@ -534,7 +534,7 @@ async def _execute_with_lock(
         command = _command_for_step(step)
         
         constitution_engine.check_runtime_state(command)
-        constitution_engine.check_dangerous_commands(command, step.args.get('confirm', False))
+        constitution_engine.check_dangerous_commands(command, step.args.get('confirmation', False))
 
         logger.info("[executor] step start | step=%s | tool=%s | risk=%s | args=%s", step.step, tool_name, step.risk_level, step.args)
         if on_step_start:

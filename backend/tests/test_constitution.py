@@ -45,7 +45,7 @@ class TestConstitutionEngine(unittest.TestCase):
 
     def test_stale_patch_target(self):
         with self.assertRaises(StalePatchTargetError):
-            self.engine.check_patch_discipline("file content", "file content", "patch")
+            self.engine.check_patch_target("missing_file.py", ["existing_file.py"])
 
     def test_unsupported_tool(self):
         with self.assertRaises(UnsupportedToolError):
