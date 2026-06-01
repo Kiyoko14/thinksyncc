@@ -110,11 +110,35 @@ async def lifespan(application):  # type: ignore[type-arg]
     diagnostics = await _run_startup_diagnostics()
     await init_http_client()
     await run_startup_consistency_check()
-    task = asyncio.create_task(run_health_check_loop())
+
+    # Health check loop
+    health_task = asyncio.create_task(run_health_check_loop())
+
+    # Worker recovery loop — detect stale jobs and dead workers
+    from services.worker_service import WorkerService
+    async def _recovery_loop() -> None:
+        while True:
+            try:
+                await asyncio.sleep(60)
+                # Run sync DB calls in thread pool to avoid blocking
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, WorkerService.recover_stale_jobs)
+                await loop.run_in_executor(None, WorkerService.cleanup_dead_workers)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+    recovery_task = asyncio.create_task(_recovery_loop())
+
     yield
-    task.cancel()
+    health_task.cancel()
+    recovery_task.cancel()
     try:
-        await task
+        await health_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await recovery_task
     except asyncio.CancelledError:
         pass
     await close_http_client()

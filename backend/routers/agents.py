@@ -144,7 +144,9 @@ async def forge_v2_run_async(
         step_timeout_seconds=payload.step_timeout_seconds,
     )
     accepted = AgentService.submit_job(user_id=user_id, payload=job_payload, trace_id=trace_id)
-    background_tasks.add_task(AgentService.run_job, accepted.id, job_payload, user_id, trace_id=trace_id)
+    # Enqueue in durable queue (no BackgroundTasks)
+    from services.job_queue import JobQueue
+    JobQueue.enqueue_job(accepted.id)
     data = {
         "job_id": accepted.id,
         "status": AgentJobStatus.QUEUED.value,

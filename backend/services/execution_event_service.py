@@ -35,6 +35,14 @@ EVENT_RETRY_COMPLETED = "retry_completed"
 EVENT_EXECUTION_FAILED = "execution_failed"
 EVENT_EXECUTION_COMPLETED = "execution_completed"
 
+# Worker events
+EVENT_WORKER_CLAIMED = "worker_claimed"
+EVENT_WORKER_HEARTBEAT = "worker_heartbeat"
+EVENT_WORKER_RELEASED = "worker_released"
+EVENT_WORKER_FAILED = "worker_failed"
+EVENT_WORKER_COMPLETED = "worker_completed"
+EVENT_WORKER_ABANDONED = "worker_abandoned"
+
 
 class ExecutionEventService:
     """Durable execution event tracking with Redis and DB persistence."""

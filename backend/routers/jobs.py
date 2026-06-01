@@ -7,6 +7,7 @@ from models.job import JobAccepted, JobCreate, JobResponse
 from services.agent_service import AgentService
 from services import logger as obs
 from services.job_recovery import JobRecovery
+from services.job_queue import JobQueue
 from services.workspace_service import WorkspaceService
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -18,13 +19,18 @@ async def submit_job(
     background_tasks: BackgroundTasks,
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> JobAccepted:
-    """Submit a natural-language job. Returns immediately; poll or stream for results."""
+    """Submit a natural-language job. Returns immediately; poll or stream for results.
+
+    Queue-based: the job is enqueued in the DB; workers claim and execute it.
+    If no worker is running, the job is queued and will be picked up when a worker starts.
+    """
     trace_id = obs.new_trace_id()
     if payload.allow_write is None:
         payload.allow_write = True
     user_id: str = current_user["sub"]
     accepted = AgentService.submit_job(user_id=user_id, payload=payload, trace_id=trace_id)
-    background_tasks.add_task(AgentService.run_job, accepted.id, payload, user_id, trace_id=trace_id)
+    # Enqueue the job in the durable queue (no BackgroundTasks)
+    JobQueue.enqueue_job(accepted.id)
     return accepted
 
 
