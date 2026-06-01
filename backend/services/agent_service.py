@@ -1220,16 +1220,26 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     try:
         server = ServerService.get_server(server_id=payload.server_id, user_id=user_id)
     except HTTPException as exc:
-        _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": exc.detail})
+        detail = str(exc.detail)
+        _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": detail})
+        try:
+            save_execution_detail(
+                job_id=job_id,
+                detail_type="error",
+                payload={"error_type": "HTTPException", "detail": detail, "reason": "server_lookup_failed", "step": 0},
+                step_number=0,
+            )
+        except Exception:
+            pass
         obs.emit(
             level="ERROR",
             layer="router",
             message="job_server_lookup_failed",
             trace_id=trace_id,
-            meta={"job_id": job_id, "error_type": "HTTPException", "detail": str(exc.detail)},
+            meta={"job_id": job_id, "error_type": "HTTPException", "detail": detail},
             exc_info=False,
         )
-        await _publish(job_id, {"type": "completed", "success": False, "summary": str(exc.detail), "step": 0, "tool": None, "trace_id": trace_id})
+        await _publish(job_id, {"type": "completed", "success": False, "summary": detail, "step": 0, "tool": None, "trace_id": trace_id})
         return
 
     if not payload.workspace_id:
@@ -1241,6 +1251,15 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         except Exception as exc:
             detail = f"Failed to resolve workspace: {exc}"
             _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": detail})
+            try:
+                save_execution_detail(
+                    job_id=job_id,
+                    detail_type="error",
+                    payload={"error_type": type(exc).__name__, "detail": str(exc), "reason": "workspace_resolve_failed", "step": 0},
+                    step_number=0,
+                )
+            except Exception:
+                pass
             obs.emit(
                 level="ERROR",
                 layer="router",
@@ -1333,6 +1352,16 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             )
             logger.info("[agent] code_execution_result | job=%s | result=%s", job_id, result)
         except HTTPException as exc:
+            summary = _exception_to_error_string(exc)
+            try:
+                save_execution_detail(
+                    job_id=job_id,
+                    detail_type="error",
+                    payload={"error_type": "HTTPException", "detail": str(exc.detail), "reason": "code_execution_failed", "step": 0},
+                    step_number=0,
+                )
+            except Exception:
+                pass
             obs.emit(
                 level="ERROR",
                 layer="execution",
@@ -1341,11 +1370,20 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
                 meta={"job_id": job_id, "error_type": "HTTPException", "detail": str(exc.detail)},
             )
             logger.exception("[agent] code_execution_http_exception | job=%s", job_id, exc_info=exc)
-            summary = _exception_to_error_string(exc)
             _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": summary})
             await _publish(job_id, {"type": "completed", "success": False, "summary": summary, "step": 0, "tool": None, "trace_id": trace_id})
             return
         except Exception as exc:
+            summary = _exception_to_error_string(exc)
+            try:
+                save_execution_detail(
+                    job_id=job_id,
+                    detail_type="error",
+                    payload={"error_type": type(exc).__name__, "detail": str(exc), "reason": "code_execution_failed", "step": 0},
+                    step_number=0,
+                )
+            except Exception:
+                pass
             obs.emit(
                 level="ERROR",
                 layer="execution",
@@ -1355,7 +1393,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
                 exc_info=True,
             )
             logger.exception("[agent] code_execution_exception | job=%s", job_id)
-            summary = _exception_to_error_string(exc)
             _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": summary})
             await _publish(job_id, {"type": "completed", "success": False, "summary": summary, "step": 0, "tool": None, "trace_id": trace_id})
             return
@@ -1594,6 +1631,16 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         )
         logger.info("[agent] server_execution_result | job=%s | success=%s | summary=%s | errors=%s", job_id, loop_result.success, loop_result.summary, loop_result.errors)
     except HTTPException as exc:
+        summary = _exception_to_error_string(exc)
+        try:
+            save_execution_detail(
+                job_id=job_id,
+                detail_type="error",
+                payload={"error_type": "HTTPException", "detail": str(exc.detail), "reason": "server_pipeline_failed", "step": len(accumulated_steps)},
+                step_number=len(accumulated_steps),
+            )
+        except Exception:
+            pass
         obs.emit(
             level="ERROR",
             layer="execution",
@@ -1603,7 +1650,6 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             exc_info=False,
         )
         logger.exception("[agent] server_pipeline_http_exception | job=%s", job_id, exc_info=exc)
-        summary = _exception_to_error_string(exc)
         _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": summary})
         if payload.workspace_id:
             try:
@@ -1618,8 +1664,17 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         await _publish(job_id, {"type": "completed", "success": False, "summary": summary, "step": 0, "tool": None})
         return
     except Exception as exc:
-        logger.exception("Unhandled error in agent loop (job=%s): %s", job_id, exc)
         summary = _exception_to_error_string(exc)
+        try:
+            save_execution_detail(
+                job_id=job_id,
+                detail_type="error",
+                payload={"error_type": type(exc).__name__, "detail": str(exc), "reason": "unhandled_server_pipeline_error", "step": len(accumulated_steps)},
+                step_number=len(accumulated_steps),
+            )
+        except Exception:
+            pass
+        logger.exception("Unhandled error in agent loop (job=%s): %s", job_id, exc)
         _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": summary})
         await _publish(job_id, {"type": "completed", "success": False, "summary": summary, "step": 0, "tool": None})
         return
@@ -1830,17 +1885,18 @@ class AgentService:
         return JobAccepted(id=job_id)
 
     @staticmethod
-    def get_job(job_id: str, user_id: str) -> JobResponse:
+    def get_job(job_id: str, user_id: str, include_deleted: bool = False) -> JobResponse:
         try:
-            result = (
+            query = (
                 get_supabase()
                 .table(_TABLE)
                 .select("*")
                 .eq("id", job_id)
                 .eq("user_id", user_id)
-                .maybe_single()
-                .execute()
             )
+            if not include_deleted:
+                query = query.is_("deleted_at", "null")
+            result = query.maybe_single().execute()
         except APIError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
@@ -1849,12 +1905,20 @@ class AgentService:
         return _row_to_response(result.data)
 
     @staticmethod
-    def list_jobs(user_id: str, workspace_id: str | None = None) -> list[JobResponse]:
+    def list_jobs(user_id: str, workspace_id: str | None = None, include_deleted: bool = False) -> list[JobResponse]:
         if not workspace_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "WORKSPACE_REQUIRED"})
 
         WorkspaceService.get_workspace_by_id(id=workspace_id, user_id=user_id)
-        query = get_supabase().table(_TABLE).select("*").eq("user_id", user_id).eq("workspace_id", workspace_id)
+        query = (
+            get_supabase()
+            .table(_TABLE)
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("workspace_id", workspace_id)
+        )
+        if not include_deleted:
+            query = query.is_("deleted_at", "null")
         result = query.order("created_at", desc=True).execute()
         return [_row_to_response(row) for row in result.data or []]
 

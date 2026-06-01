@@ -501,6 +501,33 @@ async def _execute_with_lock(
                 await on_step_result(result)
             except Exception:
                 pass
+        # Reliability Sprint: emit step_completed event
+        await _emit_event(
+            "step_completed",
+            job_id,
+            step=result.step,
+            tool=value_to_str(getattr(result, "tool", None)),
+            workspace_id=workspace_id,
+            trace_id=job_id,
+            success=result.success,
+            exit_code=result.exit_code,
+            validation_passed=result.validation_passed,
+        )
+
+    async def _emit_event(
+        event_method: str,
+        job_id: str | None,
+        **kwargs: Any,
+    ) -> None:
+        if not job_id:
+            return
+        try:
+            from services.execution_event_service import ExecutionEventService
+            method = getattr(ExecutionEventService, event_method)
+            import asyncio
+            asyncio.create_task(method(job_id, **kwargs))
+        except Exception:
+            pass
 
     async def _exec_step(step: AgentStep) -> StepResult:
         tool_name = value_to_str(getattr(step, "tool", None))
@@ -515,6 +542,17 @@ async def _execute_with_lock(
                 await on_step_start(step.step, tool_name, step.args)
             except Exception:
                 pass
+        
+        # Reliability Sprint: emit step_started event
+        await _emit_event(
+            "step_started",
+            job_id,
+            step=step.step,
+            tool=tool_name,
+            workspace_id=workspace_id,
+            trace_id=job_id,
+            args=step.args,
+        )
         
         logger.info("[executor] step=%s | command=%s", step.step, command)
 
@@ -539,10 +577,21 @@ async def _execute_with_lock(
         command_type = _step_command_type(step)
         exit_code = int(result.exit_code)
 
-        
+        # Reliability Sprint: emit validation_started for ACTION steps
+        if command_type == "ACTION" and exit_code == 0:
+            validator = _action_validator_command(step, result)
+            if validator:
+                await _emit_event(
+                    "validation_started",
+                    job_id,
+                    step=step.step,
+                    workspace_id=workspace_id,
+                    trace_id=job_id,
+                    validator=validator,
+                )
+
         if command_type == "CHECK":
             return _set_step_status(
-
                 result,
                 command=command,
                 command_type=command_type,
@@ -617,6 +666,17 @@ async def _execute_with_lock(
                 await asyncio.sleep(1)
 
         reason = f"ACTION validator `{validator}` {'passed' if validation_passed else f'failed after {validator_attempt + 1} attempts'}."
+        
+        # Reliability Sprint: emit validation_completed event
+        await _emit_event(
+            "validation_completed",
+            job_id,
+            step=step.step,
+            workspace_id=workspace_id,
+            trace_id=job_id,
+            passed=validation_passed,
+        )
+        
         return _set_step_status(
             result,
             command=command,
@@ -739,10 +799,10 @@ async def _execute_with_lock(
                     "reason": decision.reason,
                 }
                 retries.append(retry_record)
-                # Reliability Sprint: persist retry to dedicated table
-                try:
-                    from services.execution_repository import save_retry
-                    if job_id:
+                # Reliability Sprint: persist retry and emit retry_started event
+                if job_id:
+                    try:
+                        from services.execution_repository import save_retry
                         save_retry(
                             job_id=job_id,
                             step_number=step.step,
@@ -751,31 +811,61 @@ async def _execute_with_lock(
                             command_type=result.command_type,
                             reason=decision.reason,
                         )
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                    await _emit_event(
+                        "retry_started",
+                        job_id,
+                        step=step.step,
+                        attempt=attempt,
+                        workspace_id=workspace_id,
+                        trace_id=job_id,
+                    )
                 await asyncio.sleep(2 ** (attempt - 1)) # Exponential backoff
                 continue
 
-            errors.append(
-                {
-                    "step": step.step,
-                    "tool": value_to_str(getattr(step, "tool", None)),
-                    "command": result.command,
-                    "command_type": result.command_type,
-                    "exit_code": result.exit_code,
-                    "stderr": result.stderr[:1500],
-                    "stdout": result.stdout[:1500],
-                    "validation_passed": result.validation_passed,
-                    "status": result.status,
-                    "reason": decision.reason,
-                    "signature": step_sig,
-                    "timestamp": _now().isoformat(),
-                }
-            )
+            error_record = {
+                "step": step.step,
+                "tool": value_to_str(getattr(step, "tool", None)),
+                "command": result.command,
+                "command_type": result.command_type,
+                "exit_code": result.exit_code,
+                "stderr": result.stderr[:1500],
+                "stdout": result.stdout[:1500],
+                "validation_passed": result.validation_passed,
+                "status": result.status,
+                "reason": decision.reason,
+                "signature": step_sig,
+                "timestamp": _now().isoformat(),
+            }
+            errors.append(error_record)
+            # Reliability Sprint: persist error to dedicated table
+            if job_id:
+                try:
+                    from services.execution_repository import save_execution_detail
+                    save_execution_detail(
+                        job_id=job_id,
+                        detail_type="error",
+                        payload=error_record,
+                        step_number=step.step,
+                    )
+                except Exception:
+                    pass
             try:
                 analysis = await agent_llm.analyze_failure(step=step, result=result, context=coordinator_context)
                 if isinstance(analysis, dict) and analysis:
                     errors[-1]["analysis"] = analysis
+                    if job_id:
+                        try:
+                            from services.execution_repository import save_execution_detail
+                            save_execution_detail(
+                                job_id=job_id,
+                                detail_type="analysis",
+                                payload={"step": step.step, "analysis": analysis, "reason": decision.reason},
+                                step_number=step.step,
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -794,18 +884,8 @@ async def _execute_with_lock(
     success = all(r.success for r in results)
     validation_url = ""
 
-    # Reliability Sprint: emit execution_started event
-    if job_id:
-        try:
-            from services.execution_event_service import ExecutionEventService
-            import asyncio
-            asyncio.create_task(
-                ExecutionEventService.execution_started(
-                    job_id, workspace_id=workspace_id, trace_id=job_id, task_mode=task_mode
-                )
-            )
-        except Exception:
-            pass
+    # NOTE: execution_started is emitted once in agent_service.py run_agent_pipeline
+    # NOT here — this is the success contract section, not the start of execution.
 
     async def _fallback_start_and_verify(reason: str) -> tuple[bool, str]:
         if workspace_context is None or workspace_context.port is None:

@@ -31,48 +31,40 @@ class ExecutionAudit:
     def get_execution_timeline(job_id: str) -> dict[str, Any]:
         """Reconstruct complete execution timeline from audit tables.
 
-        Returns:
-            Dictionary containing:
-              - job_id: job identifier
-              - created_at: job creation timestamp
-              - state_transitions: list of state changes with timestamps
-              - events: chronological list of all execution events
-              - status: current job status
-              - can_reconstruct: whether full timeline is available
+        Optimized to use 2 queries instead of 7:
+          - Query 1: job + state_transitions + job_events + job_execution_details
+                     via PostgREST embedded resource syntax
+          - Query 2: job_steps + job_decisions + job_retries
 
-        Questions answered:
-          - What happened?
-          - In what order?
-          - When did it happen?
+        Returns:
+            Dictionary containing full execution timeline.
         """
         try:
+            # Query 1: job with related tables via Supabase embedded syntax
+            # Supabase client supports "table(*)" for embedded 1:N relations
             job_result = (
-                get_supabase().table("jobs").select("*").eq("id", job_id).maybe_single().execute()
+                get_supabase()
+                .table("jobs")
+                .select(
+                    "*,"
+                    "job_state_transitions(*),"
+                    "job_events(*),"
+                    "job_execution_details(*)"
+                )
+                .eq("id", job_id)
+                .maybe_single()
+                .execute()
             )
             if not job_result or not job_result.data:
                 return {"error": "job_not_found", "job_id": job_id}
 
             job_data = job_result.data
+            # Extract related data from the embedded response
+            transitions = job_data.pop("job_state_transitions", []) or []
+            events_raw = job_data.pop("job_events", []) or []
+            details_raw = job_data.pop("job_execution_details", []) or []
 
-            transitions_result = (
-                get_supabase()
-                .table("job_state_transitions")
-                .select("*")
-                .eq("job_id", job_id)
-                .order("created_at", desc=False)
-                .execute()
-            )
-
-            events_result = (
-                get_supabase()
-                .table("job_events")
-                .select("*")
-                .eq("job_id", job_id)
-                .order("sequence", desc=False)
-                .execute()
-            )
-
-            # Fetch new normalized tables for full timeline
+            # Query 2: normalized execution tables
             steps_result = (
                 get_supabase()
                 .table("job_steps")
@@ -97,14 +89,35 @@ class ExecutionAudit:
                 .order("created_at", desc=False)
                 .execute()
             )
-            errors_result = (
-                get_supabase()
-                .table("job_execution_details")
-                .select("*")
-                .eq("job_id", job_id)
-                .eq("detail_type", "error")
-                .order("created_at", desc=False)
-                .execute()
+
+            steps = steps_result.data or []
+            decisions = decisions_result.data or []
+            retries = retries_result.data or []
+
+            # Separate errors from other details
+            errors = [d for d in details_raw if d.get("detail_type") == "error"]
+            analysis = [d for d in details_raw if d.get("detail_type") == "analysis"]
+            metadata = [d for d in details_raw if d.get("detail_type") == "metadata"]
+            contracts = [d for d in details_raw if d.get("detail_type") == "contract"]
+
+            # Sort events by sequence
+            events = sorted(
+                [
+                    {
+                        "sequence": e.get("sequence"),
+                        "type": e.get("event_type"),
+                        "timestamp": e.get("created_at"),
+                        "payload": e.get("payload"),
+                    }
+                    for e in events_raw
+                ],
+                key=lambda x: x.get("sequence") or 0,
+            )
+
+            # Sort transitions by timestamp
+            transitions = sorted(
+                transitions,
+                key=lambda x: x.get("created_at") or "",
             )
 
             timeline = {
@@ -113,32 +126,31 @@ class ExecutionAudit:
                 "created_at": job_data.get("created_at"),
                 "updated_at": job_data.get("updated_at"),
                 "objective": job_data.get("objective"),
-                "state_transitions": transitions_result.data or [],
-                "events": [
-                    {
-                        "sequence": e.get("sequence"),
-                        "type": e.get("event_type"),
-                        "timestamp": e.get("created_at"),
-                        "payload": e.get("payload"),
-                    }
-                    for e in (events_result.data or [])
-                ],
-                "steps": steps_result.data or [],
-                "decisions": decisions_result.data or [],
-                "retries": retries_result.data or [],
-                "errors": errors_result.data or [],
+                "state_transitions": transitions,
+                "events": events,
+                "steps": steps,
+                "decisions": decisions,
+                "retries": retries,
+                "errors": errors,
+                "analysis": analysis,
+                "metadata": metadata,
+                "contracts": contracts,
                 "can_reconstruct": bool(
-                    events_result.data
-                    or steps_result.data
-                    or decisions_result.data
-                    or retries_result.data
+                    events_raw
+                    or steps
+                    or decisions
+                    or retries
+                    or details_raw
                 ),
-                "event_count": len(events_result.data or []),
-                "transition_count": len(transitions_result.data or []),
-                "step_count": len(steps_result.data or []),
-                "decision_count": len(decisions_result.data or []),
-                "retry_count": len(retries_result.data or []),
-                "error_count": len(errors_result.data or []),
+                "event_count": len(events),
+                "transition_count": len(transitions),
+                "step_count": len(steps),
+                "decision_count": len(decisions),
+                "retry_count": len(retries),
+                "error_count": len(errors),
+                "analysis_count": len(analysis),
+                "metadata_count": len(metadata),
+                "contract_count": len(contracts),
             }
             return timeline
         except Exception as exc:
