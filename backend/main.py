@@ -24,20 +24,121 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
+async def _run_startup_diagnostics() -> dict[str, Any]:
+    """Run startup diagnostics and report actionable issues.
+
+    Checks:
+      - Redis connectivity (sync + async)
+      - Database schema: new tables exist
+      - Migration status: critical columns exist
+    """
+    from services.redis_service import get_async_client, get_sync_client
+    from core.database import get_supabase
+
+    diagnostics: dict[str, Any] = {
+        "redis_sync": {"ok": False, "message": "Not checked"},
+        "redis_async": {"ok": False, "message": "Not checked"},
+        "db_tables": {"ok": False, "missing": []},
+        "db_columns": {"ok": False, "missing": []},
+        "ready": False,
+    }
+
+    # Redis sync
+    try:
+        get_sync_client().ping()
+        diagnostics["redis_sync"] = {"ok": True, "message": "Connected"}
+    except Exception as exc:
+        diagnostics["redis_sync"] = {"ok": False, "message": f"Failed: {exc}"}
+        logger.warning("Redis sync unavailable: %s", exc)
+
+    # Redis async
+    try:
+        await get_async_client().ping()
+        diagnostics["redis_async"] = {"ok": True, "message": "Connected"}
+    except Exception as exc:
+        diagnostics["redis_async"] = {"ok": False, "message": f"Failed: {exc}"}
+        logger.warning("Redis async unavailable: %s", exc)
+
+    # Database tables
+    required_tables = [
+        "job_steps",
+        "job_decisions",
+        "job_retries",
+        "job_execution_details",
+    ]
+    missing_tables: list[str] = []
+    for table in required_tables:
+        try:
+            get_supabase().table(table).select("id", count="exact").limit(0).execute()
+        except Exception as exc:
+            missing_tables.append(table)
+            logger.warning("Missing table %s: %s", table, exc)
+    diagnostics["db_tables"] = {"ok": not missing_tables, "missing": missing_tables}
+
+    # Database columns
+    required_columns = [
+        ("jobs", "deleted_at"),
+        ("jobs", "recoverable"),
+        ("jobs", "recovery_reason"),
+        ("job_events", "trace_id"),
+    ]
+    missing_columns: list[str] = []
+    for table, column in required_columns:
+        try:
+            get_supabase().table(table).select(column).limit(1).execute()
+        except Exception as exc:
+            missing_columns.append(f"{table}.{column}")
+            logger.warning("Missing column %s.%s: %s", table, column, exc)
+    diagnostics["db_columns"] = {"ok": not missing_columns, "missing": missing_columns}
+
+    diagnostics["ready"] = (
+        diagnostics["redis_sync"]["ok"]
+        and not missing_tables
+        and not missing_columns
+    )
+
+    if not diagnostics["ready"]:
+        logger.warning("Startup diagnostics: %s", json.dumps(diagnostics, default=str))
+    else:
+        logger.info("Startup diagnostics: all checks passed")
+
+    return diagnostics
+
+
 @asynccontextmanager
 async def lifespan(application):  # type: ignore[type-arg]
-    from services.redis_service import get_async_client, get_sync_client
-
-    get_sync_client().ping()
-    await get_async_client().ping()
-    logger.info("Redis connected (sync + async)")
+    diagnostics = await _run_startup_diagnostics()
     await init_http_client()
     await run_startup_consistency_check()
-    task = asyncio.create_task(run_health_check_loop())
+
+    # Health check loop
+    health_task = asyncio.create_task(run_health_check_loop())
+
+    # Worker recovery loop — detect stale jobs and dead workers
+    from services.worker_service import WorkerService
+    async def _recovery_loop() -> None:
+        while True:
+            try:
+                await asyncio.sleep(60)
+                # Run sync DB calls in thread pool to avoid blocking
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, WorkerService.recover_stale_jobs)
+                await loop.run_in_executor(None, WorkerService.cleanup_dead_workers)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+    recovery_task = asyncio.create_task(_recovery_loop())
+
     yield
-    task.cancel()
+    health_task.cancel()
+    recovery_task.cancel()
     try:
-        await task
+        await health_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await recovery_task
     except asyncio.CancelledError:
         pass
     await close_http_client()

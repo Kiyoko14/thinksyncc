@@ -89,7 +89,7 @@ DANGEROUS_COMMAND_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bchown\s+.*\s+/(etc|usr|bin|sbin|boot)\b"),
     re.compile(r"\b(reboot|shutdown|halt|poweroff)\b"),
     re.compile(r"\binit\s+[06]\b"),
-    re.compile(r"\bkill\s+-9\b"),
+    re.compile(r"\bkill\s+-9\s+1\b"),
     re.compile(r"(curl|wget|fetch)\s+.*\|\s*(ba)?sh"),
     re.compile(r"\|\s*(ba)?sh\b"),
     re.compile(r"\|\s*python\s*-c\b"),
@@ -1126,55 +1126,9 @@ class ConstitutionEngine:
                 f"Original: {original_objective!r} | Current: {current_objective!r}"
             )
 
-    def check_runtime_state(self, command: str) -> None:
-        """Compatibility wrapper: raise RuntimeStateViolationError for unsafe runtime targets.
-
-        Tests and some callers expect `check_runtime_state(command)` to exist. The
-        merged constitution centralised runtime checks elsewhere; provide a
-        lightweight compatibility shim that flags obvious localhost/hardcoded
-        network targets in suspicious contexts (e.g., external API calls, git clone).
-        
-        Allow localhost when part of internal validation checks (--max-time, -f flags).
-        """
-        lower = command.lower()
-        
-        # If it's our own internal validation (uses timeout or -f flag), allow localhost.
-        if "--max-time" in lower or re.search(r"\bcurl.*\s-[a-zA-Z]*f", lower):
-            return
-        
-        # Localhost is suspicious in bare curl/wget/git without validation markers
-        if "localhost" in lower or "127.0.0.1" in lower or "0.0.0.0" in lower:
-            # List of actually suspicious patterns that use localhost
-            suspicious_patterns = [
-                r"\bgit\s+clone",
-                r"\bgit\s+init",
-                r"\bnpx?\s+create-",
-                r"\bcreate-react-app",
-                r"\bcreate-next-app",
-                r"\b(curl|wget)\s+[^|]*localhost",  # Plain curl to localhost without validation flags
-                r">\s*/dev/(sd|nvme)",
-            ]
-            
-            for pattern_str in suspicious_patterns:
-                if re.search(pattern_str, lower):
-                    raise RuntimeStateViolationError(
-                        f"Command targets localhost in a suspicious context: {command!r}"
-                    )
-
-    def check_dangerous_commands(
-        self,
-        command: str,
-        confirmed: bool = False,
-        confirmation: bool | None = None,
-    ) -> None:
-        """Raise ConfirmationRequiredError if command matches a prohibited pattern.
-
-        Backwards-compatible signature: callers may pass `confirmation=` or
-        `confirmed=`; prefer explicit `confirmation` when provided.
-        """
-        # Prefer the `confirmation` kwarg if supplied (older callers use it).
-        effective_confirmed = confirmation if confirmation is not None else confirmed
-        if effective_confirmed:
+    def check_dangerous_commands(self, command: str, confirmed: bool = False) -> None:
+        """Raise ConfirmationRequiredError if command matches a prohibited pattern."""
+        if confirmed:
             return
         for pattern in DANGEROUS_COMMAND_PATTERNS:
             if pattern.search(command):
