@@ -82,6 +82,10 @@ class JobQueue:
         """Claim a job for execution by a specific worker.
 
         Uses Redis SET NX to ensure only one worker processes a job.
+        FIX: removed unused fallback that set status without DB-level atomicity.
+        Claims MUST go through WorkerService._claim_next_job() which uses
+        an atomic DB UPDATE ... WHERE status='queued'.
+        This method is now a Redis-only advisory lock.
         """
         try:
             redis = RedisService.get_sync_client()
@@ -93,11 +97,8 @@ class JobQueue:
                     redis.set(heartbeat_key, datetime.now(timezone.utc).isoformat(), ex=300)
                     return True
                 return False
-            # Fallback: no Redis, just mark in DB
-            get_supabase().table("jobs").update(
-                {"status": JobStatus.RUNNING.value}
-            ).eq("id", job_id).execute()
-            return True
+            # No Redis: cannot safely claim; let the DB-driven claim handle it.
+            return False
         except Exception as exc:
             logger.warning("JobQueue.claim_job failed (job=%s): %s", job_id, exc)
             return False

@@ -54,7 +54,10 @@ class AIService:
                 detail="OPENAI_API_KEY is not configured",
             )
 
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(
+    api_key=settings.OPENAI_API_KEY,
+    base_url=settings.OPENAI_BASE_URL,
+)
 
         system_prompt = (
             "You are ThinkSync agent assistant for Linux server workspaces. "

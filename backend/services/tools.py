@@ -172,7 +172,10 @@ def _classify_command_risk(command: str, *, allow_write: bool) -> str:
     if re.search(r"\b(docker|docker-compose)\s+(restart|up|down)\b", lowered):
         return "moderate"
 
-    return "moderate"
+    # NOTE (BUG #5 fix): default to "dangerous", not "moderate".
+    # Unknown/unmatched commands must require confirmation — never
+    # auto-approve a command the risk classifier doesn't understand.
+    return "dangerous"
 
 
 def _is_dangerous(command: str) -> bool:
@@ -194,7 +197,9 @@ def _guard_error(*, code: str, message: str, blocked_value: str) -> HTTPExceptio
 
 
 def _validate_command(command: str, allow_write: bool, *, confirm_dangerous: bool = False) -> str:
-    allow_write = True
+    # NOTE: allow_write is now respected. The previous hard-coded
+    # `allow_write = True` override has been removed.
+    # Permission enforcement is centralized here.
     lowered = command.strip().lower()
 
     # Path restrictions
@@ -401,7 +406,9 @@ async def write_workspace_file(
     allow_write: bool | None,
     timeout: int,
 ) -> ExecResult:
-    allow_write = True
+    # NOTE: allow_write parameter is now respected. The previous
+    # hard-coded `allow_write = True` override has been removed.
+    # Permission enforcement is centralized in _validate_command().
     rel_path = _validate_relative_path(path)
 
     raw = content if isinstance(content, str) else str(content)
@@ -456,8 +463,8 @@ async def install_python_deps(
     timeout: int,
     fallback_packages: list[str] | None = None,
 ) -> ExecResult:
-    allow_write = True
-
+    # NOTE: allow_write parameter is now respected. Removed previous
+    # hard-coded `allow_write = True` override.
     fallback = " ".join(shlex.quote(p) for p in (fallback_packages or []))
     # Keep it simple: requirements.txt wins; otherwise install fallback packages if any.
     if fallback:
@@ -1117,8 +1124,8 @@ async def _restart_service(
     step_number: int,
     on_output_chunk: OutputChunkCallback | None = None,
 ) -> ExecResult:
-    allow_write = True
-
+    # NOTE: allow_write parameter is now respected.
+    # Removed previous hard-coded `allow_write = True` override.
     service_name: str = args.get("service_name", "").strip()
     if not service_name:
         return {"stdout": "", "stderr": "restart_service: 'service_name' argument is required", "code": 1}
@@ -1153,8 +1160,6 @@ async def _deploy_app(
     on_output_chunk: OutputChunkCallback | None = None,
 ) -> ExecResult:
     '''Legacy deploy_app tool — runs a deploy command via SSH.'''
-    allow_write = True
-
     app_name: str = args.get("app_name", "").strip()
     deploy_command: str = args.get("deploy_command", "").strip()
 
@@ -1162,7 +1167,7 @@ async def _deploy_app(
         return {"stdout": "", "stderr": "deploy_app: 'app_name' and 'deploy_command' are required", "code": 1}
 
     confirm = bool(args.get("confirm", False))
-    _validate_command(deploy_command, allow_write=True, confirm_dangerous=confirm)
+    _validate_command(deploy_command, allow_write=allow_write, confirm_dangerous=confirm)
     scoped_command = _scope_workspace_command(workspace_path=workspace_path, command=deploy_command)
     _log_ssh_execution(ToolName.DEPLOY_APP.value, scoped_command)
     resp = await SSHService.execute(
@@ -1326,8 +1331,9 @@ async def execute_tool(
     All execution is real — no simulation, no faking.
     '''
     executed_at = datetime.now(timezone.utc)
-    allow_write = True
-    logger.info("Execution forced: allow_write=True")
+    # NOTE: allow_write parameter is now respected.
+    # The previous hard-coded `allow_write = True` override has been removed.
+    # Permission enforcement is centralized in _validate_command().
 
     # CRITICAL: Block all tool execution unless the caller explicitly routed intent == "server".
     normalized_intent = (intent or "").strip().lower()
@@ -1740,7 +1746,8 @@ _WRITE_ONLY_TOOLS: frozenset[str] = frozenset(
 
 def get_tool_definitions(allow_write: bool) -> list[dict[str, Any]]:
     '''Return OpenAI tool definitions filtered by the caller's write permission.'''
-    allow_write = True
+    # NOTE: allow_write parameter is now respected.
+    # Removed previous hard-coded `allow_write = True` override.
     filtered = [
         td for td in OPENAI_TOOL_DEFINITIONS
         if td["function"]["name"] != ToolName.DEPLOY_NEXTJS_APP

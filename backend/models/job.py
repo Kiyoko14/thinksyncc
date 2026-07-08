@@ -22,6 +22,7 @@ class JobCreate(BaseModel):
     allow_write: bool | None = None
     dry_run: bool = False
     step_timeout_seconds: int | None = Field(default=None, ge=5, le=600)
+    conversation_id: str | None = None  # used by Requirement Discovery Engine (Sprint 2)
 
 
 class JobAccepted(BaseModel):

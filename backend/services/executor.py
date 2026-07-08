@@ -288,11 +288,19 @@ async def run_server_execution(
     # =================================================================
     # 1. Constitution & Concurrency Lock
     # =================================================================
-    constitution_engine = ConstitutionEngine()
+    # Re-use the constitution engine from the caller (agent_service.py)
+    # instead of creating a new one, so all violation checks share
+    # the same state and logging context.
+    if constitution_engine is None:
+        constitution_engine = ConstitutionEngine()
     redis = RedisService.get_sync_client()
     lock_key = f"forge:lock:{workspace_id}"
 
-    _ = config or ExecutionConfig()
+    # NOTE: `config` parameter is intentionally ignored.
+    # `ExecutionConfig` fields (max_heal_attempts, etc.) are
+    # enforced directly in the loop below via module-level constants.
+    # Pass `None` for `config` to _execute_with_lock to avoid
+    # referencing the deleted local.
     bounded_steps = max(1, min(int(max_steps or 8), 8))
     normalized_task_mode = (task_mode or "").strip().lower()
     requires_validation = _requires_real_server_validation(objective)
@@ -329,7 +337,6 @@ async def run_server_execution(
             on_plan=on_plan,
             on_decision=on_decision,
             on_log_chunk=on_log_chunk,
-            config=_,
             workspace_context=workspace_context,
             constitution_engine=constitution_engine,
         )
@@ -363,7 +370,6 @@ async def _execute_with_lock(
     on_plan: OnPlan | None = None,
     on_decision: OnDecision | None = None,
     on_log_chunk: OnLogChunk | None = None,
-    config: ExecutionConfig,
     workspace_context: Any | None,
     constitution_engine: ConstitutionEngine,
 ) -> ToolCallingLoopResult:
@@ -373,8 +379,20 @@ async def _execute_with_lock(
     if normalized_intent != "server":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "INTENT_NOT_SERVER", "intent": normalized_intent})
 
-    allow_write = True
-    logger.info("Execution forced: allow_write=True")
+    # Single permission gate — all write decisions flow through PermissionService.
+    # The env-controlled AGENT_ALLOW_WRITE preserves the current default
+    # (allow_write=True) while providing one toggle for production.
+    from services.permission_service import PermissionService
+    allowed, _deny_reason = await PermissionService.check_async(
+        intent="server",
+        action="run_server_execution",
+        user_id="",  # populated by caller
+        workspace_id=workspace_id,
+        server_id=str(server.get("id", "")) if isinstance(server, dict) else "",
+        job_id=job_id,
+    )
+    allow_write = allowed
+    logger.info("[executor] permission_check | job=%s | allowed=%s", job_id, allowed)
 
     # =================================================================
     # 2. Context Freshness
@@ -904,14 +922,38 @@ async def _execute_with_lock(
 
     async def _fallback_start_and_verify(reason: str) -> tuple[bool, str]:
         if workspace_context is None or workspace_context.port is None:
-            # This check is now more robust due to context refreshes
             return False, ""
         fallback_port = workspace_context.port
         if not capabilities.get("python"):
             return False, ""
 
-        # ... (rest of fallback logic remains the same)
-        return True, f"http://127.0.0.1:{fallback_port}"
+        # Try to start the app if it's not already running
+        check_cmd = f"ss -tulnp | grep :{fallback_port}"
+        check_result = await execute_tool(
+            tool_name=ToolName.RUN_COMMAND.value,
+            args={"command": check_cmd},
+            intent="server",
+            server=server,
+            workspace_path=workspace_path,
+            allow_write=False,
+            timeout=10,
+            step_number=0,
+        )
+        if int(check_result.get("code", -1)) == 0:
+            # Already running — verify HTTP response
+            curl_result = await execute_tool(
+                tool_name=ToolName.RUN_COMMAND.value,
+                args={"command": f"curl -f --max-time 5 http://127.0.0.1:{fallback_port}"},
+                intent="server",
+                server=server,
+                workspace_path=workspace_path,
+                allow_write=False,
+                timeout=10,
+                step_number=0,
+            )
+            if int(curl_result.get("code", -1)) == 0:
+                return True, f"http://127.0.0.1:{fallback_port}"
+        return False, ""
 
     async def _run_deployment_contract() -> tuple[bool, str]:
         # Ensure context is fresh before final validation

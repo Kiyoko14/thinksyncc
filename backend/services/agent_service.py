@@ -54,7 +54,122 @@ from services.tools import (
 )
 from agents.constitution import ConstitutionEngine, ZombieJobError
 
+# Sprint 3: Human-in-the-Loop Orchestration (integration only)
+from models.approval import ApprovalType, ApprovalDecision, ApprovalStatus, ExecutionCursor, JobInteractionState, JobState
+from models.interaction import ClarificationSession, StructuredReplyType
+from services.approval_policy import ApprovalPolicyEngine
+from services.interactive_wait import InteractiveWaitEngine
+from services.resume_manager import ResumeManager
+from services.clarification_engine import ClarificationEngine
+
 logger = logging.getLogger(__name__)
+
+# Sprint 3A: Helper functions for approval integration
+
+class _ApprovalRequiredError(Exception):
+    """Raised inside on_step_start() when approval is required."""
+    def __init__(self, approval_id: str):
+        self.approval_id = approval_id
+        super().__init__(f"Approval required: {approval_id}")
+
+def _map_tool_to_approval_type(tool_name: str) -> ApprovalType:
+    """Map a tool name to an ApprovalType."""
+    name = (tool_name or "").lower()
+    if "write" in name or "file" in name or "patch" in name:
+        return ApprovalType.FILE_OVERWRITE
+    if "command" in name or "shell" in name or "exec" in name:
+        return ApprovalType.COMMAND
+    if "deploy" in name or "server" in name:
+        return ApprovalType.DEPLOYMENT
+    if "delete" in name or "remove" in name or "rm " in name:
+        return ApprovalType.DESTRUCTIVE
+    if "secret" in name or "password" in name or "token" in name:
+        return ApprovalType.SECRET
+    return ApprovalType.COMMAND  # default: treat as command
+
+def _assess_risk(tool_name: str, args: dict[str, Any]) -> str:
+    """Assess risk level of an action."""
+    name = (tool_name or "").lower()
+    if "delete" in name or "rm " in name or "drop" in name:
+        return "critical"
+    if "deploy" in name or "production" in name:
+        return "high"
+    if "write" in name or "patch" in name:
+        return "medium"
+    return "low"
+
+def _extract_file_paths(tool_name: str, args: dict[str, Any]) -> list[str]:
+    """Extract file paths from tool args."""
+    files = []
+    for key in ("path", "file_path", "destination", "src", "dst"):
+        val = args.get(key)
+        if val and isinstance(val, str):
+            files.append(val)
+    return files[:10]
+
+def _extract_commands(tool_name: str, args: dict[str, Any]) -> list[str]:
+    """Extract shell commands from tool args."""
+    commands = []
+    for key in ("command", "script", "code"):
+        val = args.get(key)
+        if val and isinstance(val, str):
+            commands.append(val[:200])
+    return commands[:5]
+
+
+
+# Sprint 3A: Helper functions for approval integration
+
+class _ApprovalRequiredError(Exception):
+    """Raised inside on_step_start() when approval is required."""
+    def __init__(self, approval_id: str):
+        self.approval_id = approval_id
+        super().__init__(f"Approval required: {approval_id}")
+
+def _map_tool_to_approval_type(tool_name: str) -> ApprovalType:
+    """Map a tool name to an ApprovalType."""
+    name = (tool_name or "").lower()
+    if "write" in name or "file" in name or "patch" in name:
+        return ApprovalType.FILE_OVERWRITE
+    if "command" in name or "shell" in name or "exec" in name:
+        return ApprovalType.COMMAND
+    if "deploy" in name or "server" in name:
+        return ApprovalType.DEPLOYMENT
+    if "delete" in name or "remove" in name or "rm " in name:
+        return ApprovalType.DESTRUCTIVE
+    if "secret" in name or "password" in name or "token" in name:
+        return ApprovalType.SECRET
+    return ApprovalType.COMMAND  # default: treat as command
+
+def _assess_risk(tool_name: str, args: dict[str, Any]) -> str:
+    """Assess risk level of an action."""
+    name = (tool_name or "").lower()
+    if "delete" in name or "rm " in name or "drop" in name:
+        return "critical"
+    if "deploy" in name or "production" in name:
+        return "high"
+    if "write" in name or "patch" in name:
+        return "medium"
+    return "low"
+
+def _extract_file_paths(tool_name: str, args: dict[str, Any]) -> list[str]:
+    """Extract file paths from tool args."""
+    files = []
+    for key in ("path", "file_path", "destination", "src", "dst"):
+        val = args.get(key)
+        if val and isinstance(val, str):
+            files.append(val)
+    return files[:10]
+
+def _extract_commands(tool_name: str, args: dict[str, Any]) -> list[str]:
+    """Extract shell commands from tool args."""
+    commands = []
+    for key in ("command", "script", "code"):
+        val = args.get(key)
+        if val and isinstance(val, str):
+            commands.append(val[:200])
+    return commands[:5]
+
 
 _TABLE = "jobs"
 _local_subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
@@ -566,10 +681,23 @@ async def _run_code_execution(
     trace_id: str,
 ) -> dict[str, Any]:
     overall_t0 = time.perf_counter()
-    allow_write = True
-    payload.allow_write = True
-    logger.info("Execution forced: allow_write=True")
-    logger.info("[code] allow_write=%s | job=%s", allow_write, job_id)
+    # Single permission gate: all write decisions flow through PermissionService.
+    # The current product default forces allow_write=True; this is preserved
+    # by the env-controlled AGENT_ALLOW_WRITE setting.
+    from services.permission_service import PermissionService
+    allowed, deny_reason = await PermissionService.check_async(
+        intent="code",
+        action="run_code_execution",
+        user_id=user_id,
+        workspace_id=payload.workspace_id,
+        server_id=payload.server_id,
+        job_id=job_id,
+    )
+    allow_write = allowed
+    payload.allow_write = allowed
+    if not allowed:
+        logger.warning("[code] permission_denied | job=%s | reason=%s", job_id, deny_reason)
+        return {"type": "permission_denied", "errors": [deny_reason], "success": False}
 
     workspace: dict[str, Any] | None = None
     workspace_id = payload.workspace_id
@@ -630,6 +758,122 @@ async def _run_code_execution(
         logger.warning("[guardrails] blocked_workspace | job=%s | errors=%s", job_id, ws_validation.get("errors"))
         return {"type": "validation_error", "errors": ws_validation.get("errors") or ["invalid workspace path"]}
 
+    # ------------------------------------------------------------------ #
+    # Implementation Intelligence integration (Sprint 3C.B)
+    # Try to get intelligence report BEFORE the template path.
+    # Save it for later use in build_plan().
+    # ------------------------------------------------------------------ #
+    from services.implementation_intelligence import (
+        ImplementationIntelligence,
+        ImplementationStrategy,
+        ImplementationReport,
+    )
+    intel_report_dict: dict[str, Any] | None = None
+    try:
+        intel_report = await ImplementationIntelligence.decide_strategy(
+            objective=payload.objective or "",
+            specification=project_spec if "project_spec" in dir() else None,
+            model=payload.model if hasattr(payload, "model") else None,
+        )
+        if intel_report is not None:
+            intel_report_dict = intel_report.to_dict()
+    except Exception as intel_exc:
+        logger.warning(
+            "[impl-intel] decide_strategy failed: %s — will use old template path or no template",
+            intel_exc,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Template path (use intel_report if available, else old path)
+    # ------------------------------------------------------------------ #
+    if intel_report_dict is not None:
+        # New path: use ImplementationReport
+        strategy = intel_report_dict.get("strategy", "pure_ai_generation")
+        rendered_files = intel_report_dict.get("files", {})
+        deps = intel_report_dict.get("dependencies", [])
+        validation = intel_report_dict.get("validation", {})
+        warnings = intel_report_dict.get("warnings", [])
+
+        logger.info(
+            "[impl-intel] strategy=%s | template=%s | valid=%s | job=%s",
+            strategy,
+            intel_report_dict.get("template_name"),
+            validation.get("valid", False),
+            job_id,
+        )
+        await append_run_log(
+            server=server,
+            workspace_path=workspace_path,
+            entry=obs.make_log(
+                level="INFO",
+                layer="impl-intel",
+                message="strategy_selected",
+                trace_id=trace_id,
+                meta={
+                    "job_id": job_id,
+                    "strategy": strategy,
+                    "template": intel_report_dict.get("template_name"),
+                    "compatibility_score": intel_report_dict.get("compatibility_score", 0.0),
+                    "valid": validation.get("valid", False),
+                },
+            ),
+            timeout=5,
+        )
+
+        if not rendered_files:
+            # Fall through to old path (don't return error — let old path try)
+            pass
+        else:
+            # Validate and write files
+            logs_parts: list[str] = []
+            main_code = normalize_python_booleans(str(rendered_files.get("main.py") or ""))
+            validation = validate_code(main_code)
+            if not validation.get("valid"):
+                # Fall through to old path
+                pass
+            else:
+                main_code = str(validation.get("sanitized_code") or main_code)
+                rendered_files["main.py"] = main_code
+
+                for path, content in rendered_files.items():
+                    w_res = await write_workspace_file(
+                        server=server,
+                        workspace_path=workspace_path,
+                        path=str(path),
+                        content=str(content or ""),
+                        allow_write=allow_write,
+                        timeout=step_timeout,
+                    )
+                    if w_res["stdout"] or w_res["stderr"]:
+                        logs_parts.append(f"== write {path} ==\n" + (w_res["stdout"] or w_res["stderr"]))
+                    if w_res["code"] != 0:
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail={"code": "WRITE_FAILED", "path": path, "logs": (w_res["stderr"] or w_res["stdout"])},
+                        )
+
+                syntax = await validate_python_syntax(server=server, workspace_path=workspace_path, entrypoint="main.py", timeout=15)
+                if not syntax.get("valid"):
+                    # Fall through to old path
+                    pass
+                else:
+                    result = await self_healing.execute_with_self_healing(
+                        server=server,
+                        workspace_path=workspace_path,
+                        code=main_code,
+                        entrypoint="main.py",
+                        setup_timeout=step_timeout,
+                        job_id=job_id,
+                        trace_id=trace_id,
+                    )
+                    if isinstance(result, dict) and logs_parts and "logs" in result:
+                        prefix = _trim_logs("\n".join(part for part in logs_parts if part).strip())
+                        result["logs"] = prefix + "\n\n" + result["logs"]
+                    return result
+
+    # ------------------------------------------------------------------ #
+    # Old path (fallback if ImplementationIntelligence fails or falls through)
+    # ------------------------------------------------------------------ #
     template = match_template(payload.objective or "")
     if template is not None:
         logger.info("[template] matched | name=%s | job=%s", template.name, job_id)
@@ -1102,6 +1346,41 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     step_timeout = payload.step_timeout_seconds or settings.AGENT_STEP_TIMEOUT
     constitution_engine = ConstitutionEngine()
 
+    # ------------------------------------------------------------------
+    # Sprint 3A: Resume logic (Objective 4)
+    # ------------------------------------------------------------------
+    # Check if this job is resuming from WAITING_FOR_USER.
+    # If yes: load ExecutionCursor, restore state, resume from resume_point.
+    try:
+        from core.database import get_supabase
+        result = (
+            get_supabase()
+            .table("jobs")
+            .select("status", "execution_cursor", "interaction_state", "spec", "plan")
+            .eq("id", job_id)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            row = result.data[0]
+            current_status = row.get("status")
+            # If job is WAITING_FOR_USER → this is a resume
+            if current_status == JobStatus.WAITING_FOR_USER.value:
+                logger.info("[resume] job %s resuming from WAITING_FOR_USER", job_id)
+                resume_bundle = await ResumeManager.load_resume_bundle(
+                    job_id=job_id,
+                    conversation_id=payload.conversation_id or job_id,
+                )
+                # Transition to RUNNING
+                await ResumeManager.transition_to_running(job_id)
+                # Resume from resume_point
+                # (run_tool_calling_loop() will be called with pending_steps)
+                # SKIP re-discovery and re-planning
+                payload._resume_bundle = resume_bundle  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.warning("[resume] failed to check resume state: %s", exc)
+    # ------------------------------------------------------------------
+
     # Constitution enforcement: validate state transition before publishing running.
     # Raises ZombieJobError if the job is in an active state without real execution backing it.
     try:
@@ -1118,41 +1397,71 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
     requested_mode = (value_to_str(getattr(payload, "mode", None)) or "").strip().lower()
 
-    if intent == "chat":
-        try:
-            response = await agent_llm.generate_chat_response(user_input=payload.objective, conversation_history=[])
-            message = _clean_user_summary(response, fallback=_GENERIC_FAILURE_MESSAGE)
-        except Exception as exc:
-            obs.emit(
-                level="ERROR",
-                layer="router",
-                message="plan_mode_chat_failed",
-                trace_id=trace_id,
-                meta={"job_id": job_id, "error_type": type(exc).__name__, "detail": str(exc)},
-                exc_info=True,
-            )
-            message = _exception_to_error_string(exc)
-
-        _db_update(
-            job_id,
-            {
-                "status": JobStatus.COMPLETED.value,
-                "summary": message,
-                "intent": "chat",
-                "task_mode": "simple",
-                "plan": [],
-                "steps": [],
-                "decisions": [],
-                "errors": [],
-                "retries": [],
-            },
-        )
-        await _publish(job_id, {"type": "completed", "success": True, "summary": message, "step": 0, "tool": None, "trace_id": trace_id})
+    # Single permission gate for the entire pipeline.
+    # Replaces all previous `allow_write = True` forced overrides.
+    from services.permission_service import PermissionService
+    _allowed, _deny_reason = await PermissionService.check_async(
+        intent="pipeline",
+        action="run_agent_pipeline",
+        user_id=user_id,
+        workspace_id=payload.workspace_id,
+        server_id=payload.server_id,
+        job_id=job_id,
+    )
+    if not _allowed:
+        _db_update(job_id, {"status": JobStatus.FAILED.value, "summary": _deny_reason})
+        await _publish(job_id, {"type": "failed", "success": False, "summary": _deny_reason, "step": 0, "tool": None, "trace_id": trace_id})
         return
 
     allow_write = True
     payload.allow_write = True
     logger.info("Execution forced: allow_write=True")
+
+    # ------------------------------------------------------------------
+    # Requirement Discovery Engine (Sprint 2)
+    # -------------------------------------
+    # Run BEFORE intent classification and planning so the LLM has a
+    # complete project specification and does not start generating code
+    # with missing critical information.
+    #
+    # Skip conditions (handled inside should_run_discovery):
+    #   - chat intent
+    #   - existing workspace (continuation, not new project)
+    #   - debug / patch / admin requests
+    # ------------------------------------------------------------------
+    project_spec: ProjectSpecification | None = None
+    try:
+        from services.requirement_discovery import (
+            ProjectSpecification,
+            run_discovery,
+            should_run_discovery,
+        )
+        if should_run_discovery(
+            intent="unknown",  # will be classified next; use heuristics on objective
+            objective=payload.objective,
+            conversation_id=payload.conversation_id or job_id,
+            existing_workspace=bool(payload.workspace_id),
+        ):
+            project_spec = await run_discovery(
+                objective=payload.objective,
+                conversation_id=payload.conversation_id or job_id,
+                conversation_history=conversation_history,
+                user_id=user_id,
+            )
+            # Attach spec summary to the job log for traceability
+            if project_spec:
+                _db_update(job_id, {
+                    "specification": project_spec.model_dump(mode="json"),
+                })
+                logger.info(
+                    "[discovery] spec_complete | job=%s | confidence=%.2f | missing=%d",
+                    job_id,
+                    project_spec.confidence,
+                    len(project_spec.missing_info),
+                )
+    except Exception as exc:
+        logger.warning("[discovery] engine failed (non-critical): %s", exc, exc_info=True)
+        project_spec = None
 
     try:
         server = ServerService.get_server(server_id=payload.server_id, user_id=user_id)
@@ -1318,7 +1627,10 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
         try:
             success = bool(result.get("success")) if isinstance(result, dict) else False
-            exec_time = float(result.get("execution_time") or 0.0) if isinstance(result, dict) else 0.0
+            # Use "total_time" consistently — this is set by _run_code_execution
+            # at every return path.  "execution_time" is an internal detail of
+            # self_healing and may not always be present.
+            exec_time = float(result.get("total_time") or 0.0) if isinstance(result, dict) else 0.0
         except Exception:
             success = False
             exec_time = 0.0
@@ -1373,6 +1685,23 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
     constitution_engine.check_objective(payload.objective, payload.objective)
 
+    # Resolve workspace_context for server intent BEFORE building the plan,
+    # so build_plan() can inject authoritative platform context (port, subdomain, etc.)
+    preplanned_workspace_context: Any = None
+    if intent == "server" and payload.workspace_id:
+        try:
+            from services.server_service import WorkspaceContext, load_workspace_context
+            _ws_for_plan = WorkspaceService.get_workspace_by_id(id=payload.workspace_id, user_id=user_id)
+            capabilities_for_plan = await detect_capabilities(server)
+            preplanned_workspace_context = await load_workspace_context(
+                workspace_id=payload.workspace_id,
+                workspace=_ws_for_plan,
+                server=server,
+                capabilities=capabilities_for_plan,
+            )
+        except Exception as exc:
+            logger.warning("[run_agent_pipeline] pre-plan context load failed: %s", exc)
+
     plan_bundle = await build_plan(
         intent=intent,
         task_mode=task_mode,
@@ -1382,6 +1711,9 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         server=server if intent == "server" else None,
         conversation_history=conversation_history,
         memory=memory,
+        workspace_context=preplanned_workspace_context,
+        project_spec=project_spec,
+        implementation_report=intel_report_dict,  # Sprint 3C.B
     )
     planned_task_mode = str(plan_bundle.get("task_mode") or task_mode)
     planned_plan = plan_bundle.get("plan") or []
@@ -1421,8 +1753,102 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             },
         )
 
+    # ------------------------------------------------------------------
+    # Sprint 3A: Approval Integration
+    # ------------------------------------------------------------------
+    # Initialize ApprovalPolicyEngine ONCE at the start of execution.
+    # This engine is passed to on_step_start() via closure.
+    _approval_engine = ApprovalPolicyEngine(
+        job_id=job_id,
+        conversation_id=payload.conversation_id or job_id,
+    )
+    _interaction_state = await InteractiveWaitEngine.get_state(
+        conversation_id=payload.conversation_id or job_id,
+        job_id=job_id,
+    )
+    # ------------------------------------------------------------------
+
     async def on_step_start(step_num: int, tool_name: str, args: dict[str, Any]) -> None:
-        constitution_engine.check_job_state(job_id, JobStatus.RUNNING.value, has_active_execution=bool(tool_name) and step_num > 0)
+        # Sprint 3A: Approval check BEFORE step executes
+        nonlocal _approval_engine, _interaction_state
+
+        # Skip approval check if job is already waiting (resume after approval)
+        if _interaction_state.current_state == JobState.WAITING_FOR_USER:
+            logger.warning(
+                "[approval] job %s still waiting — skipping step %s",
+                job_id, step_num,
+            )
+            return
+
+        # Determine action type from tool name
+        _action_type = _map_tool_to_approval_type(tool_name)
+        _title = f"{tool_name} step {step_num}"
+        _description = json.dumps(args)[:500]
+
+        ok, request = await _approval_engine.pre_execute_check(
+            action_type=_action_type,
+            title=_title,
+            description=_description,
+            risk_level=_assess_risk(tool_name, args),
+            affected_files=_extract_file_paths(tool_name, args),
+            affected_commands=_extract_commands(tool_name, args),
+            context={"step_num": step_num, "tool": tool_name},
+        )
+
+        if not ok and request is not None:
+            # Approval required → pause execution
+            logger.info(
+                "[approval] pausing job %s for approval: %s",
+                job_id, request.approval_id,
+            )
+
+            # Build execution cursor so we can resume later
+            _cursor = ExecutionCursor(
+                job_id=job_id,
+                conversation_id=payload.conversation_id or job_id,
+                current_step_index=step_num,
+                total_steps=len(plan_steps) if plan_steps else 0,
+                completed_step_indices=[
+                    i for i, s in enumerate(accumulated_steps or [])
+                    if s.get("success", False)
+                ],
+                waiting_step_index=step_num,
+                resume_point=step_num,
+                planner_state={"task_mode": planned_task_mode},
+                workspace_snapshot={"workspace_id": payload.workspace_id},
+            )
+
+            # Persist cursor + pause job
+            await ResumeManager.save_execution_cursor(job_id, _cursor)
+            await InteractiveWaitEngine.pause(
+                job_id=job_id,
+                conversation_id=payload.conversation_id or job_id,
+                reason=f"Approval required: {request.title}",
+                current_step_index=step_num,
+                execution_cursor=_cursor,
+            )
+
+            # Update job status to WAITING_FOR_USER
+            _db_update(job_id, {"status": JobStatus.WAITING_FOR_USER.value})
+            await _publish(
+                job_id,
+                {
+                    "type": "waiting_for_approval",
+                    "approval_id": request.approval_id,
+                    "step": step_num,
+                    "tool": tool_name,
+                    "title": request.title,
+                    "description": request.description,
+                },
+            )
+
+            # Raise to break out of run_tool_calling_loop()
+            raise _ApprovalRequiredError(request.approval_id)
+
+        constitution_engine.check_job_state(
+            job_id, JobStatus.RUNNING.value,
+            has_active_execution=bool(tool_name) and step_num > 0,
+        )
         _db_update(job_id, {"status": JobStatus.RUNNING.value})
         await _publish(
             job_id,
@@ -1685,8 +2111,22 @@ class AgentService:
 
     @staticmethod
     def create_job(user_id: str, payload: JobCreate, *, trace_id: str | None = None) -> JobAccepted:
-        allow_write = True
-        payload.allow_write = True
+        # Check permission BEFORE job creation (sync DB call; create_job is sync)
+        from services.permission_service import PermissionService
+        allowed, deny_reason = PermissionService.check(
+            intent="create_job",
+            action="create_job",
+            user_id=user_id,
+            workspace_id=payload.workspace_id,
+            server_id=payload.server_id,
+            job_id=None,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "PERMISSION_DENIED", "error": deny_reason},
+            )
+
         job_id = str(uuid4())
         trace_id = (trace_id or "").strip() or obs.new_trace_id()
         now = _now_iso()
@@ -1791,9 +2231,17 @@ class AgentService:
         subscribers.discard(queue)
 
     @staticmethod
-    async def run_job(job_id: str, payload: JobCreate, user_id: str, *, trace_id: str | None = None) -> None:
-        async with _get_semaphore():
+    async def run_job(job_id: str, payload: JobCreate, user_id: str, *, trace_id: str | None = None, bypass_semaphore: bool = False) -> None:
+        """Run a job by ID.
+
+        bypass_semaphore: set True when called from WorkerService to avoid
+        double-locking (the worker manages its own concurrency).
+        """
+        if bypass_semaphore:
             await _run_agent_loop(job_id=job_id, payload=payload, user_id=user_id, trace_id=trace_id)
+        else:
+            async with _get_semaphore():
+                await _run_agent_loop(job_id=job_id, payload=payload, user_id=user_id, trace_id=trace_id)
 
     @staticmethod
     async def run_explicit_mode(

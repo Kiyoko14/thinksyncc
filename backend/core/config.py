@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     # Agent (Forge v2)
     AGENT_MAX_RETRIES: int = 3
     AGENT_V2_WRITE_TOOLS: str = "restart_service,deploy_app"
+    # Global write gate: set to False to disable all write actions across the pipeline.
+    # Individual allow_write flags are still checked, but this is the single
+    # production kill-switch that overrides everything.
+    AGENT_ALLOW_WRITE: bool = True
+
+    # Sprint 3: Approval subsystem
+    # MUST be set in production. Fail fast at startup if missing.
+    APPROVAL_RESUME_SECRET: str = ""
 
     # Redis (Upstash) — optional; used by Forge v2 for LLM response caching
     REDIS_URL: str | None = None
@@ -72,6 +80,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     OPENAI_API_KEY: str | None = None
+    OPENAI_BASE_URL: str = "https://api.siliconflow.com/v1"
     OPENAI_MODEL: str = "gpt-4o-mini"
     # Optional model overrides for tiered performance/quality.
     OPENAI_MODEL_CLASSIFIER: str | None = None

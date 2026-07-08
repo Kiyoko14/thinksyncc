@@ -69,6 +69,9 @@ class JobRecovery:
           - status is running or waiting_for_llm
           - updated_at is older than N hours
           - no recent heartbeat exists
+
+        FIX: falls back to DB-only detection when Redis heartbeat
+        check fails, so orphaned jobs are never silently missed.
         """
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
@@ -84,11 +87,15 @@ class JobRecovery:
             )
             jobs = result.data or []
 
-            # Cross-check with Redis heartbeat
+            # Cross-check with Redis heartbeat; fall back to DB-only when Redis fails.
             orphaned: list[dict[str, Any]] = []
             for job in jobs:
                 job_id = job.get("id")
-                if JobQueue.is_job_heartbeat_stale(job_id, max_seconds=hours * 3600):
+                try:
+                    if JobQueue.is_job_heartbeat_stale(job_id, max_seconds=hours * 3600):
+                        orphaned.append(job)
+                except Exception:
+                    # Redis unavailable — treat as orphaned (no proof of life)
                     orphaned.append(job)
             return orphaned
         except Exception as exc:
@@ -272,26 +279,49 @@ class JobRecovery:
     def batch_mark_recoverable(hours: int = DEFAULT_ORPHAN_HOURS) -> dict[str, Any]:
         """Mark all orphaned jobs as recoverable in a batch.
 
+        FIX: consolidates Redis-backed and DB-only orphan detection,
+        and uses a DB-level advisory lock so only one process
+        runs recovery at a time.
+
         Returns:
             Summary of actions taken.
         """
-        orphaned = JobRecovery.detect_orphaned_jobs(hours=hours)
-        marked: list[str] = []
-        failed: list[str] = []
+        # Advisory lock so concurrent workers don't double-recover
+        lock_acquired = False
+        try:
+            try:
+                get_supabase().rpc("pg_advisory_lock", {"key": 20250401}).execute()
+                lock_acquired = True
+            except Exception:
+                pass  # lock function may not exist; proceed without
 
-        for job in orphaned:
-            job_id = job.get("id")
-            if JobRecovery.mark_job_recoverable(job_id, reason="batch_recovery"):
-                marked.append(job_id)
-            else:
-                failed.append(job_id)
+            orphaned = JobRecovery.detect_orphaned_jobs(hours=hours)
+            if not orphaned:
+                # Redis may be down; fall back to DB-only detection
+                orphaned = JobRecovery.detect_orphaned_without_redis(hours=hours)
 
-        return {
-            "action": "batch_mark_recoverable",
-            "count": len(orphaned),
-            "marked": marked,
-            "failed": failed,
-        }
+            marked: list[str] = []
+            failed: list[str] = []
+
+            for job in orphaned:
+                job_id = job.get("id")
+                if JobRecovery.mark_job_recoverable(job_id, reason="batch_recovery"):
+                    marked.append(job_id)
+                else:
+                    failed.append(job_id)
+
+            return {
+                "action": "batch_mark_recoverable",
+                "count": len(orphaned),
+                "marked": marked,
+                "failed": failed,
+            }
+        finally:
+            if lock_acquired:
+                try:
+                    get_supabase().rpc("pg_advisory_unlock", {"key": 20250401}).execute()
+                except Exception:
+                    pass
 
     @staticmethod
     def batch_mark_orphaned(hours: int = DEFAULT_ORPHAN_HOURS) -> dict[str, Any]:

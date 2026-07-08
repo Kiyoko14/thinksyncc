@@ -111,12 +111,33 @@ async def lifespan(application):  # type: ignore[type-arg]
     await init_http_client()
     await run_startup_consistency_check()
 
+    # Sprint 3A.2 / 3A.3 — Task 1+3: fail fast if APPROVAL_RESUME_SECRET is missing
+    from core.config import get_settings as _get_settings
+    from models.approval import ApprovalConfigurationError
+    _settings = _get_settings()
+    if not getattr(_settings, "APPROVAL_RESUME_SECRET", None):
+        raise ApprovalConfigurationError(
+            "APPROVAL_RESUME_SECRET is not set. "
+            "Set it to a long random secret in your .env file. "
+            "Generate one with: python3 -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+    # Sprint 3B.2 — Objective 3: startup verification
+    from services.conversation_reliability import StartupVerifier, StartupVerificationError
+    try:
+        await StartupVerifier.verify()
+    except StartupVerificationError:
+        raise  # let the typed exception propagate unchanged
+    except Exception as exc:
+        raise StartupVerificationError([str(exc)]) from exc
+
     # Health check loop
     health_task = asyncio.create_task(run_health_check_loop())
 
     # Worker recovery loop — detect stale jobs and dead workers
     from services.worker_service import WorkerService
     async def _recovery_loop() -> None:
+        consecutive_failures = 0
         while True:
             try:
                 await asyncio.sleep(60)
@@ -124,10 +145,17 @@ async def lifespan(application):  # type: ignore[type-arg]
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, WorkerService.recover_stale_jobs)
                 await loop.run_in_executor(None, WorkerService.cleanup_dead_workers)
+                consecutive_failures = 0
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                consecutive_failures += 1
+                logger.error(
+                    "[recovery_loop] error (consecutive=%s): %s",
+                    consecutive_failures,
+                    exc,
+                    exc_info=(consecutive_failures >= 3),
+                )
     recovery_task = asyncio.create_task(_recovery_loop())
 
     yield

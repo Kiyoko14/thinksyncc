@@ -1642,10 +1642,7 @@ def _get_openai_client() -> AsyncOpenAI:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="OPENAI_API_KEY is not configured",
         )
-    return AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL,
-    )
+    return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 
 def _context_hash(objective: str, context: dict[str, Any]) -> str:
@@ -2165,10 +2162,7 @@ async def summarize_tool_results(*, objective: str, results: list[StepResult]) -
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
         return ""
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL,
-    )
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     return await _request_final_summary(
         client=client,
         model=settings.OPENAI_MODEL_SUMMARY or settings.OPENAI_MODEL,
@@ -2220,10 +2214,7 @@ async def run_tool_calling_loop(
             detail="OPENAI_API_KEY is not configured on the server.",
         )
 
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL,
-    )
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     normalized_task_mode = (task_mode or "").strip().lower()
     if normalized_task_mode not in _TASK_MODE_VALUES:
         normalized_task_mode = _classify_task_mode(objective)

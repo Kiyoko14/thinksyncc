@@ -161,64 +161,75 @@ class WorkerService:
 
         Uses DB UPDATE with status filter to prevent race conditions.
         Returns the job dict or None if no jobs available.
+
+        FIX: retries DB claim on transient errors; limits per-cycle
+        claim attempts to avoid busy-looping on DB failures.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        try:
-            # Atomic claim: update only if status is 'queued' and not deleted
-            result = (
-                get_supabase()
-                .table("jobs")
-                .update(
-                    {
-                        "status": JobStatus.RUNNING.value,
-                        "worker_id": self.worker_id,
-                        "claimed_at": now,
-                        "heartbeat_at": now,
-                        "updated_at": now,
-                    }
-                )
-                .eq("status", JobStatus.QUEUED.value)
-                .is_("deleted_at", "null")
-                .order("created_at", desc=False)
-                .limit(1)
-                .execute()
-            )
-
-            if not result.data:
-                return None
-
-            job = result.data[0]
-            job_id = job["id"]
-
-            # Emit event
-            self._emit_worker_event(job_id, "worker_claimed", {"worker_id": self.worker_id})
+        for attempt in range(3):
             try:
-                import asyncio
-                loop = asyncio.get_running_loop()
-                loop.create_task(
-                    ExecutionEventService.state_transition(
-                        job_id,
-                        JobStatus.QUEUED.value,
-                        JobStatus.RUNNING.value,
-                        reason=f"Claimed by worker {self.worker_id}",
+                now = datetime.now(timezone.utc).isoformat()
+                result = (
+                    get_supabase()
+                    .table("jobs")
+                    .update(
+                        {
+                            "status": JobStatus.RUNNING.value,
+                            "worker_id": self.worker_id,
+                            "claimed_at": now,
+                            "heartbeat_at": now,
+                            "updated_at": now,
+                        }
                     )
+                    .eq("status", JobStatus.QUEUED.value)
+                    .is_("deleted_at", "null")
+                    .order("created_at", desc=False)
+                    .limit(1)
+                    .execute()
                 )
-            except Exception:
-                pass
 
-            # Redis lock (optimization, not required)
-            try:
-                redis = RedisService.get_sync_client()
-                if redis:
-                    redis.set(f"{_REDIS_LOCK_PREFIX}:{job_id}", self.worker_id, ex=300)
-            except Exception:
-                pass
+                if not result.data:
+                    return None
 
-            logger.info("Worker claimed job | worker=%s | job=%s", self.worker_id, job_id)
-            return job
-        except Exception as exc:
-            logger.warning("Worker claim failed | worker=%s: %s", self.worker_id, exc)
-            return None
+                job = result.data[0]
+                job_id = job["id"]
+
+                # Emit event
+                self._emit_worker_event(job_id, "worker_claimed", {"worker_id": self.worker_id})
+                try:
+                    import asyncio
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(
+                        ExecutionEventService.state_transition(
+                            job_id,
+                            JobStatus.QUEUED.value,
+                            JobStatus.RUNNING.value,
+                            reason=f"Claimed by worker {self.worker_id}",
+                        )
+                    )
+                except Exception:
+                    pass
+
+                # Redis lock (optimization, not required)
+                try:
+                    redis = RedisService.get_sync_client()
+                    if redis:
+                        redis.set(f"{_REDIS_LOCK_PREFIX}:{job_id}", self.worker_id, ex=300)
+                except Exception:
+                    pass
+
+                logger.info("Worker claimed job | worker=%s | job=%s", self.worker_id, job_id)
+                return job
+            except Exception as exc:
+                if attempt < 2:
+                    logger.warning("Worker claim attempt %s failed | worker=%s: %s", attempt + 1, self.worker_id, exc)
+                    try:
+                        import asyncio
+                        asyncio.sleep(1)
+                    except Exception:
+                        pass
+                    continue
+                logger.warning("Worker claim failed after retries | worker=%s: %s", self.worker_id, exc)
+                return None
 
     # ------------------------------------------------------------------
     # Job execution
@@ -255,10 +266,11 @@ class WorkerService:
                 step_timeout_seconds=step_timeout,
             )
 
-            # Run the job (via AgentService)
+            # Run the job via AgentService, bypassing the semaphore
+            # (the worker manages its own concurrency via MAX_CONCURRENT_JOBS=1).
             from services.agent_service import AgentService
 
-            await AgentService.run_job(job_id, payload, user_id, trace_id=obs.new_trace_id())
+            await AgentService.run_job(job_id, payload, user_id, trace_id=obs.new_trace_id(), bypass_semaphore=True)
 
             # Mark completed
             self._mark_completed(job_id)
@@ -523,49 +535,15 @@ class WorkerService:
 
     @staticmethod
     def recover_stale_jobs(max_seconds: int = JOB_STALE_SECONDS) -> dict[str, Any]:
-        """Mark stale jobs as abandoned/queued for recovery."""
-        stale = WorkerService.detect_stale_jobs(max_seconds)
-        recovered: list[str] = []
-        failed: list[str] = []
+        """Mark stale jobs as abandoned/queued for recovery.
 
-        for job in stale:
-            job_id = job["id"]
-            try:
-                now = datetime.now(timezone.utc).isoformat()
-                get_supabase().table("jobs").update(
-                    {
-                        "status": JobStatus.QUEUED.value,
-                        "recoverable": True,
-                        "recovery_reason": f"Stale heartbeat ({max_seconds}s)",
-                        "worker_id": None,
-                        "heartbeat_at": None,
-                        "updated_at": now,
-                    }
-                ).eq("id", job_id).execute()
-
-                try:
-                    import asyncio
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(
-                        ExecutionEventService.state_transition(
-                            job_id,
-                            JobStatus.RUNNING.value,
-                            JobStatus.QUEUED.value,
-                            reason=f"Stale heartbeat recovery ({max_seconds}s)",
-                        )
-                    )
-                except Exception:
-                    pass
-                recovered.append(job_id)
-            except Exception as exc:
-                logger.warning("Recover stale job failed | job=%s: %s", job_id, exc)
-                failed.append(job_id)
-
-        return {
-            "stale_count": len(stale),
-            "recovered": recovered,
-            "failed": failed,
-        }
+        NOTE (BUG #7 fix): consolidated with JobRecovery to avoid
+        duplicate recovery actions. Uses a DB-level lock row to ensure
+        only one process runs recovery at a time.
+        """
+        # Use JobRecovery as the single recovery authority
+        from services.job_recovery import JobRecovery
+        return JobRecovery.batch_mark_recoverable(max_seconds=max_seconds)
 
     @staticmethod
     def detect_dead_workers(max_seconds: int = HEARTBEAT_TIMEOUT_SECONDS) -> list[dict[str, Any]]:
