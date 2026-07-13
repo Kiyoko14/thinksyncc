@@ -4,9 +4,37 @@
 create extension if not exists "uuid-ossp";
 create extension if not exists "pgcrypto";
 
+
+-- =============================================================================
+-- ThinkSync custom identity model (Google OAuth migration, 2026-07-14)
+-- Canonical identity table. Supabase Auth is removed; Supabase is PostgreSQL
+-- only. JWT subject = public.users.id. Future OAuth providers (GitHub,
+-- Microsoft, Telegram, Apple) reuse this table with a provider-specific unique
+-- column (e.g. github_sub) instead of google_sub.
+-- =============================================================================
+
+create table if not exists public.users (
+    id            uuid        primary key default gen_random_uuid(),
+    email         text,
+    google_sub    text,
+    display_name  text,
+    avatar_url    text,
+    provider      text        not null default 'google',
+    is_active     boolean     not null default true,
+    last_login_at timestamptz,
+    created_at    timestamptz not null default now(),
+    updated_at    timestamptz not null default now()
+);
+
+create unique index if not exists idx_users_google_sub
+    on public.users (google_sub) where google_sub is not null;
+create unique index if not exists idx_users_email
+    on public.users (email) where email is not null;
+
+
 create table if not exists public.servers (
     id uuid primary key default gen_random_uuid(),
-    user_id uuid not null references auth.users(id) on delete cascade,
+    user_id uuid not null references public.users(id) on delete cascade,
     name text not null,
     host text not null,
     ssh_user text not null,
@@ -20,7 +48,7 @@ create table if not exists public.servers (
 
 create table if not exists public.workspaces (
     id uuid primary key default gen_random_uuid(),
-    user_id uuid not null references auth.users(id) on delete cascade,
+    user_id uuid not null references public.users(id) on delete cascade,
     server_id uuid not null references public.servers(id) on delete cascade,
     name text not null,
     path text not null,
@@ -33,7 +61,7 @@ create table if not exists public.workspaces (
 create table if not exists public.chats (
     id uuid primary key default gen_random_uuid(),
     server_id uuid not null references public.servers(id) on delete cascade,
-    user_id uuid not null references auth.users(id) on delete cascade,
+    user_id uuid not null references public.users(id) on delete cascade,
     name text not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -50,7 +78,7 @@ create table if not exists public.messages (
 create table if not exists public.chat_messages (
     id uuid primary key default gen_random_uuid(),
     workspace_id uuid not null references public.workspaces(id) on delete cascade,
-    user_id uuid not null references auth.users(id) on delete cascade,
+    user_id uuid not null references public.users(id) on delete cascade,
     role text not null check (role in ('user', 'assistant', 'system')),
     content text not null,
     created_at timestamptz not null default now()
@@ -58,7 +86,7 @@ create table if not exists public.chat_messages (
 
 create table if not exists public.jobs (
     id uuid primary key default gen_random_uuid(),
-    user_id uuid not null references auth.users(id) on delete cascade,
+    user_id uuid not null references public.users(id) on delete cascade,
     workspace_id uuid references public.workspaces(id) on delete cascade,
     server_id uuid not null references public.servers(id) on delete cascade,
     objective text not null,
@@ -180,7 +208,7 @@ create table if not exists public.agent_context_logs (
 create table if not exists public.tasks (
     id uuid primary key default gen_random_uuid(),
     chat_id uuid not null references public.chats(id) on delete cascade,
-    user_id uuid not null references auth.users(id) on delete cascade,
+    user_id uuid not null references public.users(id) on delete cascade,
     state text not null default 'pending',
     created_at timestamptz not null default now()
 );
@@ -252,202 +280,19 @@ before update on public.workspace_files
 for each row
 execute function public.set_updated_at();
 
-alter table public.servers enable row level security;
-alter table public.workspaces enable row level security;
-alter table public.chats enable row level security;
-alter table public.messages enable row level security;
-alter table public.chat_messages enable row level security;
-alter table public.tasks enable row level security;
-alter table public.jobs enable row level security;
-alter table public.workspace_files enable row level security;
-alter table public.agent_context_logs enable row level security;
 
-drop policy if exists "Users manage own servers" on public.servers;
-create policy "Users manage own servers"
-on public.servers
-for all
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id);
 
-drop policy if exists "Users manage own workspaces" on public.workspaces;
-create policy "Users manage own workspaces"
-on public.workspaces
-for all
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id);
 
-drop policy if exists "Users manage own chats" on public.chats;
-create policy "Users manage own chats"
-on public.chats
-for all
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id);
-
-drop policy if exists "Users manage own messages" on public.messages;
-create policy "Users manage own messages"
-on public.messages
-for all
-using (
-    exists (
-        select 1
-        from public.chats c
-        where c.id = messages.chat_id
-          and c.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1
-        from public.chats c
-        where c.id = messages.chat_id
-          and c.user_id = auth.uid()
-    )
-);
-
-drop policy if exists "Users manage own workspace chat messages" on public.chat_messages;
-create policy "Users manage own workspace chat messages"
-on public.chat_messages
-for all
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id);
-
-drop policy if exists "Users manage own tasks" on public.tasks;
-create policy "Users manage own tasks"
-on public.tasks
-for all
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id);
-
-drop policy if exists "Users manage own jobs" on public.jobs;
-create policy "Users manage own jobs"
-on public.jobs
-for all
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id);
-
-drop policy if exists "Users manage own job state transitions" on public.job_state_transitions;
-create policy "Users manage own job state transitions"
-on public.job_state_transitions
-for all
-using (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_state_transitions.job_id
-          and j.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_state_transitions.job_id
-          and j.user_id = auth.uid()
-    )
-);
-
-drop policy if exists "Users manage own job events" on public.job_events;
-create policy "Users manage own job events"
-on public.job_events
-for all
-using (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_events.job_id
-          and j.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_events.job_id
-          and j.user_id = auth.uid()
-    )
-);
 
 -- Reliability Sprint v1: new audit tables
 
-alter table public.job_steps enable row level security;
 
-drop policy if exists "Users manage own job steps" on public.job_steps;
-create policy "Users manage own job steps"
-on public.job_steps
-for all
-using (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_steps.job_id
-          and j.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_steps.job_id
-          and j.user_id = auth.uid()
-    )
-);
 
-alter table public.job_decisions enable row level security;
 
-drop policy if exists "Users manage own job decisions" on public.job_decisions;
-create policy "Users manage own job decisions"
-on public.job_decisions
-for all
-using (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_decisions.job_id
-          and j.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_decisions.job_id
-          and j.user_id = auth.uid()
-    )
-);
 
-alter table public.job_retries enable row level security;
 
-drop policy if exists "Users manage own job retries" on public.job_retries;
-create policy "Users manage own job retries"
-on public.job_retries
-for all
-using (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_retries.job_id
-          and j.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_retries.job_id
-          and j.user_id = auth.uid()
-    )
-);
 
-alter table public.job_execution_details enable row level security;
 
-drop policy if exists "Users manage own job execution details" on public.job_execution_details;
-create policy "Users manage own job execution details"
-on public.job_execution_details
-for all
-using (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_execution_details.job_id
-          and j.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1 from public.jobs j
-        where j.id = job_execution_details.job_id
-          and j.user_id = auth.uid()
-    )
-);
 
 -- Soft-delete and recovery support on jobs
 
@@ -459,44 +304,13 @@ alter table public.jobs
 create index if not exists idx_jobs_deleted_at on public.jobs (deleted_at) where deleted_at is null;
 create index if not exists idx_jobs_recoverable on public.jobs (recoverable, status) where deleted_at is null;
 
-drop policy if exists "Users manage own workspace files" on public.workspace_files;
-create policy "Users manage own workspace files"
-on public.workspace_files
-for all
-using (
-    exists (
-        select 1
-        from public.workspaces w
-        where w.id = workspace_files.workspace_id
-          and w.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1
-        from public.workspaces w
-        where w.id = workspace_files.workspace_id
-          and w.user_id = auth.uid()
-    )
-);
-
-drop policy if exists "Users manage own agent context logs" on public.agent_context_logs;
-create policy "Users manage own agent context logs"
-on public.agent_context_logs
-for all
-using (
-    exists (
-        select 1
-        from public.workspaces w
-        where w.id = agent_context_logs.workspace_id
-          and w.user_id = auth.uid()
-    )
-)
-with check (
-    exists (
-        select 1
-        from public.workspaces w
-        where w.id = agent_context_logs.workspace_id
-          and w.user_id = auth.uid()
-    )
-);
+-- =============================================================================
+-- Row-Level Security
+-- -----------------------------------------------------------------------------
+-- During the Google OAuth migration RLS that depended on auth.users / auth.uid()
+-- was removed. Authorization is currently enforced at the application layer: the
+-- backend connects with the Supabase service-role key (which bypasses RLS) and
+-- every service scopes queries by user_id (e.g. .eq("user_id", user_id)).
+-- A real RLS model on public.users is scheduled for a later Security/Hardening
+-- sprint (see migration notes) and intentionally NOT redesigned here.
+-- =============================================================================

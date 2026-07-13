@@ -4,10 +4,37 @@
 -- ── Extensions ───────────────────────────────────────────────────────────────
 create extension if not exists "uuid-ossp";
 
+-- =============================================================================
+-- ThinkSync custom identity model (Google OAuth migration, 2026-07-14)
+-- Canonical identity table. Supabase Auth is removed; Supabase is PostgreSQL
+-- only. JWT subject = public.users.id. Future OAuth providers reuse this table.
+-- NOTE: this is a STALE v2 copy of backend/db/schema.sql; the canonical source
+-- is backend/db/schema.sql. Regenerate from there after schema changes.
+-- =============================================================================
+
+create table if not exists public.users (
+    id            uuid        primary key default uuid_generate_v4(),
+    email         text,
+    google_sub    text,
+    display_name  text,
+    avatar_url    text,
+    provider      text        not null default 'google',
+    is_active     boolean     not null default true,
+    last_login_at timestamptz,
+    created_at    timestamptz not null default now(),
+    updated_at    timestamptz not null default now()
+);
+
+create unique index if not exists idx_users_google_sub
+    on public.users (google_sub) where google_sub is not null;
+create unique index if not exists idx_users_email
+    on public.users (email) where email is not null;
+
+
 -- ── servers ──────────────────────────────────────────────────────────────────
 create table if not exists public.servers (
     id               uuid        primary key default uuid_generate_v4(),
-    user_id          uuid        not null references auth.users(id) on delete cascade,
+    user_id          uuid        not null references public.users(id) on delete cascade,
     name             varchar(100) not null,
     host             varchar(255) not null,
     ssh_user         varchar(100) not null,
@@ -22,58 +49,22 @@ create table if not exists public.servers (
 
 create table if not exists public.workspaces (
     id          uuid         primary key default uuid_generate_v4(),
-    user_id     uuid         not null references auth.users(id) on delete cascade,
+    user_id     uuid         not null references public.users(id) on delete cascade,
     server_id   uuid         not null references public.servers(id) on delete cascade,
     name        varchar(150) not null,
     path        text         not null,
     created_at  timestamptz  not null default now()
 );
 
-alter table public.servers enable row level security;
-alter table public.workspaces enable row level security;
 
-drop policy if exists "Users manage their own servers" on public.servers;
-create policy "Users manage their own servers"
-    on public.servers for all
-    using  (auth.uid() = user_id)
-    with check (auth.uid() = user_id);
+    user_id     uuid        not null references public.users(id) on delete cascade,
 
-drop policy if exists "Users manage their own workspaces" on public.workspaces;
-create policy "Users manage their own workspaces"
-    on public.workspaces for all
-    using  (auth.uid() = user_id)
-    with check (auth.uid() = user_id);
 
--- ── chats ────────────────────────────────────────────────────────────────────
-create table if not exists public.chats (
-    id          uuid        primary key default uuid_generate_v4(),
-    server_id   uuid        references public.servers(id) on delete cascade,
-    user_id     uuid        not null references auth.users(id) on delete cascade,
-    name        varchar(255) not null,
-    created_at  timestamptz not null default now()
-);
-
-alter table public.chats enable row level security;
-
-drop policy if exists "Users manage their own chats" on public.chats;
-create policy "Users manage their own chats"
-    on public.chats for all
-    using  (auth.uid() = user_id)
-    with check (auth.uid() = user_id);
-
--- ── messages ─────────────────────────────────────────────────────────────────
-create table if not exists public.messages (
-    id          uuid        primary key default uuid_generate_v4(),
-    chat_id     uuid        not null references public.chats(id) on delete cascade,
-    role        varchar(20) not null check (role in ('user', 'assistant', 'system')),
-    content     text        not null,
-    created_at  timestamptz not null default now()
-);
 
 create table if not exists public.chat_messages (
     id           uuid        primary key default uuid_generate_v4(),
     workspace_id uuid        not null references public.workspaces(id) on delete cascade,
-    user_id      uuid        not null references auth.users(id) on delete cascade,
+    user_id      uuid        not null references public.users(id) on delete cascade,
     role         varchar(20) not null check (role in ('user', 'assistant', 'system')),
     content      text        not null,
     created_at   timestamptz not null default now()
@@ -81,7 +72,7 @@ create table if not exists public.chat_messages (
 
 create table if not exists public.jobs (
     id           uuid         primary key default uuid_generate_v4(),
-    user_id      uuid         not null references auth.users(id) on delete cascade,
+    user_id      uuid         not null references public.users(id) on delete cascade,
     workspace_id uuid         references public.workspaces(id) on delete cascade,
     server_id    uuid         not null references public.servers(id) on delete cascade,
     objective    text         not null,
@@ -120,75 +111,9 @@ create table if not exists public.agent_context_logs (
     timestamp      timestamptz  not null default now()
 );
 
-alter table public.messages enable row level security;
-alter table public.chat_messages enable row level security;
-alter table public.jobs enable row level security;
-alter table public.workspace_files enable row level security;
-alter table public.agent_context_logs enable row level security;
 
-drop policy if exists "Users access messages in their chats" on public.messages;
-create policy "Users access messages in their chats"
-    on public.messages for all
-    using (
-        exists (
-            select 1
-            from public.chats
-            where chats.id = messages.chat_id
-              and chats.user_id = auth.uid()
-        )
-    );
 
-drop policy if exists "Users manage own workspace chat messages" on public.chat_messages;
-create policy "Users manage own workspace chat messages"
-    on public.chat_messages for all
-    using  (auth.uid() = user_id)
-    with check (auth.uid() = user_id);
 
-drop policy if exists "Users manage own jobs" on public.jobs;
-create policy "Users manage own jobs"
-    on public.jobs for all
-    using  (auth.uid() = user_id)
-    with check (auth.uid() = user_id);
-
-drop policy if exists "Users manage own workspace files" on public.workspace_files;
-create policy "Users manage own workspace files"
-    on public.workspace_files for all
-    using (
-        exists (
-            select 1
-            from public.workspaces w
-            where w.id = workspace_files.workspace_id
-              and w.user_id = auth.uid()
-        )
-    )
-    with check (
-        exists (
-            select 1
-            from public.workspaces w
-            where w.id = workspace_files.workspace_id
-              and w.user_id = auth.uid()
-        )
-    );
-
-drop policy if exists "Users manage own agent context logs" on public.agent_context_logs;
-create policy "Users manage own agent context logs"
-    on public.agent_context_logs for all
-    using (
-        exists (
-            select 1
-            from public.workspaces w
-            where w.id = agent_context_logs.workspace_id
-              and w.user_id = auth.uid()
-        )
-    )
-    with check (
-        exists (
-            select 1
-            from public.workspaces w
-            where w.id = agent_context_logs.workspace_id
-              and w.user_id = auth.uid()
-        )
-    );
 
 create unique index if not exists idx_workspace_files_workspace_path_unique
     on public.workspace_files (workspace_id, path);
@@ -196,3 +121,14 @@ create index if not exists idx_workspace_files_workspace_id
     on public.workspace_files (workspace_id, updated_at desc);
 create index if not exists idx_agent_context_logs_workspace_id
     on public.agent_context_logs (workspace_id, timestamp desc);
+
+-- =============================================================================
+-- Row-Level Security
+-- -----------------------------------------------------------------------------
+-- During the Google OAuth migration RLS that depended on auth.users / auth.uid()
+-- was removed. Authorization is currently enforced at the application layer: the
+-- backend connects with the Supabase service-role key (which bypasses RLS) and
+-- every service scopes queries by user_id (e.g. .eq("user_id", user_id)).
+-- A real RLS model on public.users is scheduled for a later Security/Hardening
+-- sprint (see migration notes) and intentionally NOT redesigned here.
+-- =============================================================================
