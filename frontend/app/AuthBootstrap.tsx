@@ -6,11 +6,13 @@ import { validateStoredToken } from "@/services/auth";
 
 function isPublicPath(pathname: string | null): boolean {
   if (!pathname) return false;
+  // Normalize trailing slash so public routes match with or without a slash
+  // regardless of Next.js trailingSlash config (parity: "/login" === "/login/").
+  const normalized = pathname.replace(/\/+$/, "") || "/";
   return (
-    pathname === "/" ||
-    pathname === "/login" ||
-    pathname === "/signup" ||
-    pathname === "/demo"
+    normalized === "/" ||
+    normalized === "/login" ||
+    normalized === "/demo"
   );
 }
 

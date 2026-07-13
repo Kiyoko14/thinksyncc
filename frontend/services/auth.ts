@@ -8,7 +8,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 async function readResponseBody(response: Response): Promise<{ text: string; body: unknown }> {
   const text = await response.text();
-  console.log("RAW RESPONSE:", text);
+  if (process.env.NODE_ENV !== "production") {
+    // Debug-only: never leak raw response bodies (may contain tokens/PII) in prod.
+    console.debug("RAW RESPONSE:", text);
+  }
 
   if (!text.trim()) {
     return { text, body: null };
@@ -120,6 +123,44 @@ export async function login(email: string, password: string): Promise<void> {
   setToken(access_token);
 }
 
+/**
+ * Exchange a Google-issued OIDC ID token for a ThinkSync JWT.
+ *
+ * The Google Sign-In button (components/GoogleSignIn.tsx) uses the Google
+ * Identity Services `useIdToken` flow to obtain a credential JWT signed by
+ * Google. We forward that raw token to the backend, which verifies it
+ * cryptographically and mints our own session JWT. No email/password is used.
+ */
+export async function googleLogin(idToken: string): Promise<void> {
+  const response = await fetch("/api/auth/google", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id_token: idToken }),
+  });
+  const { text, body } = await readResponseBody(response);
+
+  if (!response.ok) {
+    const error = new Error(buildErrorMessage(response, body, text));
+    console.error("GOOGLE LOGIN ERROR:", error);
+    throw error;
+  }
+
+  if (!isRecord(body) || typeof body.access_token !== "string") {
+    const error = new Error(buildErrorMessage(response, body, text));
+    console.error("GOOGLE LOGIN ERROR:", error);
+    throw error;
+  }
+
+  setToken(body.access_token as string);
+}
+
+export class AuthConfirmationRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthConfirmationRequiredError";
+  }
+}
+
 export async function register(email: string, password: string): Promise<void> {
   const response = await fetch("/api/auth/register", {
     method: "POST",
@@ -134,7 +175,23 @@ export async function register(email: string, password: string): Promise<void> {
     throw error;
   }
 
-  if (!isRecord(body) || typeof body.access_token !== "string") {
+  if (!isRecord(body)) {
+    const error = new Error(buildErrorMessage(response, body, text));
+    console.error("API ERROR:", error);
+    throw error;
+  }
+
+  // Email confirmation is enabled in Supabase: the backend returns
+  // requires_confirmation=true and NO access_token. Do NOT store a token and
+  // do NOT treat this as a completed login — the caller must show a
+  // "check your email" screen instead of navigating into the app.
+  if (body.requires_confirmation === true) {
+    throw new AuthConfirmationRequiredError(
+      "Please check your email to confirm your account before signing in.",
+    );
+  }
+
+  if (typeof body.access_token !== "string") {
     const error = new Error(buildErrorMessage(response, body, text));
     console.error("API ERROR:", error);
     throw error;
