@@ -25,11 +25,19 @@ Run with: pytest tests/test_google_oauth.py -q
 import os
 import time
 
-os.environ.setdefault("JWT_SECRET", "test-secret-enough-bytes-0000000000")
-os.environ.setdefault("SUPABASE_URL", "http://localhost:54321")
-os.environ.setdefault("SUPABASE_ANON_KEY", "test-anon")
-os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-service-role")
-os.environ.setdefault("GOOGLE_CLIENT_ID", "fake-client-id.apps.googleusercontent.com")
+os.environ["JWT_SECRET"] = "test-secret-enough-bytes-0000000000"
+os.environ["SUPABASE_URL"] = "http://localhost:54321"
+os.environ["SUPABASE_ANON_KEY"] = "test-anon"
+os.environ["SUPABASE_SERVICE_ROLE_KEY"] = "test-service-role"
+os.environ["GOOGLE_CLIENT_ID"] = "fake-client-id.apps.googleusercontent.com"
+# Force re-resolution of cached settings so the values above take effect even
+# if get_settings() was already called earlier in the process.
+try:
+    from core.config import get_settings
+
+    get_settings.cache_clear()
+except Exception:
+    pass
 
 import jwt
 import pytest
@@ -287,4 +295,24 @@ def test_protected_route_rejects_garbage_token(client):
     app, users = client
     tc = _tc(app)
     r = tc.get("/servers/", headers={"Authorization": "Bearer not-a-jwt"})
+    assert r.status_code == 401
+
+
+def test_legacy_password_endpoints_removed(client):
+    """Regression guard: email/password auth must be fully gone (Phase 3)."""
+    app, users = client
+    tc = _tc(app)
+    # Both endpoints were deleted; hitting them must 404 (not 200/401/422).
+    assert tc.post("/auth/login", json={"email": "x@y.z", "password": "p"}).status_code == 404
+    assert tc.post("/auth/register", json={"email": "x@y.z", "password": "secret123"}).status_code == 404
+
+
+def test_jwt_rejects_non_uuid_subject(client):
+    """get_current_user requires a UUID subject (legacy invariance preserved)."""
+    app, users = client
+    tc = _tc(app)
+    from core.security import create_access_token
+
+    bad = create_access_token(subject="not-a-uuid", extra_data={"email": "x@y.z"})
+    r = tc.get("/servers/", headers={"Authorization": f"Bearer {bad}"})
     assert r.status_code == 401
