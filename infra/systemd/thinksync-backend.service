@@ -1,0 +1,33 @@
+[Unit]
+Description=ThinkSync Backend (FastAPI/Uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/thinksync/backend
+EnvironmentFile=/etc/thinksync/backend.env
+ExecStart=/opt/thinksync/backend/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=*
+Restart=always
+RestartSec=2
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/root/workspaces /var/log/thinksync /opt/thinksync
+
+LimitNOFILE=65535
+MemoryMax=1G
+CPUQuota=80%
+
+StandardOutput=append:/var/log/thinksync/backend.log
+StandardError=append:/var/log/thinksync/backend.log
+
+[Install]
+WantedBy=multi-user.target
+

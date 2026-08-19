@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    env_file:
+      - ../.env
+    expose:
+      - "8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      # INTERNAL_API_URL is read at Next.js server startup (not baked at build time).
+      # It routes /api/v1/* rewrites to the backend container over the docker network.
+      - INTERNAL_API_URL=http://backend:8000
+    expose:
+      - "3000"
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
