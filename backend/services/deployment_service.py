@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
-from core.database import get_supabase
+from core.database import get_supabase, get_supabase_async
 from services.port_allocator import allocate_port, release_port
 from services.redis_service import RedisService
 from services.server_service import ServerService
@@ -160,7 +160,7 @@ class DeploymentService:
 
         await DeploymentService._ensure_pm2_installed(server=server)
 
-        supabase = get_supabase()
+        supabase = await get_supabase_async()
         existing = DeploymentService._get_existing_deployment(supabase=supabase, workspace_id=workspace_id)
 
         port = allocate_port(workspace_id)
@@ -264,7 +264,7 @@ class DeploymentService:
         pipe.sadd("ws:active", workspace_id)
 
         try:
-            pipe.execute()
+            await pipe.execute()
         except Exception:
             release_port(workspace_id)
             raise HTTPException(
@@ -293,7 +293,7 @@ class DeploymentService:
             query = supabase.table("workspace_deployments").insert(payload)
 
         try:
-            result = query.execute()
+            result = await query.execute()
         except APIError as exc:
             code = DeploymentService._api_error_code(exc)
             if code in {"23503", "42501"}:
@@ -385,9 +385,9 @@ class DeploymentService:
                 exit_code=stop_result.exit_code,
             )
 
-        supabase = get_supabase()
+        supabase = await get_supabase_async()
         try:
-            supabase.table("workspace_deployments").update({"is_active": False}).eq(
+            await supabase.table("workspace_deployments").update({"is_active": False}).eq(
                 "workspace_id", workspace_id
             ).execute()
         except APIError:

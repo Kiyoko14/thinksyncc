@@ -24,6 +24,7 @@ Run with: pytest tests/test_google_oauth.py -q
 
 import os
 import time
+import json
 
 os.environ["JWT_SECRET"] = "test-secret-enough-bytes-0000000000"
 os.environ["SUPABASE_URL"] = "http://localhost:54321"
@@ -43,26 +44,30 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.algorithms import RSAAlgorithm
 
-# One key pair shared by the suite; the public PEM is what "Google" would expose.
+# One key pair shared by the suite. Google exposes the PUBLIC key as a JWK
+# inside {"keys":[...]}, so we serialize the public key in JWK form (matching
+# the REAL oauth2/v3/certs response shape, not a flat {kid: PEM} map).
 _KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 _PRIVATE_PEM = _KEY.private_bytes(
     encoding=serialization.Encoding.PEM,
     format=serialization.PrivateFormat.PKCS8,
     encryption_algorithm=serialization.NoEncryption(),
 ).decode()
-_PUBLIC_PEM = _KEY.public_key().public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo,
-).decode()
+_PUBLIC_JWK = json.loads(RSAAlgorithm.to_jwk(_KEY.public_key()))
+# PyJWT's to_jwk() omits the "kid"; Google's JWKs include it. Add a deterministic
+# kid so the token header and the certs document agree (exactly as Google does).
+_PUBLIC_JWK["kid"] = "test-kid"
 
 
 def _fake_certs(*args, **kwargs):
-    return {"test-kid": _PUBLIC_PEM}
+    # Real Google certs shape: a JWKS document, NOT a flat {kid: PEM} mapping.
+    return {"keys": [_PUBLIC_JWK]}
 
 
 def _make_google_token(claims: dict) -> str:
-    return jwt.encode(claims, _PRIVATE_PEM, algorithm="RS256", headers={"kid": "test-kid"})
+    return jwt.encode(claims, _PRIVATE_PEM, algorithm="RS256", headers={"kid": _PUBLIC_JWK["kid"]})
 
 
 def _valid_claims(sub="goog-123", email="user@example.com", **overrides):
@@ -265,6 +270,36 @@ def test_google_unknown_key_rejected(client):
     bad = jwt.encode(_valid_claims(), other_pem, algorithm="RS256", headers={"kid": "unknown-kid"})
     r = tc.post("/auth/google", json={"id_token": bad})
     assert r.status_code == 401
+    assert "Google sign-in failed" in r.json()["error"]
+
+
+def test_google_valid_token_jwks_succeeds(client):
+    """Regression guard for the JWKS-parsing root cause: a token signed by the
+    key published inside the real {"keys":[JWK]} certs document must verify."""
+    app, users = client
+    tc = _tc(app)
+    token = _make_google_token(_valid_claims())
+    r = tc.post("/auth/google", json={"id_token": token})
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json()["access_token"], str)
+
+
+def test_google_wrong_audience_returns_401(client):
+    app, users = client
+    tc = _tc(app)
+    claims = _valid_claims(aud="evil-client-id.apps.googleusercontent.com")
+    r = tc.post("/auth/google", json={"id_token": _make_google_token(claims)})
+    assert r.status_code == 401
+    assert "Google sign-in failed" in r.json()["error"]
+
+
+def test_google_expired_token_returns_401(client):
+    app, users = client
+    tc = _tc(app)
+    claims = _valid_claims(exp=int(time.time()) - 100)
+    r = tc.post("/auth/google", json={"id_token": _make_google_token(claims)})
+    assert r.status_code == 401
+    assert "Google sign-in failed" in r.json()["error"]
 
 
 def test_google_wrong_audience_rejected(client):

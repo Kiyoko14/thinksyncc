@@ -19,6 +19,8 @@ Every interaction must be reproducible.
 """
 
 from __future__ import annotations
+from pydantic import BaseModel, Field
+from enum import Enum
 
 import logging
 import json as _json
@@ -75,10 +77,10 @@ class AuditEvent(BaseModel):
 
     async def persist(self) -> None:
         """Persist to ``conversation_audit`` table."""
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
 
         try:
-            get_supabase().table("conversation_audit").insert(
+            await (await get_supabase_async()).table("conversation_audit").insert(
                 json.loads(self.model_dump_json())
             ).execute()
         except Exception as exc:
@@ -272,10 +274,10 @@ class ConversationAuditEngine:
         conversation_id: str | None = None,
     ) -> list[AuditEvent]:
         """Reproduce the full interaction history."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         query = (
-            get_supabase()
+            (await get_supabase_async())
             .table("conversation_audit")
             .select("*")
             .eq("job_id", job_id)
@@ -283,5 +285,5 @@ class ConversationAuditEngine:
         if conversation_id:
             query = query.eq("conversation_id", conversation_id)
         query = query.order("timestamp", desc=False)
-        result = query.execute()
+        result = await query.execute()
         return [AuditEvent(**row) for row in (result.data or [])]

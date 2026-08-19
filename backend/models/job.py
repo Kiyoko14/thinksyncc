@@ -9,6 +9,12 @@ class JobStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     WAITING_FOR_LLM = "waiting_for_llm"
+    # Interactive Wait / event-driven wait states (Sprint 3A / 3C.C)
+    WAITING_FOR_USER = "waiting_for_user"
+    RESUMED = "resumed"
+    PAUSED = "paused"
+    APPROVED = "approved"
+    CANCELLED = "cancelled"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -18,6 +24,10 @@ class JobCreate(BaseModel):
     server_id: str
     mode: str | None = None
     objective: str = Field(..., min_length=3, max_length=1000)
+    # Original, human-readable workspace name (if the user explicitly named the
+    # workspace). Optional; when absent the backend falls back to `objective`.
+    # Internal identifiers (slug/id) must never replace this in user-facing text.
+    display_name: str | None = None
     max_steps: int = Field(default=8, ge=1, le=20)
     allow_write: bool | None = None
     dry_run: bool = False
@@ -47,6 +57,9 @@ class JobResponse(BaseModel):
     errors: list[dict[str, Any]] = []
     retries: list[dict[str, Any]] = []
     summary: str | None = None
+    # Frontend Synchronization: when the job is waiting for clarification the
+    # actual question(s) MUST be visible (never a bare "waiting_for_user").
+    clarification: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
 

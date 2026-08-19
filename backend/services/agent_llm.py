@@ -35,12 +35,14 @@ from models.agent import (
     AgentDecision,
     AgentPlan,
     AgentStep,
+    ApprovalSuspendSignal,
     DecisionAction,
     StepResult,
     ToolCallingLoopResult,
     ToolName,
 )
 from services.guardrails import apply_text_patches, validate_patched_files
+from services.structured_output import request_structured
 from agents.constitution import ConstitutionEngine, PlatformContextMissingError, TargetDriftError
 logger = logging.getLogger(__name__)
 constitution = ConstitutionEngine()
@@ -177,28 +179,19 @@ async def classify_intent_with_confidence(text: str) -> dict[str, Any]:
         try:
             obj = json.loads(cached)
             return {"intent": _normalize_intent(obj.get("intent")), "confidence": _normalize_confidence(obj.get("confidence"))}
-        except Exception:
-            pass
-
-    client = _get_openai_client()
-    model = settings.OPENAI_MODEL_CLASSIFIER or settings.OPENAI_MODEL
+        except Exception as exc:  # noqa: BLE001 — cache entry corrupt; fall through to model
+            logger.debug("[agent_llm] corrupt intent cache entry, recomputing: %s", exc)
 
     payload = {"message": cleaned, "intents": list(_INTENT_VALUES)}
     try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": constitution.build_prompt("intent_classifier")},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            ),
-            timeout=45,
+        obj = await request_structured(
+            role="classifier",
+            messages=[
+                {"role": "system", "content": constitution.build_prompt("intent_classifier")},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            schema=_INTENT_SCHEMA,
         )
-        raw = (response.choices[0].message.content or "").strip()
-        obj = json.loads(raw) if raw else {}
         intent = _normalize_intent(obj.get("intent"))
         confidence = _normalize_confidence(obj.get("confidence"))
         await _cache_set(cache_key, json.dumps({"intent": intent, "confidence": confidence}))
@@ -282,7 +275,6 @@ async def detect_task_mode(
             "recent_context": context_tail,
             "task_modes": list(_TASK_MODE_VALUES),
         }
-        model = settings.OPENAI_MODEL_CLASSIFIER or settings.OPENAI_MODEL
         result = await _chat_json(
             messages=[
                 {"role": "system", "content": constitution.build_prompt("task_mode_classifier")},
@@ -290,13 +282,13 @@ async def detect_task_mode(
             ],
             schema=_TASK_MODE_SCHEMA,
             cache_key=cache_key,
-            model=model,
+            role="classifier",
         )
         mode = str(result.get("task_mode", "")).strip().lower()
         if mode in _TASK_MODE_VALUES:
             return mode
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — classifier failed; use heuristic fallback
+        logger.debug("[agent_llm] task_mode classification failed, using heuristic: %s", exc)
 
     return "complex" if len(cleaned) > 220 or "\n" in cleaned or " and " in cleaned.lower() else "simple"
 
@@ -342,7 +334,7 @@ async def generate_non_server_plan(
         ],
         schema=_NON_SERVER_PLAN_SCHEMA,
         cache_key=cache_key,
-        model=get_settings().OPENAI_MODEL_PLANNER or get_settings().OPENAI_MODEL,
+        role="planner",
     )
     steps = result.get("steps") or []
     if not isinstance(steps, list):
@@ -398,7 +390,6 @@ async def analyze_failure(
         "server_metadata": context.get("server_metadata", {}),
         "memory": context.get("memory", [])[-10:],
     }
-    model = settings.OPENAI_MODEL_DEBUG or settings.OPENAI_MODEL
     try:
         return await _chat_json(
             messages=[
@@ -406,7 +397,7 @@ async def analyze_failure(
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             schema=_FAILURE_ANALYSIS_SCHEMA,
-            model=model,
+            role="debug",
         )
     except Exception:
         return {"root_cause": "Failure analysis unavailable", "next_steps": [], "notes": ""}
@@ -436,11 +427,11 @@ async def generate_chat_response(
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
+                model=settings.resolve_model("chat"),
                 messages=messages,  # type: ignore[arg-type]
                 temperature=0.3,
             ),
-            timeout=45,
+            timeout=900,
         )
     except asyncio.TimeoutError:
         logger.warning("[chat] LLM timed out after 45s; returning empty response")
@@ -485,11 +476,11 @@ async def generate_code_response(
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
+                model=settings.resolve_model("code"),
                 messages=messages,  # type: ignore[arg-type]
                 temperature=0.2,
             ),
-            timeout=45,
+            timeout=900,
         )
     except asyncio.TimeoutError:
         logger.warning("[codegen] LLM timed out after 45s; returning empty")
@@ -1133,28 +1124,17 @@ async def generate_patch_response(
 
     _patch_timeout_failure: dict[str, Any] = {"patches": [], "validation": {"checks": []}, "report": {"summary": "llm timeout", "files_modified": [], "status": "failed"}}
     try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": constitution.build_prompt("patch")},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            ),
-            timeout=45,
+        obj = await request_structured(
+            role="patch",
+            messages=[
+                {"role": "system", "content": constitution.build_prompt("patch")},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            schema=_PATCH_SCHEMA,
         )
-    except asyncio.TimeoutError:
-        logger.warning("[patch] LLM timed out after 45s")
+    except HTTPException:
+        # Transport failure (timeout/502) maps to the existing timeout failure shape.
         return _patch_timeout_failure
-    raw = (response.choices[0].message.content or "").strip()
-    if not raw:
-        return {"patches": [], "validation": {"checks": []}, "report": {"summary": "empty llm response", "files_modified": [], "status": "failed"}}
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return {"patches": [], "validation": {"checks": []}, "report": {"summary": "invalid json from llm", "files_modified": [], "status": "failed"}}
     return obj if isinstance(obj, dict) else {"patches": [], "validation": {"checks": []}, "report": {"summary": "invalid llm shape", "files_modified": [], "status": "failed"}}
 
 
@@ -1548,11 +1528,11 @@ async def regenerate_on_error(
     try:
         rewrite = await asyncio.wait_for(
             client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
+                model=settings.resolve_model("code"),
                 messages=rewrite_messages,  # type: ignore[arg-type]
                 temperature=0.1,
             ),
-            timeout=45,
+            timeout=900,
         )
     except asyncio.TimeoutError:
         logger.warning("[codegen] regeneration LLM timed out after 45s; returning original")
@@ -1635,6 +1615,29 @@ _DECISION_SCHEMA = {
 }
 
 
+# Structured-output schemas for non-planner callers that previously hardcoded
+# OpenAI JSON mode. Routed through the provider-agnostic abstraction.
+_INTENT_SCHEMA = {
+    "type": "object",
+    "required": ["intent", "confidence"],
+    "additionalProperties": False,
+    "properties": {
+        "intent": {"type": "string", "enum": list(_INTENT_VALUES)},
+        "confidence": {"type": "number"},
+    },
+}
+
+_PATCH_SCHEMA = {
+    "type": "object",
+    "required": ["patches", "validation", "report"],
+    "properties": {
+        "patches": {"type": "array"},
+        "validation": {"type": "object"},
+        "report": {"type": "object"},
+    },
+}
+
+
 def _get_openai_client() -> AsyncOpenAI:
     settings = get_settings()
     if not settings.OPENAI_API_KEY:
@@ -1703,9 +1706,18 @@ async def _chat_json(
     messages: list[dict[str, str]],
     schema: dict[str, Any],
     cache_key: str | None = None,
-    model: str | None = None,
+    role: str = "classifier",
 ) -> dict[str, Any]:
-    """Call OpenAI chat completions with JSON mode; optionally cache result."""
+    """Bridge to the provider-agnostic Structured Output abstraction.
+
+    Callers request *structured output* via a JSON ``schema`` and a logical
+    ``role``. They no longer pass a model or ``response_format`` — model
+    selection comes from configuration (``Settings.resolve_model``) and the
+    provider-specific transport (native JSON mode vs. prompt-constrained
+    fallback) is isolated inside ``services.structured_output``.
+
+    The Redis cache keys are preserved for backward compatibility.
+    """
     if cache_key:
         cached = await _cache_get(cache_key)
         if cached:
@@ -1714,48 +1726,15 @@ async def _chat_json(
             except json.JSONDecodeError:
                 pass
 
-    settings = get_settings()
-    client = _get_openai_client()
-
-    try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=model or settings.OPENAI_MODEL,
-                messages=messages,  # type: ignore[arg-type]
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            ),
-            timeout=45,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="LLM request timed out after 45s",
-        )
-    except Exception as exc:
-        logger.error("OpenAI call failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM request failed: {exc}",
-        )
-
-    raw = (response.choices[0].message.content or "").strip()
-    if not raw:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Empty response from LLM",
-        )
-
-    try:
-        result: dict[str, Any] = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM returned invalid JSON: {exc}",
-        )
+    result = await request_structured(
+        role=role,
+        messages=messages,
+        schema=schema,
+        temperature=0.0,
+    )
 
     if cache_key:
-        await _cache_set(cache_key, raw)
+        await _cache_set(cache_key, json.dumps(result, ensure_ascii=False))
 
     return result
 
@@ -1820,7 +1799,7 @@ async def generate_plan(
     ]
 
     settings = get_settings()
-    raw = await _chat_json(messages, _PLAN_SCHEMA, cache_key=cache_key, model=settings.OPENAI_MODEL_PLANNER or settings.OPENAI_MODEL)
+    raw = await _chat_json(messages, _PLAN_SCHEMA, cache_key=cache_key, role="planner")
 
     steps_raw = raw.get("steps", [])
     steps = []
@@ -1870,7 +1849,7 @@ async def evaluate_step(
     ]
 
     settings = get_settings()
-    raw = await _chat_json(messages, _DECISION_SCHEMA, model=settings.OPENAI_MODEL_DEBUG or settings.OPENAI_MODEL)
+    raw = await _chat_json(messages, _DECISION_SCHEMA, role="debug")
 
     modified_step: AgentStep | None = None
     ms_raw = raw.get("modified_step")
@@ -1931,7 +1910,7 @@ async def revise_plan(
     ]
 
     settings = get_settings()
-    raw = await _chat_json(messages, _PLAN_SCHEMA, model=settings.OPENAI_MODEL_DEBUG or settings.OPENAI_MODEL)
+    raw = await _chat_json(messages, _PLAN_SCHEMA, role="debug")
 
     steps_raw = raw.get("steps", [])
     steps = []
@@ -2107,7 +2086,7 @@ async def _request_executor_tool_call(
                 tool_choice="required",
                 temperature=0.0,
             ),
-            timeout=45,
+            timeout=900,
         )
     except asyncio.TimeoutError:
         raise HTTPException(
@@ -2152,7 +2131,7 @@ async def _request_final_summary(
                 ],  # type: ignore[arg-type]
                 temperature=0.0,
             ),
-            timeout=45,
+            timeout=900,
         )
     except asyncio.TimeoutError:
         logger.warning("[summary] LLM timed out after 45s; returning empty")
@@ -2171,7 +2150,7 @@ async def summarize_tool_results(*, objective: str, results: list[StepResult]) -
     )
     return await _request_final_summary(
         client=client,
-        model=settings.OPENAI_MODEL_SUMMARY or settings.OPENAI_MODEL,
+        model=settings.resolve_model("summary"),
         objective=objective,
         results=results,
     )
@@ -2293,8 +2272,12 @@ async def run_tool_calling_loop(
         if on_step_start:
             try:
                 await on_step_start(step_number, tool_name, tool_args)
-            except Exception:
-                pass
+            except ApprovalSuspendSignal:
+                # Approval pause must propagate to the orchestrator so the job
+                # can suspend (event-driven wait).  Do NOT swallow it.
+                raise
+            except Exception as exc:
+                logger.error("[agent_llm] on_step_start hook failed: %s", exc)
 
         result = await execute_tool(
             tool_name=tool_name,
@@ -2330,7 +2313,7 @@ async def run_tool_calling_loop(
                 try:
                     raw_message = await _request_executor_tool_call(
                         client=client,
-                        model=settings.OPENAI_MODEL,
+                        model=settings.resolve_model("executor"),
                         messages=messages,
                         current_step=current_step,
                         tool_defs=tool_defs,
@@ -2450,7 +2433,7 @@ async def run_tool_calling_loop(
     try:
         final_summary = await _request_final_summary(
             client=client,
-            model=settings.OPENAI_MODEL,
+            model=settings.resolve_model("executor"),
             objective=objective,
             results=results,
         )

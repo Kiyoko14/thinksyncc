@@ -168,11 +168,44 @@ export interface Workspace {
   id: string;
   user_id: string;
   server_id: string;
+  display_name?: string | null;
   name: string;
   path: string;
   slug: string;
   domain: string;
   created_at: string;
+  github_connection_id?: string | null;
+}
+
+// ── GitHub Connections ──────────────────────────────────────────────────────
+
+export interface GitHubConnection {
+  id: string;
+  user_id: string;
+  name: string;
+  auth_method: string;
+  host: string;
+  ssh_public_key?: string | null;
+  ssh_key_type?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Returned ONLY once when the backend generates the keypair — the private
+// key must be shown to the user exactly once so they can add it to GitHub.
+export interface GitHubConnectionWithKey extends GitHubConnection {
+  ssh_private_key: string;
+}
+
+export interface GitHubConnectionCreatePayload {
+  name: string;
+  auth_method?: string;
+  // Import an existing keypair:
+  ssh_private_key?: string;
+  ssh_public_key?: string;
+  // OR let the backend generate one (private key returned once):
+  generate_keypair?: boolean;
+  host?: string;
 }
 
 export interface CommandResult {
@@ -198,10 +231,19 @@ export const deleteServer = (id: string) =>
 
 // ── Workspaces ────────────────────────────────────────────────────────────────
 
-export const createWorkspace = (server_id: string, name: string) =>
+export interface WorkspaceCreatePayload {
+  server_id: string;
+  name: string;
+  github_connection_id?: string | null;
+  github_repo?: string | null;
+  github_branch?: string | null;
+  github_depth?: number | null;
+}
+
+export const createWorkspace = (payload: WorkspaceCreatePayload) =>
   request<Workspace>("/api/workspaces/", {
     method: "POST",
-    body: JSON.stringify({ server_id, name }),
+    body: JSON.stringify(payload),
   });
 
 export const getWorkspace = (workspace_id: string) =>
@@ -209,6 +251,20 @@ export const getWorkspace = (workspace_id: string) =>
 
 export const getWorkspacesByServer = (server_id: string) =>
   request<Workspace[]>(`/api/workspaces/?server_id=${server_id}`);
+
+// ── GitHub Connections ───────────────────────────────────────────────────
+
+export const getGitHubConnections = () =>
+  request<GitHubConnection[]>("/api/github-connections/");
+
+export const createGitHubConnection = (data: GitHubConnectionCreatePayload) =>
+  request<GitHubConnection | GitHubConnectionWithKey>("/api/github-connections/", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const deleteGitHubConnection = (id: string) =>
+  request<void>(`/api/github-connections/${id}`, { method: "DELETE" });
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -276,6 +332,13 @@ export interface ForgeV2RunResponse {
   decisions: AgentDecision[];
   summary: string;
   success: boolean;
+  deployment?: {
+    url?: string | null;
+    verified?: boolean | null;
+    status?: string | null;
+    message?: string | null;
+    error?: string | null;
+  } | null;
 }
 
 export interface ForgeV2JobResponse {
@@ -303,7 +366,7 @@ export interface JobRecord {
 }
 
 export interface JobStreamEvent {
-  type: "step_start" | "step_result" | "log_chunk" | "status_update" | "completed" | "ping";
+  type: "step_start" | "step_result" | "log_chunk" | "status_update" | "completed" | "ping" | "waiting_for_clarification";
   sequence?: number;
   status?: AgentJobStatus;
   step: number;
@@ -320,6 +383,103 @@ export interface JobStreamEvent {
   decision?: AgentDecision;
   task_mode?: "simple" | "complex";
   plan?: AgentStep[];
+  // Structured clarification form (new generic contract).
+  questions?: ClarificationQuestion[];
+  clarification_form?: ClarificationForm | null;
+  turn?: number;
+}
+
+// ── Structured Clarification Form (generic renderer contract) ───────────────
+
+export type ClarificationQuestionType =
+  | "text"
+  | "textarea"
+  | "password"
+  | "secret"
+  | "number"
+  | "boolean"
+  | "single_select"
+  | "multi_select"
+  | "path"
+  | "directory"
+  | "url"
+  | "domain"
+  | "port"
+  | "email"
+  | "ssh_key"
+  | "api_key"
+  | "environment";
+
+export interface ClarificationChoice {
+  id: string;
+  label: string;
+  value: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ClarificationValidation {
+  required: boolean;
+  regex?: string | null;
+  pattern_description?: string | null;
+  min_length?: number | null;
+  max_length?: number | null;
+  min?: number | null;
+  max?: number | null;
+  allow_multi?: boolean;
+}
+
+export interface ClarificationFormQuestion {
+  id: string;
+  required_field: string;
+  title: string;
+  description: string;
+  placeholder: string;
+  example: string;
+  required: boolean;
+  secret: boolean;
+  type: ClarificationQuestionType;
+  default: unknown;
+  choices: ClarificationChoice[];
+  validation: ClarificationValidation;
+  depends_on?: string | null;
+  visible_if?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ClarificationForm {
+  id: string;
+  title: string;
+  description: string;
+  questions: ClarificationFormQuestion[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface ClarificationFormAnswer {
+  question_id: string;
+  required_field: string;
+  value: unknown;
+  selected_choice?: string | null;
+}
+
+export interface ClarificationFormSubmission {
+  clarification_id: string;
+  answers: ClarificationFormAnswer[];
+}
+
+// Legacy free-text question shape (kept for backward compatibility).
+export interface ClarificationQuestion {
+  question_id?: string;
+  question: string;
+  question_type?: string;
+  priority?: string;
+  reason?: string;
+  required_field?: string;
+  blocking?: boolean;
+  default_value?: unknown;
+  validation_rule?: string;
+  options?: string[];
+  source?: string;
+  cost_estimate?: number;
 }
 
 export type ChatRole = "user" | "assistant" | "system";
@@ -382,8 +542,62 @@ export const getWorkspaceChat = (workspace_id: string) =>
 export const getWorkspaceJobs = (workspace_id: string) =>
   request<JobRecord[]>(`/api/jobs/?workspace_id=${workspace_id}`);
 
+// New generic structured clarification submission (preferred).  Falls back to
+// the free-text reply path when no submission is provided.
+export const submitClarificationReply = (
+  job_id: string,
+  payload: {
+    conversation_id?: string | null;
+    reply?: string | null;
+    clarification_submission?: ClarificationFormSubmission | null;
+  }
+) =>
+  request<{ status: string; job_id: string; event: string; woke: boolean }>(
+    `/api/agents/jobs/${job_id}/clarification-reply`,
+    { method: "POST", body: JSON.stringify(payload) }
+  );
+
 export function getJobWebSocketUrl(jobId: string): string {
   const token = getToken();
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/api/v1/ws/jobs/${jobId}?token=${encodeURIComponent(token ?? "")}`;
+}
+
+// ── Agent phase status helpers (revived; consumed by AgentStatusBar / StepTimeline) ──
+
+export type AgentPhase =
+  | "queued"
+  | "planning"
+  | "reading_workspace"
+  | "repository_analysis"
+  | "implementation"
+  | "running_commands"
+  | "waiting_for_clarification"
+  | "waiting_for_approval"
+  | "waiting_for_resume"
+  | "deploying"
+  | "completed"
+  | "failed";
+
+export const AGENT_PHASE_LABELS: Record<AgentPhase, string> = {
+  queued: "Queued",
+  planning: "Planning",
+  reading_workspace: "Reading Workspace",
+  repository_analysis: "Repository Analysis",
+  implementation: "Implementation",
+  running_commands: "Running Commands",
+  waiting_for_clarification: "Awaiting Clarification",
+  waiting_for_approval: "Awaiting Approval",
+  waiting_for_resume: "Awaiting Resume",
+  deploying: "Deploying",
+  completed: "Completed",
+  failed: "Failed",
+};
+
+// Human-readable label for a workflow step tool + its args.
+export function humanizeStep(tool: string | null, args?: Record<string, unknown> | null): string {
+  const t = tool ?? "step";
+  if (!args) return t;
+  const target = (args.command as string) || (args.file as string) || (args.path as string);
+  return target ? `${t}: ${target}` : t;
 }

@@ -166,7 +166,7 @@ class TimeoutManager:
 
         Returns the number of sessions archived.
         """
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
 
         # This is a simplified version — in production you'd query
         # the conversation_audit table. For now, load sessions from
@@ -174,7 +174,7 @@ class TimeoutManager:
         count = 0
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("jobs")
                 .select("id, conversation_session")
                 .eq("conversation_id", conversation_id)

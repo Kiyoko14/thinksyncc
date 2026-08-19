@@ -141,11 +141,11 @@ class IdempotencyGuard:
 
         Returns previous result if duplicate, None if new operation.
         """
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
 
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("conversation_audit")
                 .select("content")
                 .eq("job_id", job_id)
@@ -186,9 +186,9 @@ class IdempotencyGuard:
             cursor_version=None,
         )
         # Also persist to a dedicated idempotency table (simpler lookup)
-        from core.database import get_supabase
+        from core.database import get_supabase_async
         try:
-            get_supabase().table("idempotency_store").insert(
+            await (await get_supabase_async()).table("idempotency_store").insert(
                 {
                     "operation_id": operation_id,
                     "job_id": job_id,
@@ -270,9 +270,10 @@ class OptimisticLockGuard:
             if current != expected_version:
                 raise OptimisticLockError(expected_version, current)
 
-        # Bump version
-        v = getattr(approval, "request_version", 0) or 0
-        approval.request_version = v + 1
+        # Version increment is owned solely by ApprovalEngine._persist()
+        # (its docstring: "Increments request_version on every write.").
+        # Do NOT bump here — a second increment causes a double-increment and
+        # a spurious version conflict on the resolve path.
         approval.updated_at = datetime.now(timezone.utc)
 
         # Persist (delegates to ApprovalEngine._persist)
@@ -373,11 +374,11 @@ class ExactlyOnceResumeGuard:
 
         Returns previous resume result if duplicate, None if fresh.
         """
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("conversation_audit")
                 .select("content")
                 .eq("job_id", job_id)
@@ -412,9 +413,9 @@ class ExactlyOnceResumeGuard:
             spec_version=None,
         )
         # Also persist to a dedicated table
-        from core.database import get_supabase
+        from core.database import get_supabase_async
         try:
-            get_supabase().table("resume_outcomes").insert(
+            await (await get_supabase_async()).table("resume_outcomes").insert(
                 {
                     "approval_id": approval_id,
                     "job_id": job_id,
@@ -525,9 +526,9 @@ class CrashRecoveryGuard:
 
         # 3. Recover ApprovalRequest
         try:
-            from core.database import get_supabase
+            from core.database import get_supabase_async
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("approval_requests")
                 .select("*")
                 .eq("job_id", job_id)
@@ -588,7 +589,7 @@ class StartupVerifier:
 
         Raises StartupVerificationError if any table is missing.
         """
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
 
         missing: list[str] = []
         required_tables = [
@@ -601,7 +602,7 @@ class StartupVerifier:
 
         for table in required_tables:
             try:
-                get_supabase().table(table).select("*").limit(0).execute()
+                await (await get_supabase_async()).table(table).select("*").limit(0).execute()
             except Exception as exc:
                 missing.append(table)
                 logger.error(

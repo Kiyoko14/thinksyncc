@@ -104,6 +104,28 @@ def _extract_subdomain(host: str) -> str | None:
     return first if first else None
 
 
+def _is_workspace_host(host: str) -> bool:
+    """True only for genuine deployed workspace subdomains.
+
+    Used by :class:`WorkspaceHostRoute` to decide whether the catch-all
+    Gateway route should even be considered for a request. Everything that
+    is NOT a real workspace host (apex ``thinksync.art``, ``app`` / ``api`` /
+    ``www`` and any other reserved name, non-thinksync hosts, and malformed
+    subdomains) returns ``False`` so the request falls through to the
+    platform routers. This is the routing boundary — the in-handler
+    reserved/invalid checks remain only as defence-in-depth.
+    """
+    subdomain = _extract_subdomain(host)
+    if not subdomain:
+        # apex thinksync.art, non-thinksync hosts, empty host → platform.
+        return False
+    if subdomain in _RESERVED:
+        # app / api / www → platform, never Gateway.
+        return False
+    # Only the canonical workspace subdomain shape enters the Gateway.
+    return bool(_SUBDOMAIN_RE.match(subdomain))
+
+
 def _resolve_timeout(path: str) -> float:
     clean = path.lstrip("/")
     if clean.startswith("api"):

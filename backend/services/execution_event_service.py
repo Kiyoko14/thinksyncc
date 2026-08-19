@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.config import get_settings
-from core.database import get_supabase
+from core.database import get_supabase, get_supabase_async
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)

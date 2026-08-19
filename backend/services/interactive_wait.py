@@ -121,7 +121,7 @@ class InteractiveWaitEngine:
         current ``ExecutionCursor`` version and ``FrozenSpecification``
         version, signed with ``APPROVAL_RESUME_SECRET``.
         """
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
         import json as _json, os
 
         # Load current interaction state
@@ -142,7 +142,7 @@ class InteractiveWaitEngine:
             execution_cursor.mark_waiting(current_step_index)
 
         # Add a system message explaining why we are waiting
-        from models.interaction import InteractionMessage
+        from models.approval import InteractionMessage
         state.add_message(
             InteractionMessage(
                 sender="agent",
@@ -248,7 +248,7 @@ class InteractiveWaitEngine:
 
         # Record user reply
         if reply:
-            from models.interaction import InteractionMessage
+            from models.approval import InteractionMessage
             state.add_message(
                 InteractionMessage(
                     sender="user",
@@ -294,6 +294,99 @@ class InteractiveWaitEngine:
         return await cls._load_state(conversation_id, job_id)
 
     @classmethod
+    async def record_clarification_answer(
+        cls,
+        job_id: str,
+        conversation_id: str,
+        *,
+        answer: str | None = None,
+        raw: str | None = None,
+        structured_submission: Any | None = None,
+    ) -> JobInteractionState:
+        """Record a clarification answer and transition the job back to RUNNING.
+
+        Called by ``EventWaitEngine.await_clarification_reply`` after a
+        ``CLARIFICATION_REPLY`` (or ``USER_REPLY`` / ``RESUME_REQUEST``) wakes the
+        wait loop.  Mirrors ``resume()`` but is scoped to clarification: it
+        records the user's answer as an interaction message, clears the waiting
+        cursor, and flips the job status to RUNNING so the re-dispatched
+        pipeline resumes cleanly.  The actual ProjectSpecification update happens
+        in ``agent_service.run_agent_pipeline`` using the recorded answer.
+
+        Supports BOTH the legacy free-text path (``answer`` / ``raw``) and the
+        new structured path (``structured_submission``).  When a structured
+        submission is supplied, the full authoritative payload is stored on the
+        interaction state (``clarification_submission``) so the resume handler
+        can fold it back deterministically — and the chat-history message is
+        REDACTED so secret values never appear in user-visible history.
+
+        Never bypasses the resume-token / optimistic state checks: the caller
+        (event wait engine) has already verified safety before invoking this.
+        """
+        from core.database import get_supabase
+
+        state = await cls._load_state(conversation_id, job_id)
+
+        if state.current_state != JobState.WAITING_FOR_USER:
+            logger.warning(
+                "[wait] record_clarification_answer: job %s not in WAITING_FOR_USER "
+                "(state=%s); recording answer anyway",
+                job_id,
+                state.current_state.value,
+            )
+
+        # Store the structured submission on the state (authoritative source for
+        # the resume handler).  Legacy free-text clarifications leave this None.
+        if structured_submission is not None:
+            state.clarification_submission = (
+                structured_submission.model_dump(mode="json")
+                if hasattr(structured_submission, "model_dump")
+                else dict(structured_submission)
+            )
+
+        # Record the user's answer as an interaction message.
+        if structured_submission is not None:
+            # Structured path: record a REDACTED placeholder only.  Secret values
+            # (token/api_key/password/...) MUST never appear in chat history.
+            n = 0
+            if hasattr(structured_submission, "answers"):
+                n = len(structured_submission.answers)
+            elif isinstance(structured_submission, dict):
+                n = len(structured_submission.get("answers") or [])
+            from models.approval import InteractionMessage
+
+            state.add_message(
+                InteractionMessage(
+                    sender="user",
+                    message_type="answer",
+                    content=f"Submitted {n} clarification answer(s).",
+                    structured=True,
+                )
+            )
+        elif answer or raw:
+            from models.approval import InteractionMessage
+
+            state.add_message(
+                InteractionMessage(
+                    sender="user",
+                    message_type="answer",
+                    content=(answer or raw or "").strip(),
+                    structured=False,
+                )
+            )
+
+        # Clear the waiting cursor so the re-dispatched pipeline resumes cleanly.
+        if state.execution_cursor is not None:
+            state.execution_cursor.clear_waiting()
+
+        state.transition_to(JobState.RESUMED)
+        await cls._persist_state(state)
+        await cls._update_job_status(job_id, JobStatus.RESUMED)
+
+        logger.info("[wait] clarification answer recorded | job=%s", job_id)
+        return state
+
+    @classmethod
     async def is_waiting(cls, conversation_id: str, job_id: str) -> bool:
         """Return True if the job is currently waiting for user input."""
         state = await cls._load_state(conversation_id, job_id)
@@ -309,11 +402,11 @@ class InteractiveWaitEngine:
         job_id: str,
     ) -> JobInteractionState:
         """Load ``JobInteractionState`` from ``jobs.interaction_state`` (JSONB)."""
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
 
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("jobs")
                 .select("interaction_state")
                 .eq("id", job_id)
@@ -337,10 +430,10 @@ class InteractiveWaitEngine:
     @staticmethod
     async def _persist_state(state: JobInteractionState) -> None:
         """Persist ``JobInteractionState`` to ``jobs.interaction_state``."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         try:
-            get_supabase().table("jobs").update(
+            await (await get_supabase_async()).table("jobs").update(
                 {
                     "interaction_state": state.model_dump(mode="json"),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -353,10 +446,10 @@ class InteractiveWaitEngine:
     @staticmethod
     async def _update_job_status(job_id: str, status: JobStatus) -> None:
         """Update ``jobs.status``."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         try:
-            get_supabase().table("jobs").update(
+            await (await get_supabase_async()).table("jobs").update(
                 {"status": status.value,
                  "updated_at": datetime.now(timezone.utc).isoformat()}
             ).eq("id", job_id).execute()

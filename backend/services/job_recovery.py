@@ -17,6 +17,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import asyncio
+
 from core.database import get_supabase
 from models.job import JobStatus
 from services.execution_event_service import ExecutionEventService
@@ -158,7 +160,6 @@ class JobRecovery:
 
             # Emit event asynchronously (best-effort; skip if no event loop)
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 loop.create_task(
                     ExecutionEventService.execution_failed(
@@ -327,23 +328,41 @@ class JobRecovery:
     def batch_mark_orphaned(hours: int = DEFAULT_ORPHAN_HOURS) -> dict[str, Any]:
         """Mark all orphaned jobs as failed in a batch.
 
-        Returns:
-            Summary of actions taken.
+        Uses the same DB-level advisory lock as ``batch_mark_recoverable`` so
+        only one recovery process marks orphans at a time (prevents
+        double-marking / inconsistent disposition).
         """
-        orphaned = JobRecovery.detect_orphaned_jobs(hours=hours)
-        marked: list[str] = []
-        failed: list[str] = []
+        lock_acquired = False
+        try:
+            try:
+                get_supabase().rpc("pg_advisory_lock", {"key": 20250402}).execute()
+                lock_acquired = True
+            except Exception:
+                pass  # lock function may not exist; proceed without
 
-        for job in orphaned:
-            job_id = job.get("id")
-            if JobRecovery.mark_job_orphaned(job_id, reason="batch_mark_orphaned"):
-                marked.append(job_id)
-            else:
-                failed.append(job_id)
+            orphaned = JobRecovery.detect_orphaned_jobs(hours=hours)
+            if not orphaned:
+                orphaned = JobRecovery.detect_orphaned_without_redis(hours=hours)
 
-        return {
-            "action": "batch_mark_orphaned",
-            "count": len(orphaned),
-            "marked": marked,
-            "failed": failed,
-        }
+            marked: list[str] = []
+            failed: list[str] = []
+
+            for job in orphaned:
+                job_id = job.get("id")
+                if JobRecovery.mark_job_orphaned(job_id, reason="batch_mark_orphaned"):
+                    marked.append(job_id)
+                else:
+                    failed.append(job_id)
+
+            return {
+                "action": "batch_mark_orphaned",
+                "count": len(orphaned),
+                "marked": marked,
+                "failed": failed,
+            }
+        finally:
+            if lock_acquired:
+                try:
+                    get_supabase().rpc("pg_advisory_unlock", {"key": 20250402}).execute()
+                except Exception:
+                    pass

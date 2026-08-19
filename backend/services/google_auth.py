@@ -22,6 +22,7 @@ import time
 from typing import Any, Callable
 
 import jwt
+from jwt.algorithms import RSAAlgorithm
 
 from core.config import get_settings
 
@@ -65,10 +66,46 @@ def get_google_certs(fetch_certs: Callable[[], dict[str, Any]] | None = None) ->
     return _CERTS_CACHE
 
 
+def _resolve_signing_key(certs: dict[str, Any], kid: str) -> Any:
+    """Resolve the public key (PEM string) for ``kid`` from a certs document.
+
+    Supports both Google's JWKS document shape (``{"keys": [ {kid, kty, n, e, ...}, ... ]}``)
+    and a legacy flat ``{kid: PEM-or-JWK}`` map. PyJWT's ``decode`` only accepts a
+    PEM-formatted key, so any JWK dict is converted via ``RSAAlgorithm.from_jwk``.
+    """
+    import json
+
+    candidate: Any = None
+    if isinstance(certs, dict) and "keys" in certs:
+        for jwk in certs.get("keys", []):
+            if isinstance(jwk, dict) and jwk.get("kid") == kid:
+                candidate = jwk
+                break
+    else:
+        candidate = certs.get(kid)
+
+    if candidate is None:
+        return None
+
+    # Already a PEM string -> pass through.
+    if isinstance(candidate, str):
+        return candidate
+
+    # JWK dict -> convert to a PEM public key for PyJWT.
+    if isinstance(candidate, dict) and candidate.get("kty") == "RSA":
+        try:
+            return RSAAlgorithm.from_jwk(json.dumps(candidate))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[google_auth] failed to parse JWK for kid=%s: %s", kid, exc)
+            return None
+
+    return candidate
+
+
 def verify_google_id_token(
-    id_token: str,
-    *,
-    fetch_certs: Callable[[], dict[str, Any]] | None = None,
+id_token: str,
+*,
+fetch_certs: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Verify a Google-signed OIDC ID token and return its claims.
 
@@ -106,13 +143,13 @@ def verify_google_id_token(
         raise GoogleTokenError("Google ID token is missing the 'kid' header.")
 
     certs = get_google_certs(fetch_certs=fetch_certs)
-    public_key = certs.get(kid)
+    public_key = _resolve_signing_key(certs, kid)
     if public_key is None:
         # Cert may have rotated; force a refresh and retry once.
         global _CERTS_CACHE
         _CERTS_CACHE = None
         certs = get_google_certs(fetch_certs=fetch_certs)
-        public_key = certs.get(kid)
+        public_key = _resolve_signing_key(certs, kid)
         if public_key is None:
             raise GoogleTokenError("Google ID token signed by an unknown key (kid not found).")
 

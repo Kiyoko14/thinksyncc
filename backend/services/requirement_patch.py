@@ -24,6 +24,8 @@ Small changes must remain small.
 """
 
 from __future__ import annotations
+from pydantic import BaseModel, Field
+from enum import Enum
 
 import copy
 import logging

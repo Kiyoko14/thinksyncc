@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class UserService:
-    TABLE = "public.users"
+    TABLE = "users"
 
     @staticmethod
     def _now_iso() -> str:
@@ -51,7 +51,7 @@ class UserService:
         )
 
         now = cls._now_iso()
-        if existing.data:
+        if existing and existing.data:
             user_id = existing.data["id"]
             supabase.table(cls.TABLE).update(
                 {
@@ -92,4 +92,4 @@ class UserService:
             .maybe_single()
             .execute()
         )
-        return result.data
+        return result.data if result is not None else None

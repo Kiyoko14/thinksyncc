@@ -40,20 +40,25 @@ export default function BottomNav() {
   const pathname = usePathname();
 
   return (
-    <nav className="fixed bottom-0 inset-x-0 z-40 bg-gray-900/95 backdrop-blur border-t border-gray-800 safe-bottom">
-      <div className="flex items-center justify-around h-16 max-w-lg mx-auto px-4">
+    <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-slate-200/80 bg-white/95 backdrop-blur safe-bottom lg:hidden">
+      <div className="mx-auto flex h-16 max-w-lg items-center justify-around px-4">
         {items.map((item) => {
-          const active = pathname === item.href || pathname.startsWith(item.href + "/");
+          const active =
+            pathname === item.href ||
+            pathname.startsWith(item.href + "/") ||
+            (item.href === "/servers" && pathname.startsWith("/server/"));
           return (
             <Link
               key={item.href}
               href={item.href}
-              className={`flex flex-col items-center gap-1 px-6 py-1 rounded-xl transition-colors ${
-                active ? "text-blue-400" : "text-gray-500 hover:text-gray-300"
+              className={`flex flex-col items-center gap-1 rounded-2xl px-4 py-2 transition ${
+                active
+                  ? "bg-emerald-50 text-emerald-700"
+                  : "text-slate-500 hover:bg-slate-50 hover:text-slate-900"
               }`}
             >
               {item.icon}
-              <span className="text-[10px] font-medium">{item.label}</span>
+              <span className="text-[10px] font-semibold tracking-wide">{item.label}</span>
             </Link>
           );
         })}

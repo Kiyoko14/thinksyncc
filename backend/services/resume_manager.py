@@ -63,12 +63,12 @@ class ResumeManager:
           - ``workspace_snapshot``: dict (workspace state)
           - ``spec``: dict | None (frozen specification)
         """
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
         from models.approval import ensure_approved_plan_immutable
 
         # Load job row
         result = (
-            get_supabase()
+            await (await get_supabase_async())
             .table("jobs")
             .select(
                 "execution_cursor",
@@ -167,18 +167,18 @@ class ResumeManager:
           - updates succeed ONLY if stored ``cursor_version`` == ``expected_version``
           - on conflict, raises ``ExecutionCursorConflictError``
         """
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         try:
             patch: dict[str, Any] = {
                 "execution_cursor": cursor.model_dump(mode="json"),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            query = get_supabase().table("jobs").update(patch).eq("id", job_id)
+            query = (await get_supabase_async()).table("jobs").update(patch).eq("id", job_id)
             # Optimistic locking: only update if version matches
             if expected_version is not None:
                 query = query.eq("cursor_version", expected_version)
-            result = query.execute()
+            result = await query.execute()
             if expected_version is not None and (not result.data or len(result.data) == 0):
                 raise ExecutionCursorConflictError(
                     f"Cursor version conflict for job {job_id}: "
@@ -197,11 +197,11 @@ class ResumeManager:
         step_index: int,
     ) -> None:
         """Mark a step as completed in the execution cursor."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         # Load current cursor
         result = (
-            get_supabase()
+            await (await get_supabase_async())
             .table("jobs")
             .select("execution_cursor")
             .eq("id", job_id)
@@ -223,10 +223,10 @@ class ResumeManager:
         job_id: str,
     ) -> None:
         """Transition job status from WAITING/APPROVED to RUNNING."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         try:
-            get_supabase().table("jobs").update(
+            await (await get_supabase_async()).table("jobs").update(
                 {
                     "status": JobStatus.RUNNING.value,
                     "updated_at": datetime.now(timezone.utc).isoformat(),

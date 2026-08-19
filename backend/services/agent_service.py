@@ -25,15 +25,22 @@ from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
 from core.config import get_settings
-from core.database import get_supabase
+from core.database import get_supabase, get_supabase_async
 from core.mode_context import reset_request_mode, set_request_mode
 from core.value_coercion import value_to_str
-from models.agent import AgentDecision, AgentStep, AgentTier, StepResult
+from models.agent import (
+    AgentDecision,
+    AgentStep,
+    AgentTier,
+    ApprovalSuspendSignal,
+    StepResult,
+)
 from models.job import JobAccepted, JobCreate, JobResponse, JobStatus
 from services import agent_llm
 from services import logger as obs
 from services.chat_service import ChatService
 from services.context_engine import ContextEngine
+from services.execution_result_projector import ExecutionResultProjector
 from services.redis_service import RedisService
 from services.memory import MemoryStore
 from services.planner import build_plan
@@ -66,25 +73,26 @@ logger = logging.getLogger(__name__)
 
 # Sprint 3A: Helper functions for approval integration
 
-class _ApprovalRequiredError(Exception):
-    """Raised inside on_step_start() when approval is required."""
-    def __init__(self, approval_id: str):
-        self.approval_id = approval_id
-        super().__init__(f"Approval required: {approval_id}")
+# ApprovalSuspendSignal is defined in models.agent to avoid circular imports.
+# Historical code references agent_service._ApprovalRequiredError, so we keep
+# it as an alias of the canonical model-level signal.
+_ApprovalRequiredError = ApprovalSuspendSignal
 
 def _map_tool_to_approval_type(tool_name: str) -> ApprovalType:
     """Map a tool name to an ApprovalType."""
     name = (tool_name or "").lower()
-    if "write" in name or "file" in name or "patch" in name:
+    if "secret" in name or "password" in name or "token" in name:
+        return ApprovalType.SECRET
+    if "github_push" in name:
+        return ApprovalType.DEPLOYMENT
+    if "write" in name or "file" in name or "patch" in name or "config" in name or "env" in name:
         return ApprovalType.FILE_OVERWRITE
     if "command" in name or "shell" in name or "exec" in name:
         return ApprovalType.COMMAND
-    if "deploy" in name or "server" in name:
+    if "deploy" in name or "server" in name or "github" in name:
         return ApprovalType.DEPLOYMENT
     if "delete" in name or "remove" in name or "rm " in name:
         return ApprovalType.DESTRUCTIVE
-    if "secret" in name or "password" in name or "token" in name:
-        return ApprovalType.SECRET
     return ApprovalType.COMMAND  # default: treat as command
 
 def _assess_risk(tool_name: str, args: dict[str, Any]) -> str:
@@ -92,9 +100,11 @@ def _assess_risk(tool_name: str, args: dict[str, Any]) -> str:
     name = (tool_name or "").lower()
     if "delete" in name or "rm " in name or "drop" in name:
         return "critical"
-    if "deploy" in name or "production" in name:
+    if "git_reset" in name or "git_clean" in name:
         return "high"
-    if "write" in name or "patch" in name:
+    if "deploy" in name or "production" in name or "git_push" in name or "github_push" in name:
+        return "high"
+    if "write" in name or "patch" in name or "config" in name or "env" in name or "git_restore" in name or "github_pull" in name:
         return "medium"
     return "low"
 
@@ -120,25 +130,21 @@ def _extract_commands(tool_name: str, args: dict[str, Any]) -> list[str]:
 
 # Sprint 3A: Helper functions for approval integration
 
-class _ApprovalRequiredError(Exception):
-    """Raised inside on_step_start() when approval is required."""
-    def __init__(self, approval_id: str):
-        self.approval_id = approval_id
-        super().__init__(f"Approval required: {approval_id}")
-
 def _map_tool_to_approval_type(tool_name: str) -> ApprovalType:
     """Map a tool name to an ApprovalType."""
     name = (tool_name or "").lower()
-    if "write" in name or "file" in name or "patch" in name:
+    if "secret" in name or "password" in name or "token" in name:
+        return ApprovalType.SECRET
+    if "github_push" in name:
+        return ApprovalType.DEPLOYMENT
+    if "write" in name or "file" in name or "patch" in name or "config" in name or "env" in name:
         return ApprovalType.FILE_OVERWRITE
     if "command" in name or "shell" in name or "exec" in name:
         return ApprovalType.COMMAND
-    if "deploy" in name or "server" in name:
+    if "deploy" in name or "server" in name or "github" in name:
         return ApprovalType.DEPLOYMENT
     if "delete" in name or "remove" in name or "rm " in name:
         return ApprovalType.DESTRUCTIVE
-    if "secret" in name or "password" in name or "token" in name:
-        return ApprovalType.SECRET
     return ApprovalType.COMMAND  # default: treat as command
 
 def _assess_risk(tool_name: str, args: dict[str, Any]) -> str:
@@ -146,9 +152,11 @@ def _assess_risk(tool_name: str, args: dict[str, Any]) -> str:
     name = (tool_name or "").lower()
     if "delete" in name or "rm " in name or "drop" in name:
         return "critical"
-    if "deploy" in name or "production" in name:
+    if "git_reset" in name or "git_clean" in name:
         return "high"
-    if "write" in name or "patch" in name:
+    if "deploy" in name or "production" in name or "git_push" in name or "github_push" in name:
+        return "high"
+    if "write" in name or "patch" in name or "config" in name or "env" in name or "git_restore" in name or "github_pull" in name:
         return "medium"
     return "low"
 
@@ -271,6 +279,24 @@ def _extract_message_from_json_summary(summary: str) -> str | None:
     return None
 
 
+def _extract_deployment_from_summary(summary: str) -> dict[str, Any] | None:
+    raw = (summary or "").strip()
+    if not raw:
+        return None
+
+    patterns = (
+        r"(?im)^\*\*Deployment:\*\*\s*(https?://\S+)\s*$",
+        r"(?im)^Deployment:\s*(https?://\S+)\s*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            url = match.group(1).strip().rstrip(".,)")
+            if url:
+                return {"url": url, "verified": True}
+    return None
+
+
 def _stringify_error_detail(detail: Any) -> str:
     if isinstance(detail, str):
         return detail.strip()
@@ -364,6 +390,234 @@ def _db_update(job_id: str, patch: dict[str, Any]) -> None:
             except APIError as exc2:
                 logger.warning("jobs UPDATE failed (fallback, job=%s): %s", job_id, exc2)
         logger.warning("jobs UPDATE failed (job=%s): %s", job_id, exc)
+
+
+def _parse_clarification_answer(answer_text: str, fields: list[str | None]) -> dict[str, str]:
+    """Parse a user clarification reply into per-field values.
+
+    Supports multi-question turns where the user replies with
+    ``field=value, field2=value2`` (or ``field: value`` / ``field = value``).
+    Free-text or single-value replies return an empty map so the caller applies
+    the whole text to every asked field.  Matching is case-insensitive on the
+    field name.  Unmatched trailing text is ignored to stay non-destructive.
+    """
+    if not answer_text or not fields:
+        return {}
+    text = answer_text.strip()
+    # Quick reject: needs at least one "field=" or "field:" pattern.
+    if not re.search(r"\S+\s*[:=]\s*\S", text):
+        return {}
+
+    result: dict[str, str] = {}
+    lower_to_field: dict[str, str] = {}
+    for f in fields:
+        if f:
+            lower_to_field[f.strip().lower()] = f
+
+    # Split on commas / newlines. Each part: "name = value" or "name: value".
+    for part in re.split(r",|\n", text):
+        m = re.match(r"\s*([A-Za-z0-9_.\-]+)\s*[:=]\s*(.+?)\s*$", part)
+        if not m:
+            continue
+        name = m.group(1).strip().lower()
+        value = m.group(2).strip()
+        # Strip surrounding quotes.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if name in lower_to_field:
+            result[lower_to_field[name]] = value
+    return result
+
+
+async def _apply_clarification_answer_to_spec(job_id: str, *, conversation_id: str) -> None:
+    """Fold the recorded clarification answer back into the persisted spec.
+
+    Bridge 1e (Project Specification Update).  This is the required step between
+    Resume and Capability Detection in the target execution flow.  It reads the
+    user's answer (recorded as an ``answer`` interaction message by
+    ``InteractiveWaitEngine.record_clarification_answer``) and, when the original
+    question targeted a specific ``required_field``, patches the stored
+    ``specification`` so the next stage sees complete information.  It also clears
+    the ``missing_info`` entry that triggered the question and resets
+    ``needs_user_input`` so the adaptive engine does not loop.
+
+    Never mutates a frozen spec — guarded by the existing global
+    ``ensure_frozen_spec_immutable`` path used everywhere else.  On any failure it
+    logs and returns (the pipeline continues; clarification is non-blocking to the
+    overall completion contract per the brief's "continue/pause/request info"
+    rule).
+    """
+    from models.approval import ensure_frozen_spec_immutable
+    from services.interactive_wait import InteractiveWaitEngine
+
+    try:
+        state = await InteractiveWaitEngine.get_state(conversation_id, job_id)
+    except Exception as exc:
+        logger.warning("[clarification-spec] cannot load interaction state: %s", exc)
+        return
+
+    # The most recent "answer" message holds the user's reply.
+    answer_text = ""
+    for msg in reversed(state.messages):
+        if getattr(msg, "message_type", None) == "answer" and getattr(msg, "sender", None) == "user":
+            answer_text = (getattr(msg, "content", "") or "").strip()
+            break
+    if not answer_text:
+        logger.info("[clarification-spec] no answer recorded yet | job=%s", job_id)
+        return
+
+    # Load the stored specification (JSONB column "specification").
+    try:
+        result = (
+            await (await get_supabase_async())
+            .table("jobs")
+            .select("specification", "clarification_session")
+            .eq("id", job_id)
+            .limit(1)
+            .execute()
+        )
+        if not result.data:
+            return
+        row = result.data[0]
+        spec_dict = row.get("specification") or {}
+        if not spec_dict:
+            return
+        ensure_frozen_spec_immutable(spec_dict, context="clarification_spec_update")
+    except Exception as exc:
+        logger.warning("[clarification-spec] cannot load spec: %s", exc)
+        return
+
+    # Fold EVERY asked question back into the spec. The adaptive engine may
+    # raise multiple questions in a single ClarificationSuspendSignal; the
+    # persisted clarification_session carries the full list and the user answers
+    # them (one reply per question, or one combined answer). Processing only
+    # questions[0] silently dropped Q2..Qn — see task. Iterate the whole list.
+    clar = row.get("clarification_session") or {}
+    questions = [q for q in (clar.get("questions") or []) if isinstance(q, dict)]
+    questions = [q for q in questions if q.get("required_field")]
+
+    if not questions:
+        # No structured questions to fold; still clear the pause flags so the
+        # pipeline does not loop on a bare "waiting_for_user".
+        logger.info("[clarification-spec] no required_field in questions | job=%s", job_id)
+    else:
+        # NEW (structured clarification form): prefer the authoritative
+        # structured submission stored on the interaction state.  This removes
+        # ALL free-text parsing from the resume path — one submit folds every
+        # question deterministically.  Legacy free-text replies fall back to the
+        # regex parser below (backward compatible).
+        submission = state.clarification_submission
+        structured_values: dict[str, Any] = {}
+        if submission:
+            for ans in (submission.get("answers") or []):
+                rf = ans.get("required_field") or ""
+                if not rf:
+                    continue
+                val = ans.get("value")
+                if val is None and ans.get("selected_choice") is not None:
+                    val = ans.get("selected_choice")
+                if val is None:
+                    continue
+                # Normalize booleans.
+                if isinstance(val, str) and val.lower() in {"true", "false"}:
+                    val = val.lower() == "true"
+                elif isinstance(val, str) and val.lower() in {"yes", "no"}:
+                    val = val.lower() == "yes"
+                structured_values[rf] = val
+
+        answer_map = _parse_clarification_answer(answer_text, [q.get("required_field") for q in questions])
+
+        answered_fields: list[str] = []
+        for q in questions:
+            field = q.get("required_field")
+            if not field:
+                continue
+            # 1) Structured submission (authoritative, preferred).
+            if field in structured_values:
+                value = structured_values[field]
+            # 2) Legacy free-text "field=value" form (multi-question turn).
+            elif answer_map:
+                value = answer_map.get(field)
+            # 3) Single free-text reply applies to every field — ONLY in the
+            #    legacy path (no structured submission).  When a structured
+            #    submission is present, unanswered fields stay UNANSWERED;
+            #    raw free text is never dumped into them (no information loss,
+            #    no free-text parsing overwrite).
+            elif (not submission) and answer_text:
+                value = answer_text
+            else:
+                value = None
+            # Best-effort, non-destructive: only fill when currently empty/unknown.
+            current = spec_dict.get(field)
+            if value not in (None, "", "UNKNOWN", "unknown"):
+                spec_dict[field] = value
+                updated = True
+                answered_fields.append(field)
+
+        # Clear only ANSWERED questions from missing_info (unanswered stay).
+        missing = spec_dict.get("missing_info") or []
+        if isinstance(missing, list):
+            remaining = [m for m in missing if m not in answered_fields]
+            if len(remaining) != len(missing):
+                spec_dict["missing_info"] = remaining
+                updated = True
+
+    # Recalculate needs_user_input from the (possibly reduced) missing_info set
+    # so the adaptive engine does not re-ask already-answered fields, and so any
+    # still-unanswered field keeps the job in clarification.
+    final_missing = spec_dict.get("missing_info") or []
+    recomputed_needs = bool(final_missing)
+    if bool(spec_dict.get("needs_user_input")) != recomputed_needs:
+        spec_dict["needs_user_input"] = recomputed_needs
+        updated = True
+    if spec_dict.get("readiness") == "Blocked" and not final_missing:
+        spec_dict["readiness"] = "Ready"
+        updated = True
+
+    if updated:
+        _db_update(job_id, {"specification": spec_dict})
+        logger.info(
+            "[clarification-spec] spec updated from answer | job=%s | fields=%s",
+            job_id, answered_fields,
+        )
+    else:
+        logger.info("[clarification-spec] no spec delta applied | job=%s", job_id)
+
+
+async def _build_implementation_report(
+    *,
+    objective: str,
+    spec: Any | None = None,
+    server_id: str | None = None,
+    user_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Build the Implementation Intelligence report for the planner.
+
+    Bridge 2 — connects Capability Detection → Template Discovery → Compatibility
+    Ranking → Strategy Resolution to the planning stage.  Reuses the existing
+    ``ImplementationIntelligence.decide_strategy`` entry point, which performs
+    the full fallback chain (exact template → compatible → hybrid → full AI) using
+    REAL server capabilities (capability detection is never bypassed).  Returns a
+    plain dict (the ImplementationReport.to_dict() shape) or ``None`` on any
+    failure so the planner gracefully falls back to its legacy template hint.
+    """
+    try:
+        from services.implementation_intelligence import ImplementationIntelligence
+
+        report = await ImplementationIntelligence.decide_strategy(
+            objective,
+            specification=spec,
+            server_id=server_id,
+            user_id=user_id,
+        )
+        return report.to_dict()
+    except Exception as exc:
+        logger.warning(
+            "[impl-intel] report build failed (planner will use legacy hint): %s",
+            exc,
+            exc_info=True,
+        )
+        return None
 
 
 _memory_store = MemoryStore()
@@ -709,12 +963,18 @@ async def _run_code_execution(
     else:
         workspace_name = _workspace_name_from_objective(payload.objective)
         try:
-            workspace = await WorkspaceService.resolve_workspace(user_id=user_id, server_id=payload.server_id, name=workspace_name)
+            workspace = await WorkspaceService.resolve_workspace(
+                user_id=user_id, server_id=payload.server_id, name=workspace_name,
+                display_name=payload.display_name or payload.objective,
+            )
         except Exception:
             workspace = None
 
     if workspace is None:
-        workspace = await WorkspaceService.create_workspace_from_prompt(user_id=user_id, server_id=payload.server_id, user_input=payload.objective)
+        workspace = await WorkspaceService.create_workspace_from_prompt(
+            user_id=user_id, server_id=payload.server_id, user_input=payload.objective,
+            display_name=payload.display_name or payload.objective,
+        )
 
     workspace_id = str(workspace.get("id") or "")
     payload.workspace_id = workspace_id or None
@@ -774,6 +1034,8 @@ async def _run_code_execution(
             objective=payload.objective or "",
             specification=project_spec if "project_spec" in dir() else None,
             model=payload.model if hasattr(payload, "model") else None,
+            server_id=payload.server_id,
+            user_id=user_id,
         )
         if intel_report is not None:
             intel_report_dict = intel_report.to_dict()
@@ -1011,6 +1273,19 @@ async def _run_code_execution(
         if isinstance(result, dict):
             result["trace_id"] = trace_id
             result["total_time"] = max(0.0, time.perf_counter() - overall_t0)
+            # Enrich with structured execution metadata so the final response
+            # layer (ExecutionResultProjector) has a single source of truth.
+            # These fields are internal business results, never progress events.
+            if rendered_files:
+                result["created_files"] = sorted(rendered_files.keys())
+            if strategy:
+                result["strategy"] = strategy
+            if intel_report_dict:
+                result["template_name"] = intel_report_dict.get("template_name")
+                result["template_summary"] = intel_report_dict.get("template_summary")
+            if workspace:
+                result["workspace_display_name"] = workspace.get("display_name") or workspace.get("name") or ""
+                result["workspace_slug"] = workspace.get("slug") or ""
         return result
 
     logger.info("[template] no_match | fallback_llm=true | job=%s", job_id)
@@ -1032,6 +1307,7 @@ async def _run_code_execution(
         task=payload.objective,
         server=server,
         workspace_path=workspace_path,
+        display_name=workspace.get("display_name") if isinstance(workspace, dict) else None,
     )
     logger.info(
         "[context] mode=%s | selected_files=%s | job=%s",
@@ -1291,6 +1567,7 @@ def _row_to_response(row: dict[str, Any]) -> JobResponse:
         errors=[],
         retries=[],
         summary=_extract_message_from_json_summary(str(row.get("summary") or "")) or str(row.get("summary") or ""),
+        clarification=row.get("clarification_session"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -1354,7 +1631,7 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     try:
         from core.database import get_supabase
         result = (
-            get_supabase()
+            await (await get_supabase_async())
             .table("jobs")
             .select("status", "execution_cursor", "interaction_state", "spec", "plan")
             .eq("id", job_id)
@@ -1377,6 +1654,22 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
                 # (run_tool_calling_loop() will be called with pending_steps)
                 # SKIP re-discovery and re-planning
                 payload._resume_bundle = resume_bundle  # type: ignore[attr-defined]
+
+                # ------------------------------------------------------------------
+                # Bridge 1e — Project Specification Update on Resume
+                # ------------------------------------------------------------------
+                # When resuming from a clarification wait, the user's answer was
+                # recorded into the JobInteractionState by
+                # InteractiveWaitEngine.record_clarification_answer (called from
+                # EventWaitEngine.await_clarification_reply).  We fold that answer
+                # back into the persisted specification so the next stage runs
+                # with complete information — exactly the "Project Specification
+                # Update" step of the target flow (never a restart, never a
+                # re-discovery; the answer is the only delta).
+                await _apply_clarification_answer_to_spec(
+                    job_id,
+                    conversation_id=payload.conversation_id or job_id,
+                )
     except Exception as exc:
         logger.warning("[resume] failed to check resume state: %s", exc)
     # ------------------------------------------------------------------
@@ -1418,6 +1711,33 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     logger.info("Execution forced: allow_write=True")
 
     # ------------------------------------------------------------------
+    # Intent detection + Conversation History
+    # ------------------------------------------------------------------
+    conversation_history: list[dict[str, str]] = []
+    if payload.workspace_id:
+        try:
+            conversation_history = ChatService.get_recent_context_messages(
+                workspace_id=payload.workspace_id,
+                user_id=user_id,
+                limit=20,
+                current_input=payload.objective,
+            )
+        except Exception:
+            conversation_history = []
+
+    intent = (await agent_llm.classify_intent(user_input=payload.objective, conversation_history=conversation_history)).strip().lower()
+    if intent not in {"chat", "code", "server"}:
+        intent = "code"
+    deployment_intent = bool(re.search(r"\b(deploy|server|app|run|website)\b", payload.objective or "", re.IGNORECASE))
+    if deployment_intent:
+        intent = "server"
+    if intent == "server" and not deployment_intent:
+        lowered_obj = (payload.objective or "").lower()
+        if re.search(r"\b(telegram|bot|yoz|kod|code|python|script|program|programma)\b", lowered_obj):
+            intent = "code"
+    logger.info("[router] input=%r | detected_intent=%s", (payload.objective or "")[:500], intent)
+
+    # ------------------------------------------------------------------
     # Requirement Discovery Engine (Sprint 2)
     # -------------------------------------
     # Run BEFORE intent classification and planning so the LLM has a
@@ -1431,8 +1751,8 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     # ------------------------------------------------------------------
     project_spec: ProjectSpecification | None = None
     try:
+        from models.agent import ProjectSpecification
         from services.requirement_discovery import (
-            ProjectSpecification,
             run_discovery,
             should_run_discovery,
         )
@@ -1454,7 +1774,7 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
                     "specification": project_spec.model_dump(mode="json"),
                 })
                 logger.info(
-                    "[discovery] spec_complete | job=%s | confidence=%.2f | missing=%d",
+                    "[discovery] spec_complete | job=%s | confidence=%s | missing=%d",
                     job_id,
                     project_spec.confidence,
                     len(project_spec.missing_info),
@@ -1462,6 +1782,107 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     except Exception as exc:
         logger.warning("[discovery] engine failed (non-critical): %s", exc, exc_info=True)
         project_spec = None
+
+    # ------------------------------------------------------------------
+    # Bridge 1 — Missing Information Detection → Adaptive Clarification
+    # ------------------------------------------------------------------
+    # run_discovery() above already populates project_spec.missing_info and
+    # project_spec.confidence.  This bridge CONNECTS that output to the
+    # AdaptiveClarificationEngine (which was previously never invoked by the
+    # pipeline) and, when the engine decides it must ASK, raises
+    # ClarificationSuspendSignal so the job parks on the event bus exactly like
+    # the approval flow.  On resume the pipeline re-enters here and updates the
+    # specification with the recorded answer (Bridge 1e).
+    #
+    # Skip re-asking if we are resuming from a prior clarification turn: the
+    # answer has already been folded into the spec by the resume handler below.
+    _clarification_turn = 1
+    try:
+        from models.agent import ClarificationSuspendSignal  # local import (avoid cycles)
+        from services.adaptive_clarification import AdaptiveClarificationEngine
+
+        conversation_id = payload.conversation_id or job_id
+        # Detect an in-progress clarification resume by inspecting the
+        # interaction state; if we just recorded an answer we bump the turn.
+        _existing_state = await InteractiveWaitEngine.get_state(
+            conversation_id, job_id,
+        )
+        if _existing_state.current_state == JobState.WAITING_FOR_USER:
+            # A prior clarification suspended us; the resume handler will have
+            # transitioned us, but defensively keep us from re-asking the same
+            # question by reading prior questions from the interaction thread.
+            _clarification_turn = 2
+
+        if project_spec is not None:
+            _decision = await AdaptiveClarificationEngine.evaluate(
+                objective=payload.objective,
+                intent="server" if intent == "server" else "code",
+                conversation_id=conversation_id,
+                conversation_history=conversation_history,
+                spec=project_spec,
+                turn=_clarification_turn,
+            )
+            if _decision.action.value == "ask" and _decision.questions:
+                # Publish the actual question(s) so the frontend is never left
+                # with a bare "waiting_for_user" (Frontend Synchronization rule).
+                _q_payloads = [q.model_dump(mode="json") for q in _decision.questions]
+
+                # NEW (structured clarification form): translate the adaptive
+                # engine's ClarificationQuestion list into a single generic
+                # ClarificationForm.  The frontend renders this form; it no
+                # longer parses free text.  The free-text path is retained for
+                # backward compatibility (legacy clients / Telegram bridge may
+                # still send unstructured replies).
+                from models.clarification_form import ClarificationForm
+
+                _form = ClarificationForm.from_questions(
+                    _decision.questions,
+                    title="Clarification Required",
+                    description=(
+                        "Please answer the questions below so the agent can "
+                        "continue. All answers are submitted at once."
+                    ),
+                    metadata={
+                        "turn": _clarification_turn,
+                        "objective": payload.objective,
+                    },
+                )
+                _form_payload = _form.model_dump(mode="json")
+
+                _db_update(job_id, {
+                    "status": JobStatus.WAITING_FOR_USER.value,
+                    "clarification_session": {
+                        "job_id": job_id,
+                        "conversation_id": conversation_id,
+                        "questions": _q_payloads,
+                        "turn": _clarification_turn,
+                    },
+                    "clarification_form": _form_payload,
+                })
+                await _publish(job_id, {
+                    "type": "waiting_for_clarification",
+                    "step": 0,
+                    "status": JobStatus.WAITING_FOR_USER.value,
+                    "questions": _q_payloads,
+                    "clarification_form": _form_payload,
+                    "turn": _clarification_turn,
+                })
+                # Park the job on the event bus (mirrors ApprovalSuspendSignal).
+                raise ClarificationSuspendSignal(
+                    job_id, questions=_decision.questions, resume_point=0,
+                )
+            # SAFE_ASSUME / CONTINUE → execution continues automatically.
+            logger.info(
+                "[clarification] decision=%s | turn=%s | completeness=%.2f | job=%s",
+                _decision.action.value, _clarification_turn,
+                _decision.completeness_score, job_id,
+            )
+    except ClarificationSuspendSignal:
+        raise  # re-raised to the suspend handler below
+    except Exception as exc:
+        logger.warning(
+            "[clarification] engine failed (non-critical): %s", exc, exc_info=True,
+        )
 
     try:
         server = ServerService.get_server(server_id=payload.server_id, user_id=user_id)
@@ -1499,33 +1920,11 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
 
     logger.info("[router] job=%s | allow_write=%s | workspace_id=%s", job_id, allow_write, payload.workspace_id)
 
-    conversation_history: list[dict[str, str]] = []
-    if payload.workspace_id:
-        try:
-            conversation_history = ChatService.get_recent_context_messages(
-                workspace_id=payload.workspace_id,
-                user_id=user_id,
-                limit=20,
-                current_input=payload.objective,
-            )
-        except Exception:
-            conversation_history = []
-
     accumulated_steps: list[dict[str, Any]] = []
     accumulated_decisions: list[dict[str, Any]] = []
 
     memory: list[dict[str, Any]] = await _memory_store.load(user_id=user_id, workspace_id=payload.workspace_id)
 
-    intent = (await agent_llm.classify_intent(user_input=payload.objective, conversation_history=conversation_history)).strip().lower()
-    if intent not in {"chat", "code", "server"}:
-        intent = "code"
-    deployment_intent = bool(re.search(r"\b(deploy|server|app|run|website)\b", payload.objective or "", re.IGNORECASE))
-    if deployment_intent:
-        intent = "server"
-    if intent == "server" and not deployment_intent:
-        lowered_obj = (payload.objective or "").lower()
-        if re.search(r"\b(telegram|bot|yoz|kod|code|python|script|program|programma)\b", lowered_obj):
-            intent = "code"
     logger.info("[router] input=%r | detected_intent=%s", (payload.objective or "")[:500], intent)
     try:
         constitution_engine.check_job_state(job_id, JobStatus.RUNNING.value, has_active_execution=bool(intent))
@@ -1574,6 +1973,72 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             "trace_id": trace_id,
         },
     )
+
+    # ------------------------------------------------------------------
+    # Sprint 4C/4D/4E: Decision Engine — SHADOW / WEIGHTED / AUTHORITATIVE
+    # ------------------------------------------------------------------
+    # Via settings.decision_engine_mode:
+    #   "off"           -> skipped entirely (default; current production behavior).
+    #   "shadow"        -> compute a decision + record MATCH/MISMATCH (4C).
+    #   "weighted"      -> compute a weighted RECOMMENDATION + classify/stats (4D).
+    #   "authoritative" -> Decision Engine SELECTS the route; legacy validates it;
+    #                      `intent` is reassigned to the validated effective route
+    #                      so the SAME downstream branches dispatch on it (4E).
+    # Security gates downstream (permission/write-gate/approval/ownership) run
+    # regardless of route and are never bypassed. Authoritative routing can never
+    # escalate privilege beyond the legacy intent (see decision_router veto).
+    # In every mode this block never raises into the pipeline.
+    _decision_mode = getattr(settings, "decision_engine_mode", "off")
+    if _decision_mode in ("shadow", "weighted", "authoritative"):
+        try:
+            from services.agent_decision_engine import DecisionState
+
+            _decision_state = DecisionState(
+                objective=payload.objective or "",
+                intent=intent,
+                task_mode=task_mode,
+                has_specification=project_spec is not None,
+                specification_confidence=(
+                    project_spec.confidence if project_spec is not None else None
+                ),
+                specification_missing_info=(
+                    len(project_spec.missing_info) if project_spec is not None else 0
+                ),
+                conversation_len=len(conversation_history),
+                memory_len=len(memory),
+                has_history=bool(conversation_history),
+                has_workspace=bool(payload.workspace_id),
+                existing_workspace=bool(payload.workspace_id),
+                has_server=server is not None,
+                deployment_signal=deployment_intent,
+                is_resume=getattr(payload, "_resume_bundle", None) is not None,
+                current_status=JobStatus.RUNNING.value,
+            )
+            if _decision_mode == "authoritative":
+                from services.decision_router import resolve_route
+
+                _route = resolve_route(
+                    job_id=job_id, trace_id=trace_id, state=_decision_state
+                )
+                # Decision Engine is now the routing authority: the validated
+                # effective route (never exceeding legacy privilege) becomes the
+                # intent the downstream branches dispatch on. Intent is retained
+                # only as the signal that fed the decision.
+                intent = _route.execution_kind
+            elif _decision_mode == "weighted":
+                from services.decision_weighted import record_weighted_recommendation
+
+                record_weighted_recommendation(
+                    job_id=job_id, trace_id=trace_id, state=_decision_state
+                )
+            else:
+                from services.decision_shadow import record_shadow_comparison
+
+                record_shadow_comparison(
+                    job_id=job_id, trace_id=trace_id, state=_decision_state
+                )
+        except Exception as _decision_exc:  # noqa: BLE001 — must never break prod
+            logger.warning("[decision_engine] hook skipped (non-fatal): %s", _decision_exc)
 
     if intent == "code":
         try:
@@ -1640,40 +2105,117 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             success = True
         final_status = JobStatus.COMPLETED.value if success else JobStatus.FAILED.value
         workspace_url: str | None = None
+        workspace_row: dict[str, Any] = {}
         if payload.workspace_id:
             try:
-                ws = WorkspaceService.get_workspace_by_id(id=payload.workspace_id, user_id=user_id)
-                workspace_url = str(ws.get("url") or "") or (f"https://{ws.get('domain')}" if ws.get("domain") else None)
+                workspace_row = WorkspaceService.get_workspace_by_id(id=payload.workspace_id, user_id=user_id)
+                workspace_url = str(workspace_row.get("url") or "") or (
+                    f"https://{workspace_row.get('domain')}" if workspace_row.get("domain") else None
+                )
             except Exception:
                 workspace_url = None
 
-        if success:
-            if isinstance(result, dict) and result.get("type") == "patch":
-                patched_files = result.get("files") or []
-                if patched_files:
-                    summary = f"Updated files: {', '.join(patched_files)}"
-                else:
-                    summary = "Code updated successfully."
-            else:
-                steps_evidence = result.get("steps") or [] if isinstance(result, dict) else []
-                if workspace_url and _deployment_verified_from_steps(steps_evidence):
-                    summary = f"All set. Open: {workspace_url}"
-                    logger.info("[agent] deployment_url_verified | url=%s | job=%s", workspace_url, job_id)
-                else:
-                    summary = _clean_user_summary(
-                        str(result.get("summary") or result.get("message") or "") if isinstance(result, dict) else "",
-                        fallback="All set.",
-                    )
-        else:
-            summary = _result_to_error_string(result)
+        # Single source of truth: project the internal execution result into a
+        # structured ExecutionResult. No more "All set." fallback — the final
+        # response, conversation history, and ContextEngine all read this.
+        execution_result = ExecutionResultProjector.project(
+            result if isinstance(result, dict) else {},
+            workspace=workspace_row,
+            objective=payload.objective,
+            workspace_url=workspace_url,
+        )
+        summary = execution_result.summary
 
         _db_update(job_id, {"status": final_status, "summary": summary})
         if payload.workspace_id:
             try:
-                ChatService.save_workspace_message(workspace_id=payload.workspace_id, user_id=user_id, role="assistant", content=summary)
+                # Store the STRUCTURED completion summary in chat history so
+                # future turns know what was accomplished (never "All set.").
+                ChatService.save_workspace_message(
+                    workspace_id=payload.workspace_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=ExecutionResultProjector.build_conversation_summary(execution_result),
+                )
             except Exception:
                 logger.warning("Failed to persist assistant message for job=%s", job_id)
         await _publish(job_id, {"type": "completed", "status": final_status, "success": success, "summary": summary, "step": 0, "tool": None})
+        return
+
+    if intent == "chat":
+        # ------------------------------------------------------------------
+        # Sprint 4F-1: Chat execution branch inside the unified orchestration.
+        # Reuses the existing conversation implementation (agent_llm.generate_chat_response)
+        # and chat persistence (ChatService). Discovery already ran above; NO planning and
+        # NO server execution are performed. This branch returns BEFORE build_plan()/
+        # run_server_execution(), so a chat intent can never reach the server executor.
+        # Clarification is intentionally not invoked here: the existing reusable chat
+        # pipeline (run_explicit_mode "plan" path) does not require clarification for
+        # conversational intents, i.e. "when required" == not required.
+        # ------------------------------------------------------------------
+        if payload.workspace_id:
+            try:
+                ChatService.save_workspace_message(
+                    workspace_id=payload.workspace_id, user_id=user_id, role="user",
+                    content=payload.objective,
+                )
+            except Exception:
+                logger.warning("Failed to persist user message for job=%s", job_id)
+        chat_message = await agent_llm.generate_chat_response(
+            user_input=payload.objective, conversation_history=conversation_history,
+        )
+        if not chat_message:
+            chat_message = "I'm not sure how to respond to that."
+
+        # Build a minimal result dict to project through ExecutionResult
+        # for consistent structured summaries and conversation context.
+        chat_result = {
+            "success": True,
+            "summary": chat_message,
+        }
+
+        workspace_url: str | None = None
+        workspace_row: dict[str, Any] = {}
+        if payload.workspace_id:
+            try:
+                workspace_row = WorkspaceService.get_workspace_by_id(
+                    id=payload.workspace_id, user_id=user_id
+                )
+                workspace_url = str(workspace_row.get("url") or "") or (
+                    f"https://{workspace_row.get('domain')}" if workspace_row.get("domain") else None
+                )
+            except Exception:
+                workspace_url = None
+
+        execution_result = ExecutionResultProjector.project(
+            chat_result,
+            workspace=workspace_row,
+            objective=payload.objective,
+            workspace_url=workspace_url,
+        )
+
+        # Save the structured conversation summary for future context.
+        if payload.workspace_id:
+            try:
+                ChatService.save_workspace_message(
+                    workspace_id=payload.workspace_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=ExecutionResultProjector.build_conversation_summary(execution_result),
+                )
+            except Exception:
+                logger.warning("Failed to persist assistant message for job=%s", job_id)
+
+        summary = execution_result.summary
+        _db_update(job_id, {"status": JobStatus.COMPLETED.value, "summary": summary})
+        obs.emit(
+            level="INFO", layer="router", message="chat_execution_complete",
+            trace_id=trace_id, meta={"job_id": job_id, "intent": intent},
+        )
+        await _publish(
+            job_id, {"type": "completed", "status": JobStatus.COMPLETED.value,
+                     "success": True, "summary": summary, "step": 0, "tool": "chat"},
+        )
         return
 
     if intent == "server" and payload.workspace_id:
@@ -1690,7 +2232,8 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
     preplanned_workspace_context: Any = None
     if intent == "server" and payload.workspace_id:
         try:
-            from services.server_service import WorkspaceContext, load_workspace_context
+            from services.server_service import WorkspaceContext
+            from services.capability_service import load_workspace_context
             _ws_for_plan = WorkspaceService.get_workspace_by_id(id=payload.workspace_id, user_id=user_id)
             capabilities_for_plan = await detect_capabilities(server)
             preplanned_workspace_context = await load_workspace_context(
@@ -1713,7 +2256,19 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
         memory=memory,
         workspace_context=preplanned_workspace_context,
         project_spec=project_spec,
-        implementation_report=intel_report_dict,  # Sprint 3C.B
+        # Bridge 2 — feed the Implementation Intelligence report into the planner.
+        # The report is produced from REAL server capabilities (never bypassed)
+        # and lets the planner prefer an exact/compatible template, hybrid, or
+        # full generation instead of guessing.  Computed here so both the local
+        # and server execution paths benefit (the server path also recomputes it
+        # inside _run_code_execution, which is harmless and keeps that path
+        # self-contained).
+        implementation_report=await _build_implementation_report(
+            objective=payload.objective,
+            spec=project_spec,
+            server_id=payload.server_id,
+            user_id=user_id,
+        ),
     )
     planned_task_mode = str(plan_bundle.get("task_mode") or task_mode)
     planned_plan = plan_bundle.get("plan") or []
@@ -1984,6 +2539,100 @@ async def run_agent_pipeline(*, job_id: str, payload: JobCreate, user_id: str, t
             on_decision=on_decision,
         )
         logger.info("[agent] server_execution_result | job=%s | success=%s | summary=%s | errors=%s", job_id, loop_result.success, loop_result.summary, loop_result.errors)
+    except ApprovalSuspendSignal as suspend:
+        # ------------------------------------------------------------------
+        # EVENT-DRIVEN WAIT (Sprint 3C.C)
+        # on_step_start() already:
+        #   - persisted the ExecutionCursor (ResumeManager)
+        #   - persisted interaction state + set job status to
+        #     WAITING_FOR_USER (InteractiveWaitEngine.pause)
+        # Here we register the job on the event bus, arm the configurable
+        # timeout, and spawn the resume-waiter task.  We then RETURN, which
+        # releases the worker.  The job is NOT marked failed and NOT polled;
+        # it wakes ONLY when a resolver (user reply / approval decision /
+        # explicit resume / timeout) calls EventWaitEngine.signal(...).
+        # ------------------------------------------------------------------
+        from core.config import get_settings as _cfg
+        from services.event_wait_engine import EventWaitEngine
+
+        conversation_id = payload.conversation_id or job_id
+        timeout_seconds = int(getattr(_cfg(), "WAIT_TIMEOUT_SECONDS", 1800))
+        EventWaitEngine.register(
+            job_id,
+            conversation_id,
+            timeout_seconds=timeout_seconds,
+        )
+        # Spawn the event-driven continuation driver.  It parks on the bus
+        # and re-dispatches execution (via the existing run_job pipeline)
+        # when a valid system event arrives.  Running as a detached task
+        # keeps the worker free while we wait.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                EventWaitEngine.await_and_resume(
+                    job_id=job_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    timeout_seconds=timeout_seconds,
+                    trace_id=trace_id or job_id,
+                )
+            )
+        except RuntimeError:
+            logger.warning(
+                "[event-wait] no running loop to spawn resume-waiter | job=%s",
+                job_id,
+            )
+        logger.info(
+            "[event-wait] job %s suspended for approval; parked on event bus | approval=%s",
+            job_id,
+            getattr(suspend, "approval_id", None),
+        )
+        return
+    except ClarificationSuspendSignal as csuspend:
+        # ------------------------------------------------------------------
+        # Bridge 1d — Clarification Suspend (mirrors ApprovalSuspendSignal)
+        # ------------------------------------------------------------------
+        # The adaptive clarification bridge raised this after publishing the
+        # actual question to the frontend (see Bridge 1c).  Here we park the job
+        # on the event bus and spawn the clarification continuation driver,
+        # which reuses the SAME reliability layer as approval/resume.  The job
+        # wakes ONLY when a CLARIFICATION_REPLY / USER_REPLY / RESUME_REQUEST
+        # arrives; the driver records the answer and re-enters run_job, which
+        # re-runs the adaptive decision with the new context (multi-turn, never
+        # a restart).
+        from core.config import get_settings as _cfg
+        from services.event_wait_engine import EventWaitEngine
+
+        conversation_id = payload.conversation_id or job_id
+        timeout_seconds = int(getattr(_cfg(), "WAIT_TIMEOUT_SECONDS", 1800))
+        EventWaitEngine.register(
+            job_id,
+            conversation_id,
+            timeout_seconds=timeout_seconds,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                EventWaitEngine.await_clarification_reply(
+                    job_id=job_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    timeout_seconds=timeout_seconds,
+                    turn=getattr(csuspend, "resume_point", 0) or 1,
+                    trace_id=trace_id or job_id,
+                )
+            )
+        except RuntimeError:
+            logger.warning(
+                "[event-wait] no running loop to spawn clarification-waiter | job=%s",
+                job_id,
+            )
+        logger.info(
+            "[event-wait] job %s suspended for clarification; parked on event bus | questions=%d",
+            job_id,
+            len(getattr(csuspend, "questions", []) or []),
+        )
+        return
     except HTTPException as exc:
         obs.emit(
             level="ERROR",
@@ -2137,7 +2786,7 @@ class AgentService:
             "server_id": payload.server_id,
             "objective": payload.objective,
             "status": JobStatus.QUEUED.value,
-            "allow_write": bool(allow_write),
+            "allow_write": bool(payload.allow_write),
             "dry_run": payload.dry_run,
             "intent": "code",
             "task_mode": "simple",
@@ -2375,25 +3024,24 @@ class AgentService:
 
             success = bool(result.get("success")) if isinstance(result, dict) else False
             workspace_url: str | None = None
+            workspace_row: dict[str, Any] = {}
             if payload.workspace_id:
                 try:
-                    ws = WorkspaceService.get_workspace_by_id(id=payload.workspace_id, user_id=user_id)
-                    workspace_url = str(ws.get("url") or "") or (f"https://{ws.get('domain')}" if ws.get("domain") else None)
+                    workspace_row = WorkspaceService.get_workspace_by_id(id=payload.workspace_id, user_id=user_id)
+                    workspace_url = str(workspace_row.get("url") or "") or (
+                        f"https://{workspace_row.get('domain')}" if workspace_row.get("domain") else None
+                    )
                 except Exception:
                     workspace_url = None
 
-            if success:
-                steps_evidence = result.get("steps") or [] if isinstance(result, dict) else []
-                if workspace_url and _deployment_verified_from_steps(steps_evidence):
-                    message = f"All set. Open: {workspace_url}"
-                    logger.info("[agent] deployment_url_verified | url=%s | job=%s", workspace_url, job_id)
-                else:
-                    message = _clean_user_summary(
-                        str(result.get("summary") or result.get("message") or "") if isinstance(result, dict) else "",
-                        fallback="All set.",
-                    )
-            else:
-                message = _result_to_error_string(result)
+            # Single source of truth: project into a structured ExecutionResult.
+            execution_result = ExecutionResultProjector.project(
+                result if isinstance(result, dict) else {},
+                workspace=workspace_row,
+                objective=payload.objective,
+                workspace_url=workspace_url,
+            )
+            message = execution_result.summary
             final_status = JobStatus.COMPLETED.value if success else JobStatus.FAILED.value
             _db_update(job_id, {"status": final_status, "summary": message})
             obs.METRICS.record_request(success=success, execution_time_seconds=0.0)
@@ -2407,6 +3055,7 @@ def to_forge_v2_response(job: JobResponse) -> dict[str, Any]:
     raw_summary = job.summary or ""
     extracted = _extract_message_from_json_summary(raw_summary) or raw_summary
     safe_summary = extracted.strip() or _GENERIC_FAILURE_MESSAGE
+    deployment = _extract_deployment_from_summary(raw_summary)
     run: dict[str, Any] | None = {
         "agent": AgentTier.FORGE_V2.value,
         "job_id": job.id,
@@ -2424,6 +3073,8 @@ def to_forge_v2_response(job: JobResponse) -> dict[str, Any]:
         run = None
     elif status_value == JobStatus.FAILED.value:
         error = safe_summary
+    elif deployment is not None:
+        run["deployment"] = deployment
 
     return {
         "job_id": job.id,

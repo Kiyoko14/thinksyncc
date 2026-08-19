@@ -75,6 +75,7 @@ from models.agent import (
     ReplayMetrics,
     RequirementConflict,
     RequirementEvent,
+    RequirementResolutionEngine,
     RequirementSnapshot,
     ResolutionPolicy,
     SnapshotCheckpoint,
@@ -114,11 +115,11 @@ class RequirementEventStore:
     @classmethod
     async def append(cls, conversation_id: str, event: RequirementEvent) -> None:
         """Append ONE immutable event to the store."""
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
         now = datetime.now(timezone.utc).isoformat()
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table(cls.TABLE)
                 .select("requirement_events")
                 .eq("conversation_id", conversation_id)
@@ -129,7 +130,7 @@ class RequirementEventStore:
             if result and result.data:
                 events = result.data.get("requirement_events") or []
             events.append(event.model_dump(mode="json"))
-            get_supabase().table(cls.TABLE).upsert({
+            await (await get_supabase_async()).table(cls.TABLE).upsert({
                 "conversation_id": conversation_id,
                 "requirement_events": events,
                 "updated_at": now,
@@ -146,9 +147,9 @@ class RequirementEventStore:
     async def load_events(cls, conversation_id: str) -> list[RequirementEvent]:
         """Return the full event log (oldest → newest)."""
         try:
-            from core.database import get_supabase
+            from core.database import get_supabase_async
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table(cls.TABLE)
                 .select("requirement_events")
                 .eq("conversation_id", conversation_id)
@@ -173,9 +174,9 @@ class RequirementEventStore:
     @classmethod
     async def load_event_count(cls, conversation_id: str) -> int:
         try:
-            from core.database import get_supabase
+            from core.database import get_supabase_async
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table(cls.TABLE)
                 .select("requirement_events")
                 .eq("conversation_id", conversation_id)
@@ -250,10 +251,10 @@ class SnapshotRepository:
     @classmethod
     async def save_snapshot(cls, conversation_id: str, snapshot: RequirementSnapshot) -> None:
         """Persist the latest snapshot."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
         now = datetime.now(timezone.utc).isoformat()
         try:
-            get_supabase().table(cls.TABLE).upsert({
+            await (await get_supabase_async()).table(cls.TABLE).upsert({
                 "conversation_id": conversation_id,
                 "latest_snapshot": snapshot.model_dump(mode="json"),
                 "updated_at": now,
@@ -265,9 +266,9 @@ class SnapshotRepository:
     @classmethod
     async def load_latest(cls, conversation_id: str) -> RequirementSnapshot | None:
         try:
-            from core.database import get_supabase
+            from core.database import get_supabase_async
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table(cls.TABLE)
                 .select("latest_snapshot")
                 .eq("conversation_id", conversation_id)
@@ -285,9 +286,9 @@ class SnapshotRepository:
     @classmethod
     async def load_version(cls, conversation_id: str, version: int) -> RequirementSnapshot | None:
         try:
-            from core.database import get_supabase
+            from core.database import get_supabase_async
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table(cls.TABLE)
                 .select("spec_versions")
                 .eq("conversation_id", conversation_id)
@@ -311,10 +312,10 @@ class SnapshotRepository:
     @classmethod
     async def save_checkpoint(cls, conversation_id: str, checkpoint: SnapshotCheckpoint) -> None:
         """Persist a snapshot checkpoint."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
         now = datetime.now(timezone.utc).isoformat()
         try:
-            get_supabase().table(cls.TABLE).upsert({
+            await (await get_supabase_async()).table(cls.TABLE).upsert({
                 "conversation_id": conversation_id,
                 "latest_checkpoint": checkpoint.model_dump(mode="json"),
                 "updated_at": now,
@@ -325,9 +326,9 @@ class SnapshotRepository:
     @classmethod
     async def load_checkpoint(cls, conversation_id: str) -> SnapshotCheckpoint | None:
         try:
-            from core.database import get_supabase
+            from core.database import get_supabase_async
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table(cls.TABLE)
                 .select("latest_checkpoint")
                 .eq("conversation_id", conversation_id)
@@ -345,8 +346,8 @@ class SnapshotRepository:
     @classmethod
     async def delete_cache(cls, conversation_id: str) -> None:
         try:
-            from core.database import get_supabase
-            get_supabase().table(cls.TABLE).update({
+            from core.database import get_supabase_async
+            await (await get_supabase_async()).table(cls.TABLE).update({
                 "requirement_events": [],
                 "latest_snapshot": None,
                 "latest_checkpoint": None,
@@ -384,7 +385,15 @@ class RequirementProjectionEngine:
     """
     @classmethod
     def project(cls, context: ProjectionContext) -> tuple[RequirementSnapshot, ReplayMetrics]:
-        """Deterministic projection.  Same context → same snapshot."""
+        """Deterministic projection.  Same context → same snapshot.
+
+        ORCHESTRATOR ONLY. Resolution logic lives in
+        ``RequirementResolutionEngine.resolve`` (single source of truth). This
+        method upcasts events, delegates resolution, then attaches projection
+        provenance and recomputes the hash with the historical formula so the
+        projected snapshot (and its hash) is byte-for-byte identical to before
+        the consolidation.
+        """
         metrics = ReplayMetrics()
         metrics.total_events = len(context.events)
 
@@ -397,181 +406,44 @@ class RequirementProjectionEngine:
         upcasted = EventUpcaster.upcast(context.events)
         metrics.upcast_count = metrics.total_events - len(upcasted)
 
-        # ── Apply resolution policy ─────────────────────────────────────
-        active_events = cls._apply_policy(upcasted, context.policy, metrics)
+        # ── Delegate resolution to the single source of truth ──────────
+        snap = RequirementResolutionEngine.resolve(upcasted, policy=context.policy)
 
-        # ── Build snapshot fields ─────────────────────────────────────
-        newest = active_events[-1] if active_events else upcasted[-1]
+        # ── Carry conversation-derived fields from the projection ctx ──
+        newest = upcasted[-1]
         context.intent = newest.intent
         context.resolved_text = newest.payload.get("requirement_text", "")
-
-        # Merge components (newest wins per component_type under NEWEST_WINS)
-        comp_map: dict[str, DynamicComponent] = {}
-        for ev in active_events:
-            for c_dict in (ev.payload.get("components") or []):
-                ct = c_dict.get("component_type", "UNKNOWN")
-                if ct not in comp_map:
-                    comp_map[ct] = DynamicComponent(
-                        id=f"{ct}-{len(comp_map) + 1}",
-                        component_type=ct,
-                        framework=c_dict.get("framework", "UNKNOWN"),
-                        language=c_dict.get("language", "UNKNOWN"),
-                        notes=c_dict.get("notes", ""),
-                    )
-                else:
-                    # Newest wins: update framework/language if not UNKNOWN
-                    new_fw = c_dict.get("framework", "UNKNOWN")
-                    if new_fw != "UNKNOWN":
-                        comp_map[ct].framework = new_fw
-                    new_lang = c_dict.get("language", "UNKNOWN")
-                    if new_lang != "UNKNOWN":
-                        comp_map[ct].language = new_lang
-
-        active_components = list(comp_map.values())
-
-        # ── Compute unknowns + assumptions ───────────────────────────
-        unknowns = cls._compute_unknowns(active_components)
-        assumptions = cls._compute_assumptions(active_components)
-
-        # ── Detect conflicts ─────────────────────────────────────────
-        conflicts = cls._detect_conflicts(active_events, metrics)
-
-        # ── Assemble snapshot ───────────────────────────────────────
-        snap = RequirementSnapshot(
-            snapshot_id=str(uuid.uuid4()),
-            source_events=[e.event_id for e in context.events],
-            requirement_text=context.resolved_text,
-            intent=context.intent,
-            components=active_components,
-            assumptions=assumptions,
-            conflicts=conflicts,
-            event_count=len(context.events),
-            revision_count=len(context.events),
-        )
-        snap.hash = cls._snapshot_hash(snap)
-        snap.integrity_status = "valid"
+        snap.intent = context.intent
+        snap.requirement_text = context.resolved_text
+        snap.source_events = [e.event_id for e in context.events]
+        snap.event_count = len(context.events)
+        snap.revision_count = len(context.events)
 
         # ── Provenance (Objective 7) ───────────────────────────────
+        snap.snapshot_id = str(uuid.uuid4())
         snap.projection_id = str(uuid.uuid4())
         snap.projection_timestamp = datetime.now(timezone.utc)
         snap.source_event_count = len(context.events)
         snap.projection_version = 1
-        snap.projection_hash = snap.hash
         snap.policy = context.policy
+
+        # ── Recompute hash with the historical projection formula ─────
+        # (resolve() already set a hash, but provenance fields must be part
+        # of the canonical hash so the projected output stays unchanged.)
+        snap.hash = cls._snapshot_hash(snap)
+        snap.projection_hash = snap.hash
+        snap.integrity_status = "valid"
+
+        # Preserve metrics.conflict_count (was set by the removed
+        # _detect_conflicts helper; now derived from the resolved snapshot).
+        metrics.conflict_count = len(snap.conflicts)
 
         return snap, metrics
 
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    # Policy application
+    # Resolution helpers live in RequirementResolutionEngine (single source
+    # of truth). project() only orchestrates (upcast → resolve → provenance).
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-    @classmethod
-    def _apply_policy(
-        cls,
-        events: list[RequirementEvent],
-        policy: ResolutionPolicy,
-        metrics: ReplayMetrics,
-    ) -> list[RequirementEvent]:
-        """Return the list of active (non-superseded) events after applying ``policy``.
-
-        Raises:
-            NotImplementedError: if the policy is defined but not yet implemented.
-        """
-        # ── Always remove superseded events first ───────────────────────
-        superseded: set[str] = set()
-        for ev in events:
-            superseded.update(ev.supersedes)
-        active = [ev for ev in events if ev.event_id not in superseded]
-
-        if policy == ResolutionPolicy.NEWEST_WINS:
-            return active
-
-        if policy == ResolutionPolicy.MERGE:
-            raise NotImplementedError(
-                "ResolutionPolicy.MERGE is not yet implemented. "
-                "Only NEWEST_WINS is currently supported. "
-                "Use NEWEST_WINS or implement MERGE in "
-                "RequirementProjectionEngine._apply_policy()."
-            )
-
-        if policy == ResolutionPolicy.REJECT:
-            raise NotImplementedError(
-                "ResolutionPolicy.REJECT is not yet implemented. "
-                "Only NEWEST_WINS is currently supported. "
-                "Use NEWEST_WINS or implement REJECT in "
-                "RequirementProjectionEngine._apply_policy()."
-            )
-
-        if policy == ResolutionPolicy.PRIORITY_WINS:
-            raise NotImplementedError(
-                "ResolutionPolicy.PRIORITY_WINS is not yet implemented. "
-                "Priority is not yet populated by the Approval System. "
-                "Only NEWEST_WINS is currently supported."
-            )
-
-        if policy == ResolutionPolicy.MANUAL:
-            raise NotImplementedError(
-                "ResolutionPolicy.MANUAL is not yet implemented. "
-                "Only NEWEST_WINS is currently supported. "
-                "Use NEWEST_WINS or implement MANUAL in "
-                "RequirementProjectionEngine._apply_policy()."
-            )
-
-        # Fallback: treat unknown policy as NEWEST_WINS (safe default)
-        logger.warning(
-            "[projection] unknown policy=%s; defaulting to NEWEST_WINS", policy
-        )
-        return active
-
-    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    # Helpers
-    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-    @classmethod
-    def _compute_unknowns(cls, components: list[DynamicComponent]) -> dict[str, UnknownType]:
-        result: dict[str, UnknownType] = {}
-        for c in components:
-            if c.framework == "UNKNOWN":
-                utype = UnknownType.REQUIRED if c.component_type in ("backend", "database") else UnknownType.OPTIONAL
-                result[c.id] = utype
-        return result
-
-    @classmethod
-    def _compute_assumptions(cls, components: list[DynamicComponent]) -> list[Assumption]:
-        assumptions: list[Assumption] = []
-        for c in components:
-            if c.framework == "UNKNOWN":
-                assumptions.append(Assumption(
-                    field=f"{c.component_type}.framework",
-                    value="UNKNOWN",
-                    reason=f"User did not specify {c.component_type} framework.",
-                    confidence=0.0,
-                    priority=AssumptionPriority.CRITICAL,
-                    can_be_confirmed=True,
-                    approval_required=True,
-                ))
-        return assumptions
-
-    @classmethod
-    def _detect_conflicts(cls, events: list[RequirementEvent], metrics: ReplayMetrics) -> list[RequirementConflict]:
-        conflicts: list[RequirementConflict] = []
-        framework_map: dict[str, list[tuple[str, str]]] = {}
-        for ev in events:
-            for c in ((ev.payload or {}).get("components") or []):
-                ct = c.get("component_type", "UNKNOWN")
-                fw = c.get("framework", "UNKNOWN")
-                framework_map.setdefault(ct, []).append((ev.event_id, fw))
-        for ct, entries in framework_map.items():
-            unique = {fw for _, fw in entries if fw != "UNKNOWN"}
-            if len(unique) > 1:
-                conflicts.append(RequirementConflict(
-                    conflict_type="framework",
-                    description=f"Multiple frameworks for '{ct}': {', '.join(unique)}",
-                    conflicting_events=[eid for eid, _ in entries],
-                    conflicting_values=list(unique),
-                ))
-        metrics.conflict_count = len(conflicts)
-        return conflicts
 
     @staticmethod
     def _snapshot_hash(snapshot: RequirementSnapshot) -> str:
@@ -1023,11 +895,11 @@ def _classify_unknowns(arch: DynamicArchitecture) -> dict[str, UnknownType]:
 
 async def _save_spec_version(spec: ProjectSpecification, review: dict, conversation_id: str) -> int:
     """Save spec version (with lineage + projection)."""
-    from core.database import get_supabase
+    from core.database import get_supabase_async
     now = datetime.now(timezone.utc).isoformat()
     try:
         result = (
-            get_supabase().table("project_specifications")
+            await (await get_supabase_async()).table("project_specifications")
             .select("spec_versions", "latest_spec_version")
             .eq("conversation_id", conversation_id)
             .maybe_single().execute()
@@ -1047,7 +919,7 @@ async def _save_spec_version(spec: ProjectSpecification, review: dict, conversat
             "frozen_at": now,
         }
         versions.append(version_entry)
-        get_supabase().table("project_specifications").update({
+        await (await get_supabase_async()).table("project_specifications").update({
             "spec_versions": versions,
             "latest_spec_version": new_version,
             "updated_at": now,
@@ -1080,3 +952,26 @@ async def get_cached_spec(conversation_id: str) -> ProjectSpecification | None:
 
 async def clear_cached_spec(conversation_id: str) -> None:
     await SnapshotRepository.delete_cache(conversation_id)
+
+
+# ===========================================================================
+# PLACEHOLDER STUBS — RESTORE FROM WORKING TREE
+# ---------------------------------------------------------------------------
+# The following symbols were present in the uncommitted working tree but were
+# lost due to an accidental `git stash`/`git checkout` during this sprint.
+# They are imported (but never instantiated or called) by the experimental
+# clarification engines, which the production request path reaches via
+# ``services.agent_service`` -> ``services.clarification_engine``.
+# They are declared here ONLY so the package imports cleanly. Replace these
+# stubs with the real working-tree implementations when restoring the repo.
+# ===========================================================================
+class ArchitectureValidator:
+    """PLACEHOLDER — restore real implementation from working tree."""
+
+
+class AssumptionEngine:
+    """PLACEHOLDER — restore real implementation from working tree."""
+
+
+class QuestionPlanner:
+    """PLACEHOLDER — restore real implementation from working tree."""

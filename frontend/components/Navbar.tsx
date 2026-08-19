@@ -13,21 +13,21 @@ export default function Navbar() {
   };
 
   return (
-    <nav className="bg-gray-900 border-b border-gray-800">
-      <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+    <nav className="border-b border-slate-200/80 bg-white/90 backdrop-blur">
+      <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6 lg:px-8">
         <div className="flex items-center gap-6">
-          <Link href="/dashboard" className="text-white font-bold text-lg tracking-tight">
+          <Link href="/dashboard" className="text-lg font-semibold tracking-tight text-slate-950">
             ThinkSync
           </Link>
           <Link
             href="/dashboard"
-            className="text-gray-400 hover:text-white text-sm transition"
+            className="text-sm text-slate-500 transition hover:text-slate-950"
           >
             Dashboard
           </Link>
           <Link
             href="/servers"
-            className="text-gray-400 hover:text-white text-sm transition"
+            className="text-sm text-slate-500 transition hover:text-slate-950"
           >
             Servers
           </Link>
@@ -35,7 +35,7 @@ export default function Navbar() {
 
         <button
           onClick={handleLogout}
-          className="text-gray-400 hover:text-white text-sm transition"
+          className="app-button-secondary"
         >
           Logout
         </button>

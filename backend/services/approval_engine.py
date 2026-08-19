@@ -20,6 +20,7 @@ from models.approval import (
     ApprovalType,
 )
 from models.job import JobStatus
+from services.conversation_reliability import OptimisticLockError
 
 logger = logging.getLogger(__name__)
 
@@ -289,19 +290,38 @@ class ApprovalEngine:
         Increments ``request_version`` on every write.
         Raises ``OptimisticLockError`` on version mismatch.
         """
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
         import json as _json
 
-        # Increment version
+        # Decide CREATE vs UPDATE BEFORE any DB access, from repository state.
+        # A brand-new ApprovalRequest starts at request_version == 0 (model
+        # default); an existing row loaded via _load() carries version >= 1.
+        is_create = (request.request_version or 0) == 0
+
+        # Increment version (_persist is the sole owner of these increments)
         request.request_version = (request.request_version or 0) + 1
         request.updated_at = datetime.now(timezone.utc)
 
         data = _json.loads(request.model_dump_json())
 
         try:
-            # Optimistic locking: only update if DB version matches
+            if is_create:
+                # CREATE path — true INSERT (never UPDATE-first, never UPSERT).
+                result = (
+                    await (await get_supabase_async())
+                    .table("approval_requests")
+                    .insert(data)
+                    .execute()
+                )
+                if not result.data:
+                    raise RuntimeError(
+                        f"Failed to insert approval {request.approval_id}"
+                    )
+                return
+
+            # UPDATE path — optimistic locking: only update if DB version matches
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("approval_requests")
                 .update(data)
                 .eq("approval_id", request.approval_id)
@@ -309,10 +329,32 @@ class ApprovalEngine:
                 .execute()
             )
             if not result.data:
-                # Version mismatch — someone else wrote concurrently
-                raise OptimisticLockError(
-                    expected=request.request_version - 1,
-                    actual=request.request_version - 1,  # will be loaded fresh
+                # 0 rows updated. Re-read the ACTUAL stored version to decide
+                # whether this is a genuine version conflict. Raising on an empty
+                # result alone is wrong: a missing/deleted row is not a version
+                # conflict, and reporting `expected == actual` is impossible.
+                current = await (
+                    (await get_supabase_async())
+                    .table("approval_requests")
+                    .select("request_version")
+                    .eq("approval_id", request.approval_id)
+                    .limit(1)
+                    .execute()
+                )
+                expected_version = request.request_version - 1
+                actual_version = (
+                    current.data[0]["request_version"] if current.data else None
+                )
+                if actual_version != expected_version:
+                    raise OptimisticLockError(
+                        expected=expected_version,
+                        actual=actual_version,
+                    )
+                # Row is present at the expected version but the UPDATE affected
+                # 0 rows (e.g. row missing/deleted) — NOT a version conflict.
+                raise ValueError(
+                    f"Approval {request.approval_id} not found for update "
+                    f"(expected version {expected_version})"
                 )
         except OptimisticLockError:
             raise
@@ -322,10 +364,10 @@ class ApprovalEngine:
 
     async def _load(self, approval_id: str) -> ApprovalRequest:
         """Load an approval request from Supabase."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         result = (
-            get_supabase()
+            await (await get_supabase_async())
             .table("approval_requests")
             .select("*")
             .eq("approval_id", approval_id)
@@ -346,7 +388,7 @@ class ApprovalEngine:
         user: str = "",
     ) -> None:
         """Append an audit event to ``approval_audit`` table."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         event = ApprovalAuditEvent(
             approval_id=request.approval_id,
@@ -358,7 +400,7 @@ class ApprovalEngine:
             user=user,
         )
         try:
-            get_supabase().table("approval_audit").insert(
+            await (await get_supabase_async()).table("approval_audit").insert(
                 event.model_dump(mode="json")
             ).execute()
         except Exception as exc:

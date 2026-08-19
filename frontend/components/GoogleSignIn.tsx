@@ -133,7 +133,7 @@ export default function GoogleSignIn() {
         type="button"
         onClick={onClick}
         disabled={loading || !clientId}
-        className="inline-flex w-full items-center justify-center gap-3 rounded-3xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm shadow-slate-100/50 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+        className="inline-flex w-full items-center justify-center gap-3 rounded-3xl border border-slate-200 bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
       >
         {loading ? (
           <span className="inline-flex items-center gap-2">

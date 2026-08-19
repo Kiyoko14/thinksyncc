@@ -66,6 +66,12 @@ class ClarificationQuestion(BaseModel):
     source: str = ""  # which engine produced this
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Cost estimate tagged by AdaptiveClarificationEngine at decision time
+    # (internal, used by the cost-aware ask-vs-assume logic). Added to complete
+    # the component contract — the engine writes this attribute but it was
+    # missing from the model definition, which crashed evaluate() on any ASK.
+    cost_estimate: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # StructuredUserReply
@@ -147,3 +153,8 @@ class ClarificationSession(BaseModel):
         if self.current_question_index < len(self.questions):
             return self.questions[self.current_question_index]
         return None
+
+
+# PLACEHOLDER — restore real definition from working tree.
+# Imported (but never used at runtime) by services.agent_service / routers.agents.
+StructuredReplyType = Any  # type: ignore[assignment]

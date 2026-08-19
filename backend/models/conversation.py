@@ -184,11 +184,11 @@ class ConversationSessionStore:
         """Persist session to DB (PRIVATE — use ``OptimisticLockGuard`` instead)."""
 
 
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
         import json as _json
 
         try:
-            get_supabase().table("jobs").update(
+            await (await get_supabase_async()).table("jobs").update(
                 {
                     "conversation_session": _json.loads(
                         session.model_dump_json()
@@ -203,11 +203,11 @@ class ConversationSessionStore:
     @staticmethod
     async def load(job_id: str) -> ConversationSession | None:
         """Load session from DB."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
 
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("jobs")
                 .select("conversation_session")
                 .eq("id", job_id)

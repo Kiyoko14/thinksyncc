@@ -442,6 +442,41 @@ async def read_workspace_file(
     return await exec_in_workspace(server=server, workspace_path=workspace_path, command=command, timeout=timeout)
 
 
+async def list_files(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    path: str = ".",
+    timeout: int,
+) -> ExecResult:
+    """List files/dirs under ``path`` (relative to workspace), one per line.
+
+    Uses ``ls -la`` so the agent can see permissions and sizes. Returns
+    stdout with the listing; the caller parses it.
+    """
+    rel_path = _validate_relative_path(path)
+    command = f"ls -la {shlex.quote(rel_path)}"
+    return await exec_in_workspace(server=server, workspace_path=workspace_path, command=command, timeout=timeout)
+
+
+async def list_processes(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    timeout: int,
+) -> ExecResult:
+    """List running processes (scoped to the workspace where possible).
+
+    Uses ``ps`` + ``grep`` on the workspace path so the agent can see what is
+    running inside its workspace without listing the entire host.
+    """
+    root = _workspaces_root()
+    command = (
+        f"ps -eo pid,ppid,user,stat,etime,cmd | grep -E {shlex.quote(root)} || true"
+    )
+    return await exec_in_workspace(server=server, workspace_path=workspace_path, command=command, timeout=timeout)
+
+
 async def file_exists_in_workspace(
     *,
     server: dict[str, Any],
@@ -453,6 +488,53 @@ async def file_exists_in_workspace(
     command = f"test -f {shlex.quote(rel_path)}"
     res = await exec_in_workspace(server=server, workspace_path=workspace_path, command=command, timeout=timeout)
     return res["code"] == 0
+
+
+async def patch_workspace_file(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    path: str,
+    old_string: str,
+    new_string: str,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    """Apply a precise in-file patch using old_string → new_string replacement.
+
+    Uses an exact substring match (Anthropic-style). If ``old_string`` appears
+    more than once the patch is rejected (ambiguous) to avoid corrupting the
+    file. If it is absent the patch fails clearly so the caller can self-heal.
+    Reads the current file, performs the replacement locally, and rewrites it
+    in a single atomic SSH op.
+    """
+    rel_path = _validate_relative_path(path)
+
+    # Encode both blobs; the worker reads the file, replaces once, writes back.
+    old_b64 = base64.b64encode(old_string.encode("utf-8")).decode("ascii")
+    new_b64 = base64.b64encode(new_string.encode("utf-8")).decode("ascii")
+
+    py = (
+        "import base64,os,io\n"
+        f"p={rel_path!r}\n"
+        f"old=base64.b64decode({old_b64!r}).decode('utf-8')\n"
+        f"new=base64.b64decode({new_b64!r}).decode('utf-8')\n"
+        "if not os.path.exists(p):\n"
+        "    raise SystemExit('PATCH_TARGET_MISSING')\n"
+        "with open(p,'r',encoding='utf-8') as f:\n"
+        "    src=f.read()\n"
+        "n=src.count(old)\n"
+        "if n==0:\n"
+        "    raise SystemExit('PATCH_ANCHOR_NOT_FOUND')\n"
+        "if n>1:\n"
+        "    raise SystemExit('PATCH_AMBIGUOUS_MULTIPLE_MATCHES')\n"
+        "out=src.replace(old,new,1)\n"
+        "with open(p,'w',encoding='utf-8') as f:\n"
+        "    f.write(out)\n"
+        "print('PATCH_APPLIED')\n"
+    )
+    command = f"python3 -c {shlex.quote(py)}"
+    return await exec_in_workspace(server=server, workspace_path=workspace_path, command=command, timeout=timeout)
 
 
 async def install_python_deps(
@@ -475,6 +557,95 @@ async def install_python_deps(
     else:
         command = "python3 -m pip install -r requirements.txt"
     return await exec_in_workspace(server=server, workspace_path=workspace_path, command=command, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Environment / secret management (write ONLY to workspace-local .env)
+# ---------------------------------------------------------------------------
+
+def _validate_env_key(key: str) -> str:
+    """Reject keys that could be used for injection or clobbering shell state."""
+    cleaned = (key or "").strip()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cleaned):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_env_key",
+                "message": "Env key must match [A-Za-z_][A-Za-z0-9_]*",
+            },
+        )
+    # Block attempts to override critical runtime vars.
+    if cleaned in {"PATH", "HOME", "SHELL", "USER", "PWD", "THINKSYNC_WORKSPACES_ROOT"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "protected_env_key",
+                "message": f"Refusing to overwrite protected key: {cleaned}",
+            },
+        )
+    return cleaned
+
+
+async def set_env(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    key: str,
+    value: str,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    """Set KEY=VALUE in the workspace-local .env file (idempotent).
+
+    Replaces an existing KEY line or appends a new one. Values are written
+    verbatim; the caller is responsible for NOT logging `value` (redaction is
+    enforced in the tool wrapper via _REDACTED_MARKER).
+    """
+    safe_key = _validate_env_key(key)
+    rel_env = _validate_relative_path(".env")
+    # Read current .env (may not exist yet), swap the key, write back.
+    py = (
+        "import os,re\n"
+        f"p={rel_env!r}\n"
+        f"k={safe_key!r}\n"
+        f"v={value!r}\n"
+        "lines=[]\n"
+        "if os.path.exists(p):\n"
+        "    with open(p,'r',encoding='utf-8') as f:\n"
+        "        lines=f.read().splitlines()\n"
+        "new=[ln for ln in lines if not ln.startswith(k+'=') and not ln.startswith(k+' ')+'=']\n"
+        "new.append(f'{k}={v}')\n"
+        "with open(p,'w',encoding='utf-8') as f:\n"
+        "    f.write('\\n'.join(new)+'\\n')\n"
+        "print('ENV_SET', k)\n"
+    )
+    command = f"python3 -c {shlex.quote(py)}"
+    return await exec_in_workspace(server=server, workspace_path=workspace_path, command=command, timeout=timeout)
+
+
+async def write_secret(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    key: str,
+    value: str,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    """Write a secret (token/password) into the workspace-local .env.
+
+    Functionally identical to ``set_env`` but semantically a SECRET op — it MUST
+    be routed through ApprovalType.SECRET (see executor/agent_service mapping).
+    The value is never echoed to logs; the tool wrapper returns a redacted marker.
+    """
+    return await set_env(
+        server=server,
+        workspace_path=workspace_path,
+        key=key,
+        value=value,
+        allow_write=allow_write,
+        timeout=timeout,
+    )
 
 
 async def run_python_file(
@@ -1275,6 +1446,106 @@ async def _write_file(
     return res
 
 
+async def _patch_file(
+    *,
+    server: dict[str, Any],
+    args: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool | None,
+    timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
+) -> ExecResult:
+    if not allow_write:
+        return {"stdout": "", "stderr": "patch_file: permission denied", "code": 1}
+    path = (args.get("path", "") or "").strip()
+    old_string = args.get("old_string", "")
+    new_string = args.get("new_string", "")
+    if not path:
+        return {"stdout": "", "stderr": "patch_file: 'path' argument is required", "code": 1}
+    if old_string == "" or new_string == "":
+        return {"stdout": "", "stderr": "patch_file: 'old_string' and 'new_string' are required", "code": 1}
+
+    rel_path = _validate_relative_path(path)
+    res = await patch_workspace_file(
+        server=server,
+        workspace_path=workspace_path,
+        path=rel_path,
+        old_string=old_string,
+        new_string=new_string,
+        allow_write=True,
+        timeout=timeout,
+    )
+    if res["code"] == 0 and "PATCH_APPLIED" in res["stdout"]:
+        res["stdout"] = f"Successfully patched {path}"
+    elif res["code"] != 0:
+        # Surface the SystemExit reason as a clear stderr message.
+        err = res["stderr"] or res["stdout"]
+        if any(t in err for t in ("PATCH_TARGET_MISSING", "PATCH_ANCHOR_NOT_FOUND", "PATCH_AMBIGUOUS")):
+            res["stderr"] = f"patch_file failed: {err.strip()}"
+    return res
+
+
+async def _config_set(
+    *,
+    server: dict[str, Any],
+    args: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool | None,
+    timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
+) -> ExecResult:
+    if not allow_write:
+        return {"stdout": "", "stderr": "config_set: permission denied", "code": 1}
+    key = (args.get("key", "") or "").strip()
+    value = str(args.get("value", "") or "")
+    if not key:
+        return {"stdout": "", "stderr": "config_set: 'key' argument is required", "code": 1}
+    res = await set_env(
+        server=server,
+        workspace_path=workspace_path,
+        key=key,
+        value=value,
+        allow_write=True,
+        timeout=timeout,
+    )
+    # Redact the value from any echoed output.
+    res["stdout"] = res["stdout"].replace(value, "***REDACTED***") if value else res["stdout"]
+    res["stderr"] = res["stderr"].replace(value, "***REDACTED***") if value else res["stderr"]
+    return res
+
+
+async def _write_secret(
+    *,
+    server: dict[str, Any],
+    args: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool | None,
+    timeout: int,
+    step_number: int,
+    on_output_chunk: OutputChunkCallback | None = None,
+) -> ExecResult:
+    if not allow_write:
+        return {"stdout": "", "stderr": "write_secret: permission denied", "code": 1}
+    key = (args.get("key", "") or "").strip()
+    value = str(args.get("value", "") or "")
+    if not key:
+        return {"stdout": "", "stderr": "write_secret: 'key' argument is required", "code": 1}
+    res = await write_secret(
+        server=server,
+        workspace_path=workspace_path,
+        key=key,
+        value=value,
+        allow_write=True,
+        timeout=timeout,
+    )
+    # Never echo secret values — always redact.
+    res["stdout"] = res["stdout"].replace(value, "***REDACTED***") if value else res["stdout"]
+    res["stderr"] = res["stderr"].replace(value, "***REDACTED***") if value else res["stderr"]
+    return res
+
+
 async def _list_processes(
     *,
     server: dict[str, Any],
@@ -1295,23 +1566,291 @@ async def _list_processes(
     return {"stdout": resp.output or "", "stderr": resp.stderr or "", "code": int(resp.exit_code)}
 
 
+# _TOOL_FN dispatch table is defined at the END of this module (after all
+# tool functions) so that forward references to git_*/_git_* resolve.
+
+
 # ---------------------------------------------------------------------------
-# Tool dispatch table
+# Git layer (agent operates ONLY inside an existing workspace git repo)
 # ---------------------------------------------------------------------------
 
-_TOOL_FN: dict[ToolName, Any] = {
-    ToolName.RUN_COMMAND: _run_command,
-    ToolName.CHECK_DISK: _check_disk,
-    ToolName.CHECK_MEMORY: _check_memory,
-    ToolName.READ_LOGS: _read_logs,
-    ToolName.RESTART_SERVICE: _restart_service,
-    ToolName.DEPLOY_APP: _deploy_app,
-    ToolName.DEPLOY_NEXTJS_APP: _deploy_nextjs_app,
-    ToolName.LIST_FILES: _list_files,
-    ToolName.READ_FILE: _read_file,
-    ToolName.WRITE_FILE: _write_file,
-    ToolName.LIST_PROCESSES: _list_processes,
-}
+async def _require_git_repo(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    timeout: int,
+) -> ExecResult | None:
+    """Verify the workspace is a git repository. Returns None if OK, else an error result."""
+    check = await exec_in_workspace(
+        server=server,
+        workspace_path=workspace_path,
+        command="test -d .git && echo GIT_OK || echo NO_GIT",
+        timeout=max(5, min(timeout, 15)),
+    )
+    if "GIT_OK" not in (check["stdout"] or ""):
+        return {
+            "stdout": "",
+            "stderr": "git: workspace is not a git repository (import it via workspace import first)",
+            "code": 1,
+        }
+    return None
+
+
+async def _git_status(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    return await exec_in_workspace(
+        server=server, workspace_path=workspace_path,
+        command="git status --porcelain=v1 -b", timeout=timeout,
+    )
+
+
+async def _git_diff(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    staged: bool = False,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    flag = "--cached" if staged else ""
+    return await exec_in_workspace(
+        server=server, workspace_path=workspace_path,
+        command=f"git diff {flag} --stat", timeout=timeout,
+    )
+
+
+async def _git_branch(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    return await exec_in_workspace(
+        server=server, workspace_path=workspace_path,
+        command="git branch -a && echo '---HEAD---' && git rev-parse --abbrev-ref HEAD",
+        timeout=timeout,
+    )
+
+
+async def _git_commit(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    message: str,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    safe_msg = (message or "agent commit").replace('"', "'")[:200]
+    return await exec_in_workspace(
+        server=server, workspace_path=workspace_path,
+        command=f"git add -A && git commit -m {shlex.quote(safe_msg)}",
+        timeout=timeout,
+    )
+
+
+async def _git_restore(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    paths: list[str] | None = None,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    target = " ".join(shlex.quote(p) for p in (paths or [])) or "."
+    return await exec_in_workspace(
+        server=server, workspace_path=workspace_path,
+        command=f"git restore --worktree {target}",
+        timeout=timeout,
+    )
+
+
+async def _git_reset(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    mode: str = "mixed",
+    target: str = "HEAD",
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    """Destructive — requires HIGH approval (enforced in executor/agent_service).
+
+    mode: 'soft' | 'mixed' | 'hard'. 'hard' discards ALL local changes.
+    """
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    if mode not in {"soft", "mixed", "hard"}:
+        return {"stdout": "", "stderr": f"git_reset: invalid mode {mode!r}", "code": 1}
+    safe_target = (target or "HEAD").replace(" ", "")
+    if not re.match(r"^[A-Za-z0-9_./\-^~:]+$", safe_target):
+        return {"stdout": "", "stderr": "git_reset: invalid target", "code": 1}
+    return await exec_in_workspace(
+        server=server, workspace_path=workspace_path,
+        command=f"git reset --{mode} {shlex.quote(safe_target)}",
+        timeout=timeout,
+    )
+
+
+async def _git_clean(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    force: bool = False,
+    allow_write: bool | None,
+    timeout: int,
+) -> ExecResult:
+    """Remove untracked files. Destructive — requires HIGH approval.
+
+    By default dry-run (-n) only; pass force=true to actually delete.
+    """
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    if not force:
+        return await exec_in_workspace(
+            server=server, workspace_path=workspace_path,
+            command="git clean -ndx", timeout=timeout,
+        )
+    return await exec_in_workspace(
+        server=server, workspace_path=workspace_path,
+        command="git clean -fdx", timeout=timeout,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GitHub agent tools (pull / push over an EXISTING workspace repo)
+#
+# These NEVER clone and NEVER see a plaintext private key. They resolve the
+# workspace's linked GitHub connection (from the DB), decrypt the key in-process,
+# and delegate the actual git transport to GitHubService. Push is gated by
+# HIGH risk + explicit human approval (enforced in executor/agent_service).
+# ---------------------------------------------------------------------------
+
+
+async def _github_pull(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    github_connection_id: str,
+    user_id: str | None = None,
+    remote: str = "origin",
+    branch: str | None = None,
+    strategy: str = "ff_only",
+    allow_write: bool | None = None,
+    timeout: int = 180,
+) -> ExecResult:
+    """Fetch + integrate (fast-forward / merge / rebase) an existing repo.
+
+    Requires the workspace to already be a git repo (cloned at workspace
+    creation time, never by the agent). The credential PROVIDER (SSH key vs
+    GitHub App installation token) is resolved entirely inside the service
+    layer (``git_transport``) from the linked connection — the agent tool has
+    no knowledge of SSH/OAuth/App. Returns a structured result.
+    """
+    from services.git_transport import workspace_pull
+
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    if strategy not in ("ff_only", "merge", "rebase"):
+        return {"stdout": "", "stderr": f"github_pull: invalid strategy {strategy!r}", "code": 1}
+    try:
+        res = await workspace_pull(
+            connection_id=github_connection_id,
+            user_id=user_id,
+            workspace_path=workspace_path,
+            server=server,
+            remote=remote,
+            branch=branch,
+            strategy=strategy,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        return {"stdout": "", "stderr": json.dumps(detail), "code": 1}
+    except Exception as exc:  # noqa: BLE001
+        return {"stdout": "", "stderr": f"github_pull: failed to load credential: {exc}", "code": 1}
+
+    return {
+        "stdout": res.get("stderr", "") if not res.get("ok") else "pull ok",
+        "stderr": res.get("stderr", "") if res.get("ok") else "",
+        "code": int(res.get("code", 1)),
+    }
+
+
+async def _github_push(
+    *,
+    server: dict[str, Any],
+    workspace_path: str,
+    github_connection_id: str,
+    user_id: str | None = None,
+    remote: str = "origin",
+    branch: str | None = None,
+    force: bool = False,
+    tags: bool = False,
+    allow_write: bool | None = None,
+    timeout: int = 180,
+) -> ExecResult:
+    """Push commits to the remote. ALWAYS requires explicit approval (HIGH risk).
+
+    The force flag maps to ``--force-with-lease`` (safer than ``--force``).
+    Provider selection (SSH vs GitHub App token) happens in the service layer
+    (``git_transport``); the agent tool never sees a credential.
+    """
+    from services.git_transport import workspace_push
+
+    err = await _require_git_repo(server=server, workspace_path=workspace_path, timeout=timeout)
+    if err:
+        return err
+    if not allow_write:
+        return {
+            "stdout": "",
+            "stderr": "github_push blocked: allow_write=false (push requires write access + approval)",
+            "code": 1,
+        }
+    try:
+        res = await workspace_push(
+            connection_id=github_connection_id,
+            user_id=user_id,
+            workspace_path=workspace_path,
+            server=server,
+            remote=remote,
+            branch=branch,
+            force=force,
+            tags=tags,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        return {"stdout": "", "stderr": json.dumps(detail), "code": 1}
+    except Exception as exc:  # noqa: BLE001
+        return {"stdout": "", "stderr": f"github_push: failed to load credential: {exc}", "code": 1}
+
+    return {
+        "stdout": "push ok" if res.get("ok") else "",
+        "stderr": res.get("stderr", "") if not res.get("ok") else "",
+        "code": int(res.get("code", 1)),
+    }
 
 
 async def execute_tool(
@@ -1324,6 +1863,7 @@ async def execute_tool(
     allow_write: bool | None,
     timeout: int,
     step_number: int = 0,
+    user_id: str | None = None,
     on_output_chunk: OutputChunkCallback | None = None,
 ) -> StepResult:
     '''
@@ -1415,30 +1955,106 @@ async def execute_tool(
         allow_write,
         timeout,
     )
-    try:
-        res = await asyncio.wait_for(
-            fn(
+
+    # Git tools take extra structured args from the plan step.
+    if tool in {
+        ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_BRANCH,
+        ToolName.GIT_COMMIT, ToolName.GIT_RESTORE, ToolName.GIT_RESET, ToolName.GIT_CLEAN,
+    }:
+        git_kwargs: dict[str, Any] = dict(
+            server=server,
+            workspace_path=workspace_path,
+            allow_write=allow_write,
+            timeout=timeout,
+        )
+        if tool == ToolName.GIT_DIFF:
+            git_kwargs["staged"] = bool(args.get("staged", False))
+        elif tool == ToolName.GIT_COMMIT:
+            git_kwargs["message"] = str(args.get("message", "agent commit"))
+        elif tool == ToolName.GIT_RESTORE:
+            git_kwargs["paths"] = args.get("paths") or None
+        elif tool == ToolName.GIT_RESET:
+            git_kwargs["mode"] = str(args.get("mode", "mixed"))
+            git_kwargs["target"] = str(args.get("target", "HEAD"))
+        elif tool == ToolName.GIT_CLEAN:
+            git_kwargs["force"] = bool(args.get("force", False))
+        try:
+            res = await asyncio.wait_for(fn(**git_kwargs), timeout=timeout + 30)
+        except asyncio.TimeoutError:
+            res = {"stdout": "", "stderr": f"Tool '{tool_name}' timed out after {timeout}s", "code": 124}
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"code": "tool_execution_blocked", "message": str(exc.detail)}
+            res = {"stdout": "", "stderr": json.dumps(detail), "code": 1}
+        except Exception as exc:
+            logger.exception("Unexpected error in git tool '%s': %s", tool_name, exc)
+            res = {"stdout": "", "stderr": f"Internal git tool error: {exc}", "code": 1}
+    elif tool in {ToolName.GITHUB_PULL, ToolName.GITHUB_PUSH}:
+        # GitHub pull/push: resolve the linked connection id, then delegate to
+        # GitHubService (which decrypts the key in-process). The connection id
+        # is supplied by the orchestrator at plan time (args["github_connection_id"]).
+        github_connection_id = str(args.get("github_connection_id") or "").strip()
+        if not github_connection_id:
+            res = {
+                "stdout": "",
+                "stderr": "github tool requires 'github_connection_id' in args",
+                "code": 1,
+            }
+        else:
+            # Resolve user_id: prefer explicit value (set by orchestrator),
+            # fall back to the server's owner id.
+            effective_user_id = user_id or (server or {}).get("user_id")
+            gh_kwargs: dict[str, Any] = dict(
                 server=server,
-                args=args,
                 workspace_path=workspace_path,
+                github_connection_id=github_connection_id,
+                user_id=effective_user_id,
                 allow_write=allow_write,
                 timeout=timeout,
-                step_number=step_number,
-                on_output_chunk=on_output_chunk,
-            ),
-            timeout=timeout + 30,
-        )
-    except asyncio.TimeoutError:
-        res = {"stdout": "", "stderr": f"Tool '{tool_name}' timed out after {timeout}s", "code": 124}
-    except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, dict) else {
-            "code": "tool_execution_blocked",
-            "message": str(exc.detail),
-        }
-        res = {"stdout": "", "stderr": json.dumps(detail), "code": 1}
-    except Exception as exc:
-        logger.exception("Unexpected error in tool '%s': %s", tool_name, exc)
-        res = {"stdout": "", "stderr": f"Internal tool error: {exc}", "code": 1}
+            )
+            if tool == ToolName.GITHUB_PULL:
+                gh_kwargs["remote"] = str(args.get("remote", "origin"))
+                gh_kwargs["branch"] = args.get("branch") or None
+                gh_kwargs["strategy"] = str(args.get("strategy", "ff_only"))
+            else:  # GITHUB_PUSH
+                gh_kwargs["remote"] = str(args.get("remote", "origin"))
+                gh_kwargs["branch"] = args.get("branch") or None
+                gh_kwargs["force"] = bool(args.get("force", False))
+                gh_kwargs["tags"] = bool(args.get("tags", False))
+            try:
+                res = await asyncio.wait_for(fn(**gh_kwargs), timeout=timeout + 30)
+            except asyncio.TimeoutError:
+                res = {"stdout": "", "stderr": f"Tool '{tool_name}' timed out after {timeout}s", "code": 124}
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {"code": "tool_execution_blocked", "message": str(exc.detail)}
+                res = {"stdout": "", "stderr": json.dumps(detail), "code": 1}
+            except Exception as exc:
+                logger.exception("Unexpected error in github tool '%s': %s", tool_name, exc)
+                res = {"stdout": "", "stderr": f"Internal github tool error: {exc}", "code": 1}
+    else:
+        try:
+            res = await asyncio.wait_for(
+                fn(
+                    server=server,
+                    args=args,
+                    workspace_path=workspace_path,
+                    allow_write=allow_write,
+                    timeout=timeout,
+                    step_number=step_number,
+                    on_output_chunk=on_output_chunk,
+                ),
+                timeout=timeout + 30,
+            )
+        except asyncio.TimeoutError:
+            res = {"stdout": "", "stderr": f"Tool '{tool_name}' timed out after {timeout}s", "code": 124}
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {
+                "code": "tool_execution_blocked",
+                "message": str(exc.detail),
+            }
+            res = {"stdout": "", "stderr": json.dumps(detail), "code": 1}
+        except Exception as exc:
+            logger.exception("Unexpected error in tool '%s': %s", tool_name, exc)
+            res = {"stdout": "", "stderr": f"Internal tool error: {exc}", "code": 1}
 
     stdout = res.get("stdout", "")
     stderr = res.get("stderr", "")
@@ -1736,12 +2352,125 @@ OPENAI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": ToolName.GITHUB_PULL,
+            "description": (
+                "Fetch and integrate changes from the linked GitHub repository into the "
+                "current workspace (the repo was cloned at workspace creation time — the agent "
+                "NEVER clones). Requires the workspace to be linked to a GitHub connection. "
+                "Use 'ff_only' (default) to avoid rewriting local history; 'merge' or 'rebase' "
+                "when explicitly needed. Returns the pull result."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "github_connection_id": {
+                        "type": "string",
+                        "description": "ID of the GitHub connection linked to this workspace (provided by the orchestrator).",
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default: 'origin'.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch to pull (defaults to the current branch's upstream).",
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["ff_only", "merge", "rebase"],
+                        "description": "How to integrate fetched changes. Default: 'ff_only'.",
+                        "default": "ff_only",
+                    },
+                },
+                "required": ["github_connection_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": ToolName.GITHUB_PUSH,
+            "description": (
+                "Push committed changes to the linked GitHub repository. ALWAYS requires explicit "
+                "human approval before it runs (HIGH risk). The agent must have committed first. "
+                "Prefer a normal push; only set force=true (maps to --force-with-lease) when the "
+                "remote history was intentionally rewritten. Never push secrets or large binaries."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "github_connection_id": {
+                        "type": "string",
+                        "description": "ID of the GitHub connection linked to this workspace (provided by the orchestrator).",
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default: 'origin'.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch to push (defaults to the current branch).",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force push using --force-with-lease. Requires HIGH approval. Default: false.",
+                        "default": False,
+                    },
+                    "tags": {
+                        "type": "boolean",
+                        "description": "Also push tags. Default: false.",
+                        "default": False,
+                    },
+                },
+                "required": ["github_connection_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 #: Write-only tools that are hidden when allow_write=False.
 _WRITE_ONLY_TOOLS: frozenset[str] = frozenset(
     [ToolName.RESTART_SERVICE, ToolName.DEPLOY_NEXTJS_APP, ToolName.DEPLOY_APP, ToolName.WRITE_FILE]
 )
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch table — defined LAST so all git_*/_git_* functions above
+# are already in scope (forward references resolve at call time).
+# ---------------------------------------------------------------------------
+
+_TOOL_FN: dict[ToolName, Any] = {
+    ToolName.RUN_COMMAND: _run_command,
+    ToolName.CHECK_DISK: _check_disk,
+    ToolName.CHECK_MEMORY: _check_memory,
+    ToolName.READ_LOGS: _read_logs,
+    ToolName.RESTART_SERVICE: _restart_service,
+    ToolName.DEPLOY_APP: _deploy_app,
+    ToolName.DEPLOY_NEXTJS_APP: _deploy_nextjs_app,
+    ToolName.LIST_FILES: _list_files,
+    ToolName.READ_FILE: _read_file,
+    ToolName.WRITE_FILE: _write_file,
+    ToolName.LIST_PROCESSES: _list_processes,
+    ToolName.PATCH_FILE: _patch_file,
+    ToolName.CONFIG_SET: _config_set,
+    ToolName.WRITE_SECRET: _write_secret,
+    ToolName.GIT_STATUS: _git_status,
+    ToolName.GIT_DIFF: _git_diff,
+    ToolName.GIT_BRANCH: _git_branch,
+    ToolName.GIT_COMMIT: _git_commit,
+    ToolName.GIT_RESTORE: _git_restore,
+    ToolName.GIT_RESET: _git_reset,
+    ToolName.GIT_CLEAN: _git_clean,
+    ToolName.GITHUB_PULL: _github_pull,
+    ToolName.GITHUB_PUSH: _github_push,
+}
 
 
 def get_tool_definitions(allow_write: bool) -> list[dict[str, Any]]:

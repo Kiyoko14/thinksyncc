@@ -10,7 +10,7 @@ from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
 from core.crypto import decrypt_secret, encrypt_secret
-from core.database import get_supabase
+from core.database import get_supabase, get_supabase_async
 from core.value_coercion import value_to_str
 from models.server import ServerCreate, ServerResponse
 from services.ssh_service import SSHService
@@ -161,7 +161,7 @@ class ServerService:
             ssh_password=data.ssh_password,
             ssh_key=data.ssh_key,
         )
-        supabase = get_supabase()
+        supabase = await get_supabase_async()
         record = {
             "user_id": user_id,
             "name": data.name,
@@ -175,7 +175,7 @@ class ServerService:
         }
 
         try:
-            result = supabase.table("servers").insert(record).execute()
+            result = await supabase.table("servers").insert(record).execute()
         except APIError as exc:
             code = ServerService._api_error_code(exc)
             if code in {"22P02"}:

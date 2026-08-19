@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Clarification Flow — After</title>
+<style>
+  body { margin:0; background:#0f172a; color:#e2e8f0; font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; }
+  .wrap { max-width:900px; margin:0 auto; padding:32px 20px; }
+  h1 { color:#f8fafc; font-size:22px; margin:0 0 4px; }
+  .sub { color:#94a3b8; font-size:13px; margin-bottom:24px; }
+  .flow { display:flex; flex-direction:column; gap:0; }
+  .node { border:1px solid #334155; border-radius:12px; padding:14px 18px; background:#1e293b; position:relative; }
+  .node b { color:#f1f5f9; }
+  .node .tag { font-size:11px; color:#64748b; }
+  .node.ext { border-color:#15803d; background:#16271c; }
+  .node.new { border-color:#2563eb; background:#15233f; }
+  .node.renderer { border-color:#7c3aed; background:#231a36; }
+  .arrow { text-align:center; color:#475569; font-size:18px; line-height:18px; padding:4px 0; }
+  .note { margin-top:28px; font-size:12px; color:#94a3b8; border-left:3px solid #2563eb; padding-left:12px; }
+  code { background:#0b1220; padding:1px 5px; border-radius:5px; color:#7dd3fc; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Architecture — AFTER</h1>
+  <div class="sub">Structured clarification schema. Frontend is a pure renderer. Backend stays orchestration-first.</div>
+  <div class="flow">
+    <div class="node"><b>User Request</b></div>
+    <div class="arrow">↓</div>
+    <div class="node"><b>Requirement Discovery</b><div class="tag">unchanged</div></div>
+    <div class="arrow">↓</div>
+    <div class="node"><b>Adaptive Clarification</b> (AdaptiveClarificationEngine)<div class="tag">unchanged — still produces ClarificationQuestion[]</div></div>
+    <div class="arrow">↓</div>
+    <div class="node new"><b>ClarificationForm.from_questions()</b> — adapter (NO engine rewrite)<div class="tag">maps questions → generic ClarificationForm schema</div></div>
+    <div class="arrow">↓</div>
+    <div class="node ext"><b>Publish ClarificationForm</b> over WebSocket<div class="tag">event <code>waiting_for_clarification</code> { clarification_form }</div></div>
+    <div class="arrow">↓</div>
+    <div class="node renderer"><b>Frontend ClarificationForm.tsx</b> — PURE RENDERER<div class="tag">renders title/inputs/choices/validation; client validation; collects answers</div></div>
+    <div class="arrow">↓</div>
+    <div class="node new"><b>POST /clarification-reply</b> with ClarificationFormSubmission<div class="tag">authoritative server validation → 422 on invalid</div></div>
+    <div class="arrow">↓</div>
+    <div class="node ext"><b>EventWaitEngine → Resume</b> (submission in signal)<div class="tag">await_clarification_reply forwards submission</div></div>
+    <div class="arrow">↓</div>
+    <div class="node ext"><b>record_clarification_answer</b> stores submission; REDACTED chat entry<div class="tag">secrets never echoed / never in history</div></div>
+    <div class="arrow">↓</div>
+    <div class="node ext"><b>_apply_clarification_answer_to_spec</b> folds submission deterministically<div class="tag">preferred; legacy regex retained as fallback</div></div>
+    <div class="arrow">↓</div>
+    <div class="node"><b>ProjectSpecification Update</b><div class="tag">missing_info / needs_user_input recomputed</div></div>
+    <div class="arrow">↓</div>
+    <div class="node"><b>Implementation Intelligence → Planner → Execution</b><div class="tag">unchanged; receives completed spec</div></div>
+  </div>
+  <div class="note">
+    Only change: Adaptive Clarification now yields a <b>structured payload</b> (via adapter) instead of plain
+    chat text. One submit → one resume. No free-text parsing, no duplicate clarification system, no
+    Telegram hard-coding, fully backward compatible.
+  </div>
+</div>
+</body>
+</html>

@@ -16,22 +16,28 @@ export default function LogsPanel({
   }, [logs.length]);
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="border-b border-gray-800 px-4 py-3">
-        <p className="text-sm font-semibold text-white">{title}</p>
-        <p className="mt-1 text-xs text-gray-500">Live tool output</p>
-      </div>
-      <div className="flex-1 overflow-y-auto px-4 py-4">
+    <details className="app-panel overflow-hidden">
+      <summary className="cursor-pointer list-none border-b border-slate-200 px-4 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-slate-900">{title}</p>
+            <p className="mt-1 text-xs text-slate-500">Expandable command output</p>
+          </div>
+          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">Logs</span>
+        </div>
+      </summary>
+      <div className="max-h-[420px] overflow-y-auto px-4 py-4">
         {logs.trim().length === 0 ? (
-          <div className="text-sm text-gray-500">No logs yet.</div>
+          <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-3 py-4 text-sm text-slate-500">
+            No logs captured yet.
+          </div>
         ) : (
-          <pre className="whitespace-pre-wrap break-words rounded-2xl border border-gray-800 bg-gray-950/30 p-3 font-mono text-xs leading-relaxed text-gray-100">
+          <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-slate-200 bg-slate-950 px-3 py-3 font-mono text-xs leading-relaxed text-slate-100">
             {logs}
           </pre>
         )}
         <div ref={bottomRef} />
       </div>
-    </div>
+    </details>
   );
 }
-

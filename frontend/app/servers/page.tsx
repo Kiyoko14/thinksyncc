@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import BottomNav from "@/components/BottomNav";
 import ServerList, { type ServerStatus } from "@/components/ServerList";
 import { addServer, getServers, getWorkspacesByServer, type Server, type ServerCreatePayload } from "@/services/api";
 import { getToken, logout } from "@/services/auth";
@@ -27,6 +28,7 @@ export default function ServersPage() {
   const router = useRouter();
   const [servers, setServers] = useState<Server[]>([]);
   const [statusById, setStatusById] = useState<Record<string, ServerStatus>>({});
+  const [workspaceCountById, setWorkspaceCountById] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -60,24 +62,35 @@ export default function ServersPage() {
   useEffect(() => {
     if (!servers.length) return;
     let cancelled = false;
-    const check = async (serverId: string) => {
+
+    const hydrateServer = async (server: Server) => {
       try {
-        await withTimeout(getWorkspacesByServer(serverId), 1800);
-        if (!cancelled) setStatusById((p) => ({ ...p, [serverId]: "online" }));
+        const workspaces = await withTimeout(getWorkspacesByServer(server.id), 1800);
+        if (!cancelled) {
+          setStatusById((prev) => ({ ...prev, [server.id]: "online" }));
+          setWorkspaceCountById((prev) => ({ ...prev, [server.id]: workspaces.length }));
+        }
       } catch {
-        if (!cancelled) setStatusById((p) => ({ ...p, [serverId]: "offline" }));
+        if (!cancelled) {
+          setStatusById((prev) => ({ ...prev, [server.id]: "offline" }));
+          setWorkspaceCountById((prev) => ({ ...prev, [server.id]: 0 }));
+        }
       }
     };
-    servers.forEach((s) => {
-      if (!statusById[s.id]) void check(s.id);
+
+    servers.forEach((server) => {
+      if (statusById[server.id] === undefined) {
+        void hydrateServer(server);
+      }
     });
+
     return () => {
       cancelled = true;
     };
   }, [servers, statusById]);
 
   const serverCountLabel = useMemo(() => {
-    if (loading) return "Loading…";
+    if (loading) return "Loading inventory…";
     return `${servers.length} server${servers.length === 1 ? "" : "s"}`;
   }, [loading, servers.length]);
 
@@ -103,23 +116,26 @@ export default function ServersPage() {
   };
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white safe-top safe-bottom">
-      <header className="sticky top-0 z-30 border-b border-gray-800 bg-gray-950/95 backdrop-blur">
-        <div className="mx-auto flex h-14 max-w-4xl items-center justify-between px-4">
+    <div className="min-h-screen bg-transparent text-slate-900 safe-top pb-24">
+      <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/90 backdrop-blur">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-4 sm:px-6 lg:px-8">
           <div className="min-w-0">
-            <p className="truncate text-base font-semibold">Servers</p>
-            <p className="truncate text-xs text-gray-500">{serverCountLabel}</p>
+            <div className="inline-flex rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-600">
+              Infrastructure
+            </div>
+            <h1 className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">Servers</h1>
+            <p className="mt-1 text-sm text-slate-600">{serverCountLabel}</p>
           </div>
           <div className="flex items-center gap-2">
-            <button
-              onClick={() => { setShowAdd(true); setFormError(null); }}
-              className="rounded-xl bg-blue-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-blue-500"
-            >
-              + Add Server
+            <button onClick={() => { setShowAdd(true); setFormError(null); }} className="app-button-accent">
+              + Add server
             </button>
             <button
-              onClick={() => { logout(); router.replace("/login"); }}
-              className="rounded-xl border border-gray-800 bg-gray-900/40 px-3 py-2 text-sm font-semibold text-gray-200 transition hover:bg-gray-900"
+              onClick={() => {
+                logout();
+                router.replace("/login");
+              }}
+              className="app-button-secondary"
             >
               Logout
             </button>
@@ -127,108 +143,126 @@ export default function ServersPage() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-4xl px-4 py-6">
-        {error ? (
-          <div className="rounded-2xl border border-red-900/60 bg-red-950/40 px-4 py-3 text-sm text-red-200">
-            {error}
+      <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+        <section className="app-surface overflow-hidden">
+          <div className="grid gap-0 lg:grid-cols-[1.1fr_0.9fr]">
+            <div className="subtle-grid border-b border-slate-200/70 px-6 py-6 lg:border-b-0 lg:border-r lg:px-8 lg:py-8">
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Server management</p>
+              <h2 className="mt-4 max-w-2xl text-3xl font-semibold tracking-tight text-slate-950">
+                Every server should clearly show where ThinkSync will work.
+              </h2>
+              <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-600">
+                Use the host, SSH identity, status, and workspace count to understand what is connected before you open a workspace.
+              </p>
+            </div>
+            <div className="px-6 py-6 lg:px-8 lg:py-8">
+              <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1">
+                <div className="app-panel-subtle p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Connected</p>
+                  <p className="mt-2 text-2xl font-semibold text-slate-950">{servers.length}</p>
+                </div>
+                <div className="app-panel-subtle p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Status</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{loading ? "Checking reachability" : "Available"}</p>
+                </div>
+                <div className="app-panel-subtle p-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Action</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">Open a server or add a new one</p>
+                </div>
+              </div>
+            </div>
           </div>
+        </section>
+
+        {error ? (
+          <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
         ) : null}
 
-        {loading ? (
-          <div className="flex items-center justify-center py-20">
-            <svg className="h-6 w-6 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-            </svg>
-          </div>
-        ) : servers.length === 0 ? (
-          <div className="rounded-3xl border border-gray-800 bg-gray-900/40 p-8 text-center">
-            <p className="text-sm font-semibold text-white">No servers yet</p>
-            <p className="mt-1 text-sm text-gray-500">Add your first server to start.</p>
-            <button
-              onClick={() => setShowAdd(true)}
-              className="mt-4 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500"
-            >
-              + Add Server
-            </button>
-          </div>
-        ) : (
-          <ServerList servers={servers} statusById={statusById} onSelect={onSelect} />
-        )}
+        <section className="mt-6">
+          {loading ? (
+            <div className="app-panel px-4 py-12 text-center text-sm text-slate-500">Loading servers…</div>
+          ) : servers.length === 0 ? (
+            <div className="app-panel px-6 py-10 text-center">
+              <p className="text-sm font-semibold text-slate-900">No servers yet</p>
+              <p className="mt-1 text-sm text-slate-500">Connect your first server to give ThinkSync an environment to work in.</p>
+              <button onClick={() => setShowAdd(true)} className="app-button-accent mt-4">
+                + Add server
+              </button>
+            </div>
+          ) : (
+            <ServerList servers={servers} statusById={statusById} workspaceCountById={workspaceCountById} onSelect={onSelect} />
+          )}
+        </section>
       </main>
 
       {showAdd ? (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 p-4 sm:items-center">
-          <div className="w-full max-w-lg rounded-3xl border border-gray-800 bg-gray-950 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-base font-semibold text-white">Add Server</p>
-              <button
-                onClick={() => setShowAdd(false)}
-                className="rounded-xl p-2 text-gray-400 transition hover:bg-gray-900 hover:text-white"
-                aria-label="Close"
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/55 p-4 backdrop-blur-sm sm:items-center">
+          <div className="w-full max-w-2xl app-surface p-6">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Add server</p>
+                <p className="mt-1 text-sm text-slate-500">Connect a host so ThinkSync has somewhere to work.</p>
+              </div>
+              <button onClick={() => setShowAdd(false)} className="app-button-secondary px-3 py-2" aria-label="Close">
+                ×
               </button>
             </div>
 
-            <form onSubmit={onSubmit} className="mt-4 space-y-3">
-              <div className="grid grid-cols-2 gap-3">
-                <div className="col-span-2">
-                  <label className="mb-1 block text-xs font-medium text-gray-400">Name</label>
+            <form onSubmit={onSubmit} className="mt-5 grid gap-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="sm:col-span-2">
+                  <label className="mb-2 block text-sm font-medium text-slate-700">Name</label>
                   <input
                     value={form.name}
                     onChange={(e) => setForm({ ...form, name: e.target.value })}
-                    className="w-full rounded-2xl border border-gray-800 bg-gray-900/40 px-3 py-2.5 text-sm text-white placeholder:text-gray-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="app-input"
                     placeholder="production"
                     required
                   />
                 </div>
-                <div className="col-span-2">
-                  <label className="mb-1 block text-xs font-medium text-gray-400">Host</label>
+                <div className="sm:col-span-2">
+                  <label className="mb-2 block text-sm font-medium text-slate-700">Host</label>
                   <input
                     value={form.host}
                     onChange={(e) => setForm({ ...form, host: e.target.value })}
-                    className="w-full rounded-2xl border border-gray-800 bg-gray-900/40 px-3 py-2.5 font-mono text-sm text-white placeholder:text-gray-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="app-input app-mono"
                     placeholder="203.0.113.10"
                     required
                   />
                 </div>
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-gray-400">SSH User</label>
+                  <label className="mb-2 block text-sm font-medium text-slate-700">SSH user</label>
                   <input
                     value={form.ssh_user}
                     onChange={(e) => setForm({ ...form, ssh_user: e.target.value })}
-                    className="w-full rounded-2xl border border-gray-800 bg-gray-900/40 px-3 py-2.5 text-sm text-white focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="app-input"
                     required
                   />
                 </div>
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-gray-400">Port</label>
+                  <label className="mb-2 block text-sm font-medium text-slate-700">Port</label>
                   <input
                     type="number"
                     min={1}
                     max={65535}
                     value={form.ssh_port}
                     onChange={(e) => setForm({ ...form, ssh_port: Number(e.target.value) })}
-                    className="w-full rounded-2xl border border-gray-800 bg-gray-900/40 px-3 py-2.5 text-sm text-white focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="app-input"
                     required
                   />
                 </div>
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-medium text-gray-400">Auth</label>
-                <div className="inline-flex rounded-2xl border border-gray-800 bg-gray-900/40 p-1">
+                <label className="mb-2 block text-sm font-medium text-slate-700">Auth method</label>
+                <div className="inline-flex rounded-2xl border border-slate-200 bg-slate-50 p-1">
                   {(["password", "key"] as const).map((m) => (
                     <button
                       key={m}
                       type="button"
                       onClick={() => setForm({ ...form, ssh_auth_method: m })}
-                      className={`rounded-xl px-3 py-2 text-xs font-semibold transition ${
-                        form.ssh_auth_method === m ? "bg-gray-800 text-white" : "text-gray-400 hover:text-gray-200"
+                      className={`rounded-xl px-3 py-2 text-sm font-semibold transition ${
+                        form.ssh_auth_method === m ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-900"
                       }`}
                     >
                       {m === "password" ? "Password" : "SSH Key"}
@@ -239,54 +273,43 @@ export default function ServersPage() {
 
               {form.ssh_auth_method === "password" ? (
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-gray-400">SSH Password</label>
+                  <label className="mb-2 block text-sm font-medium text-slate-700">SSH password</label>
                   <input
                     type="password"
                     value={form.ssh_password ?? ""}
                     onChange={(e) => setForm({ ...form, ssh_password: e.target.value })}
-                    className="w-full rounded-2xl border border-gray-800 bg-gray-900/40 px-3 py-2.5 text-sm text-white focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="app-input"
                   />
                 </div>
               ) : (
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-gray-400">Private Key</label>
+                  <label className="mb-2 block text-sm font-medium text-slate-700">Private key</label>
                   <textarea
-                    rows={5}
+                    rows={6}
                     value={form.ssh_key ?? ""}
                     onChange={(e) => setForm({ ...form, ssh_key: e.target.value })}
-                    className="w-full rounded-2xl border border-gray-800 bg-gray-900/40 px-3 py-2.5 font-mono text-xs text-white focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="app-textarea app-mono"
                     placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
                   />
                 </div>
               )}
 
-              {formError ? (
-                <div className="rounded-2xl border border-red-900/60 bg-red-950/40 px-4 py-3 text-sm text-red-200">
-                  {formError}
-                </div>
-              ) : null}
+              {formError ? <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{formError}</div> : null}
 
-              <div className="flex gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => setShowAdd(false)}
-                  className="flex-1 rounded-2xl border border-gray-800 bg-gray-900/40 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-gray-900"
-                >
+              <div className="flex gap-3 pt-1">
+                <button type="button" onClick={() => setShowAdd(false)} className="app-button-secondary flex-1">
                   Cancel
                 </button>
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="flex-1 rounded-2xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:opacity-60"
-                >
-                  {submitting ? "Saving…" : "Save"}
+                <button type="submit" disabled={submitting} className="app-button-accent flex-1">
+                  {submitting ? "Saving…" : "Save server"}
                 </button>
               </div>
             </form>
           </div>
         </div>
       ) : null}
+
+      <BottomNav />
     </div>
   );
 }
-

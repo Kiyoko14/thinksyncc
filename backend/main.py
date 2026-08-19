@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from core.config import get_settings
-from routers import agents, auth, chat, commands, deployments, gateway, health, jobs, servers, workspaces, ws
+from routers import agents, auth, chat, commands, deployments, gateway, github, github_app, github_webhook, health, jobs, servers, workspaces, ws
 from services.health_checker import run_health_check_loop, run_startup_consistency_check
 from services.http_client import close_http_client, init_http_client
 
@@ -158,9 +158,21 @@ async def lifespan(application):  # type: ignore[type-arg]
                 )
     recovery_task = asyncio.create_task(_recovery_loop())
 
+    # Worker loop — claim queued jobs from the DB and execute them.
+    # Without this, jobs created via /agents/forge-v2/run stay in 'queued'
+    # forever (no process consumes the queue), so the agent never advances
+    # past "starting..." and the frontend reports "Connection lost".
+    async def _worker_loop() -> None:
+        try:
+            await WorkerService.get_instance().run()
+        except asyncio.CancelledError:
+            pass
+    worker_task = asyncio.create_task(_worker_loop())
+
     yield
     health_task.cancel()
     recovery_task.cancel()
+    worker_task.cancel()
     try:
         await health_task
     except asyncio.CancelledError:
@@ -168,6 +180,15 @@ async def lifespan(application):  # type: ignore[type-arg]
     try:
         await recovery_task
     except asyncio.CancelledError:
+        pass
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+    # Signal the worker loop to exit its poll loop cleanly.
+    try:
+        WorkerService.get_instance().stop()
+    except Exception:
         pass
     await close_http_client()
 
@@ -179,6 +200,15 @@ app = FastAPI(
     # Disable interactive docs in production to reduce attack surface.
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url=None,
+    # Root-cause fix for the old "Failed to fetch" double-redirect. Platform
+    # routers register collection roots WITH a trailing slash (/servers/,
+    # /workspaces/, /jobs/). With redirect_slashes=True the backend answered a
+    # slash-less request with a 307 to the rewrite Host (INTERNAL_API_URL, e.g.
+    # http://backend:8000) which the browser cannot resolve -> "Failed to fetch".
+    # We turn it OFF and normalize those exact roots at the edge instead (see
+    # normalize_collection_root_slash), so both "/servers" and "/servers/" resolve
+    # with NO redirect. This removes the dependency on Next.js trailingSlash:true.
+    redirect_slashes=False,
 )
 
 app.add_middleware(
@@ -188,6 +218,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def correlation_middleware(request: Request, call_next):
+    """Thread a request_id + correlation_id through every HTTP entry point (Part 7, D2).
+
+    Rule: continue an existing correlation_id if present (e.g. forwarded by a
+    gateway), otherwise mint a new one. Never blocks the response path; the
+    audit write is best-effort.
+    """
+    from services.github_audit import (
+        get_request_id,
+        reset_correlation,
+        set_correlation_id,
+        set_request_id,
+    )
+
+    incoming_corr = request.headers.get("x-correlation-id") or request.headers.get("x-request-id")
+    set_request_id(request.headers.get("x-request-id"))
+    set_correlation_id(incoming_corr)
+    try:
+        response = await call_next(request)
+    finally:
+        # set_request_id always mints a value, so get_request_id() is non-None.
+        response.headers.setdefault("x-request-id", get_request_id() or "")
+        reset_correlation()
+    return response
 
 
 def _redact(obj: object) -> object:
@@ -252,6 +309,59 @@ async def log_http_requests(request: Request, call_next):  # type: ignore[overri
     )
 
 
+# ---------------------------------------------------------------------------
+# Trailing-slash parity for platform collection roots (root-cause fix)
+# ---------------------------------------------------------------------------
+# The platform routers register their collection roots WITH a trailing slash
+# (servers.py -> "/servers/", workspaces.py -> "/workspaces/", jobs.py ->
+# "/jobs/"). Browsers/fetch call the slash-less form ("/api/servers"). To avoid
+# any 307 redirect (which previously leaked the rewrite Host and broke the
+# browser), we accept BOTH forms by normalizing the exact roots at the edge.
+# This is exhaustive + explicit: only these three literal paths are rewritten,
+# everything else falls through unchanged. It intentionally does NOT handle
+# workspace subdomains (those requests carry their own URL space and are
+# dispatched to the Gateway regardless of trailing slash).
+_COLLECTION_ROOTS = frozenset({"/servers", "/workspaces", "/jobs"})
+
+
+@app.middleware("http")
+async def normalize_collection_root_slash(request: Request, call_next):  # type: ignore[override]
+    if request.url.path in _COLLECTION_ROOTS:
+        # Rewrite the ASGI path scope so routing + the downstream handler see
+        # the canonical "/servers/" form. No HTTP redirect is emitted.
+        request.scope["path"] = request.url.path + "/"
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Host-scoped Gateway boundary (restores isolation regressed in d016a14)
+# ---------------------------------------------------------------------------
+# ThinkSync architecture:
+#   app.thinksync.art  -> Platform (Next.js)          } never Gateway
+#   api.thinksync.art  -> REST API                    } never Gateway
+#   thinksync.art/www  -> Platform / reserved         } never Gateway
+#   *.thinksync.art    -> deployed Workspace Runtime   -> Gateway (proxy)
+#
+# The routing decision is made HERE, before any router (including the
+# catch-all) is evaluated. Requests on a genuine workspace subdomain are
+# dispatched straight to the Gateway proxy for their ENTIRE URL space, so a
+# user app route like "/health" or "/servers" is proxied to the workspace and
+# is NOT shadowed by a platform router. Platform hosts fall through to normal
+# FastAPI routing (and its redirect_slashes behaviour) untouched.
+#
+# NB: this does NOT touch deployment / port / subdomain allocation or the
+# Gateway's runtime proxy logic — it only decides *who* reaches the proxy.
+from routers.gateway import _is_workspace_host, proxy_request as _gateway_proxy
+
+
+@app.middleware("http")
+async def route_workspace_hosts_to_gateway(request: Request, call_next):  # type: ignore[override]
+    if _is_workspace_host(request.headers.get("host", "")):
+        # Deployed workspace runtime: proxy the whole request via the Gateway.
+        path = request.url.path.lstrip("/")
+        return await _gateway_proxy(path, request)
+    # Platform / reserved / apex host → normal platform routing.
+    return await call_next(request)
 
 
 # keyin qolganlar
@@ -260,12 +370,20 @@ app.include_router(auth.router)
 app.include_router(servers.router)
 app.include_router(commands.router)
 app.include_router(workspaces.router)
+app.include_router(github.router)
+app.include_router(github_app.router)
+app.include_router(github_webhook.router)
 app.include_router(chat.router)
 app.include_router(deployments.router)
 app.include_router(agents.router)
 app.include_router(jobs.router)
 app.include_router(ws.router)
-app.include_router(gateway.router)
+# NOTE: gateway.router is intentionally NOT included as a route.
+# Workspace-host traffic is dispatched to the Gateway proxy by the
+# route_workspace_hosts_to_gateway middleware above (host-scoped boundary).
+# Registering it as a global "/{path:path}" catch-all is what caused the
+# d016a14 regression (it shadowed platform routes like /servers). The proxy
+# handler itself is unchanged and still lives in routers/gateway.py.
 
 def _api_error_code(exc: APIError) -> str:
     code = getattr(exc, "code", None)
@@ -355,6 +473,20 @@ async def handle_http_exception(request: Request, exc: HTTPException) -> JSONRes
 
 @app.exception_handler(Exception)
 async def handle_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    # GitHub rate limiting (Part 3): surface a precise 429 with Retry-After.
+    # Imported lazily to avoid import cost at module load; isinstance keeps this
+    # ahead of the generic 500 fallback below.
+    from services.github_rate_limit import GitHubRateLimitError
+
+    if isinstance(exc, GitHubRateLimitError):
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content=_error_payload(
+                exc.message, request=request, code="GITHUB_RATE_LIMITED", exc=exc
+            ),
+            headers=headers,
+        )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content=_error_payload(f"{type(exc).__name__}: {exc}", request=request, code="INTERNAL_ERROR", exc=exc),

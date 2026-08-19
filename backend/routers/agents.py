@@ -178,6 +178,194 @@ async def forge_v2_ws(job_id: str, websocket: WebSocket) -> None:
     await websocket.close(code=1008)
 
 
+# ── Sprint 3C.C: Event-Driven Wait — external event sources ──────────────
+# These endpoints are the SYSTEM EVENT entry points for the Event Wait Engine:
+#   • a user reply (Telegram bridge / Web UI / API)
+#   • a generic system event (API callback, webhook, custom signal)
+# They do NOT poll.  They deliver a single wake signal to the parked job.
+
+
+class ReplyEventRequest(BaseModel):
+    """A user reply that should resume a suspended job.
+
+    ``structured_reply`` is a free-form dict (legacy).  ``clarification_submission``
+    is the authoritative structured ClarificationFormSubmission produced by the
+    new generic clarification form (preferred).  Either may be present.
+    """
+
+    conversation_id: str | None = None
+    reply: str | None = None
+    structured_reply: dict[str, Any] | None = None
+    clarification_submission: dict[str, Any] | None = None
+
+
+class SystemEventRequest(BaseModel):
+    """A generic system event delivered to a suspended job."""
+
+    conversation_id: str | None = None
+    event_type: str = Field(..., min_length=1, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/jobs/{job_id}/reply")
+async def post_job_reply(
+    job_id: str,
+    payload: ReplyEventRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Deliver a USER_REPLY event to a suspended job.
+
+    The Telegram bridge, Web UI, and API all funnel user replies here.  The
+    reply is routed through ``ConversationContinuationEngine`` (the single
+    owner of continuation semantics — intent classification, APPROVE / REJECT /
+    MODIFY / CLARIFY / CONTINUE / CANCEL / RESTART) which then funnels every
+    resume path through ``EventWaitEngine.signal(...)``.  The Event Wait Engine
+    owns the resume lifecycle (verify_resume_safety -> InteractiveWaitEngine
+    .resume -> run_job re-dispatch); no parallel resume path exists.
+    """
+    from services.conversation_continuation import (
+        ConversationContinuationEngine,
+    )
+
+    conversation_id = payload.conversation_id or job_id
+    result = await ConversationContinuationEngine.continue_conversation(
+        job_id,
+        conversation_id,
+        reply=payload.reply,
+        structured_reply=payload.structured_reply,
+    )
+    logger.info(
+        "[agents] reply → continuation | job=%s | conversation=%s | next=%s",
+        job_id,
+        conversation_id,
+        result.get("next_action"),
+    )
+    return {"status": "accepted", "job_id": job_id, "result": result}
+
+
+@router.post("/jobs/{job_id}/event")
+async def post_job_event(
+    job_id: str,
+    payload: SystemEventRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Deliver a generic system event (RESUME_REQUEST, CANCEL, …) to a job.
+
+    Extensible: any event_type string is accepted.  The Event Wait Engine
+    decides whether it wakes the parked job.  This is the single extension
+    point for future event sources (Web UI actions, API webhooks, custom
+    integrations) — no handler change required.
+    """
+    from services.event_wait_engine import EventWaitEngine
+
+    conversation_id = payload.conversation_id or job_id
+    woke = EventWaitEngine.signal(
+        job_id,
+        payload.event_type,
+        conversation_id=conversation_id,
+        payload={**payload.payload, "user_id": current_user.get("sub")},
+    )
+    logger.info(
+        "[agents] system event | job=%s | conversation=%s | type=%s | woke=%s",
+        job_id,
+        conversation_id,
+        payload.event_type,
+        woke,
+    )
+    return {"status": "accepted", "job_id": job_id, "event": payload.event_type, "woke": woke}
+
+
+@router.post("/jobs/{job_id}/clarification-reply")
+async def post_clarification_reply(
+    job_id: str,
+    payload: ReplyEventRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Deliver a clarification answer to a job suspended for clarification.
+
+    Sprint 3C.D: this is the dedicated entry point for adaptive-clarification
+    replies (Telegram bridge / Web UI / API).  It wakes the parked job via the
+    Event Wait Engine using a CLARIFICATION_REPLY signal.  No polling — a single
+    wake signal resumes exactly the affected job.
+
+    The frontend submits a structured ``ClarificationFormSubmission`` (preferred).
+    The backend performs AUTHORITATIVE validation against the persisted form
+    schema before waking the job; invalid submissions are rejected (HTTP 422)
+    so the user can correct them without losing pipeline state.  Legacy
+    free-text replies (``reply``) are still accepted for backward compatibility.
+    """
+    from services.conversation_continuation import (
+        ConversationContinuationEngine,
+        ContinuationIntent,
+    )
+    from models.clarification_form import ClarificationFormSubmission
+
+    conversation_id = payload.conversation_id or job_id
+
+    # Authoritative server-side validation of the structured submission.
+    submission = None
+    if payload.clarification_submission:
+        try:
+            submission = ClarificationFormSubmission.model_validate(
+                payload.clarification_submission
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as 422
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "invalid_clarification_submission", "reason": str(exc)},
+            )
+        # Validate against the persisted form schema (if available).  We do not
+        # hard-fail the wake on missing schema (defensive), but when present we
+        # enforce it so the resume handler folds only valid data.
+        try:
+            row = (
+                await (await get_supabase_async())
+                .table("jobs")
+                .select("clarification_form")
+                .eq("id", job_id)
+                .limit(1)
+                .execute()
+            )
+            form_blob = (row.data[0].get("clarification_form") if row.data else None) or {}
+            if form_blob.get("questions"):
+                from models.clarification_form import ClarificationForm
+
+                form = ClarificationForm.model_validate(form_blob)
+                errors = form.validate_submission(submission)
+                if errors:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={"error": "clarification_validation_failed", "errors": errors},
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 — never block resume on a
+            # transient schema read failure; validation already ran on the model.
+            logger.warning("[agents] clarification form re-validation skipped: %s", exc)
+
+    # Route through ConversationContinuationEngine (CLARIFY = answer recording).
+    # The engine records the answer via InteractiveWaitEngine.record_clarification
+    # _answer() and wakes the EventWaitEngine orchestrator with a
+    # CLARIFICATION_REPLY signal — preserving the existing clarification
+    # behaviour (no spec mutation, no RequirementPatchEngine).
+    result = await ConversationContinuationEngine.continue_conversation(
+        job_id,
+        conversation_id,
+        intent=ContinuationIntent.CLARIFY,
+        reply=payload.reply,
+        structured_reply=(
+            {"submission": submission.model_dump(mode="json")} if submission else payload.structured_reply
+        ),
+    )
+    logger.info(
+        "[agents] clarification reply → continuation | job=%s | conversation=%s | next=%s",
+        job_id,
+        conversation_id,
+        result.get("next_action"),
+    )
+    return {"status": "accepted", "job_id": job_id, "result": result}
+
+
 # ── Legacy alias (hidden from docs) ──────────────────────────────────────
 
 

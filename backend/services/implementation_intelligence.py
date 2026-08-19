@@ -244,8 +244,114 @@ class TemplateCompatibilityScorer:
 
 
 # --------------------------------------------------------------------- #
-# ImplementationStrategyResolver
+# SemanticTemplateReviewer
 # --------------------------------------------------------------------- #
+
+_SEMANTIC_REVIEW_DECISIONS = frozenset({"USE_TEMPLATE", "PATCH_TEMPLATE", "NEW_IMPLEMENTATION"})
+
+
+class SemanticTemplateReviewer:
+    """AI semantic reviewer for a candidate template.
+
+    EXTENSION ONLY: adds a semantic decision layer on top of the existing
+    similarity/confatibility pipeline. The AI is a *reviewer*, NOT an executor:
+    it returns structured JSON describing whether the top template
+    semantically satisfies the user requirement. The backend
+    (ImplementationStrategyResolver) remains the single point that turns this
+    hint into the final execution strategy. The AI never writes code, patches,
+    or edits anything.
+    """
+
+    # JSON schema handed to the structured-output provider.
+    _SCHEMA: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "decision": {
+                "type": "string",
+                "enum": ["USE_TEMPLATE", "PATCH_TEMPLATE", "NEW_IMPLEMENTATION"],
+            },
+            "reason": {"type": "string"},
+            "behavior_match": {"type": "string"},
+            "coverage_summary": {"type": "string"},
+            "patch_required": {"type": "boolean"},
+            "patch_scope": {"type": "string"},
+            "risk": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+            "implementation_cost": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+            "confidence_adjustment": {"type": "string"},
+            "notes": {"type": "string"},
+        },
+        "required": ["decision", "patch_required", "risk", "implementation_cost"],
+        "additionalProperties": False,
+    }
+
+    @classmethod
+    async def review(
+        cls,
+        *,
+        requirement: str,
+        projection: Any | None,
+        top_template: dict[str, Any],
+        template_summary: str,
+        confidence_score: float,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Run the AI semantic review and return the parsed JSON.
+
+        Returns a dict with at least ``decision`` (one of the three allowed
+        values). On any failure, returns a safe fallback that does NOT override
+        the existing confidence-based path (decision=None so the resolver
+        ignores the hint).
+        """
+        from agents.constitution import ConstitutionEngine
+        from services.agent_llm import _chat_json
+
+        system_prompt = ConstitutionEngine().build_prompt("semantic_template_review")
+
+        projection_text: str
+        if projection is None:
+            projection_text = "No structured projection available."
+        elif isinstance(projection, dict):
+            projection_text = _json.dumps(projection, ensure_ascii=False, indent=2)
+        else:
+            projection_text = str(projection)
+
+        user_content = _json.dumps(
+            {
+                "user_requirement": requirement,
+                "requirement_projection": projection_text,
+                "top_template": top_template,
+                "template_summary": template_summary,
+                "existing_confidence_score": confidence_score,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        try:
+            result = await _chat_json(
+                messages=messages,
+                schema=cls._SCHEMA,
+                role="semantic_template_review",
+            )
+        except Exception as exc:  # noqa: BLE001 — never let review break the pipeline
+            logger.warning("[impl-intel] semantic review failed: %s — ignoring hint", exc)
+            return {"decision": None, "error": str(exc)}
+
+        decision = result.get("decision")
+        if decision not in _SEMANTIC_REVIEW_DECISIONS:
+            logger.warning(
+                "[impl-intel] semantic review returned invalid decision %r — ignoring hint",
+                decision,
+            )
+            return {"decision": None, "error": "invalid_decision"}
+
+        result["decision"] = decision
+        return result
 
 class ImplementationStrategyResolver:
     """Single decision point: given discoveries + scores, pick a strategy."""
@@ -256,6 +362,7 @@ class ImplementationStrategyResolver:
         specification: Any | None = None,
         *,
         available_capabilities: dict[str, Any] | None = None,
+        semantic_hint: dict[str, Any] | None = None,
     ) -> tuple[ImplementationStrategy, dict[str, Any] | None]:
         """
         Returns (strategy, chosen_template_info_or_None).
@@ -265,6 +372,13 @@ class ImplementationStrategyResolver:
           2. Compatible Template  (compatibility ≥ 0.5)
           3. Hybrid               (compatibility ≥ 0.5, has template)
           4. Pure AI Generation   (no suitable template)
+
+        ``semantic_hint`` (optional) is the AI semantic reviewer's structured
+        recommendation (from SemanticTemplateReviewer.review). When present and
+        valid, the backend (this method) folds it into the final decision
+        TOGETHER WITH the existing compatibility score — the AI never decides
+        alone. If semantic_hint is None or its decision is None, the legacy
+        confidence-only path is used unchanged.
         """
         if not discoveries:
             return ImplementationStrategy.PURE_AI_GENERATION, None
@@ -275,15 +389,42 @@ class ImplementationStrategyResolver:
         )
         best["compatibility"] = compatibility
 
+        # Semantic hint (AI reviewer) — backend applies the final decision.
+        hint_decision = (
+            semantic_hint.get("decision") if isinstance(semantic_hint, dict) else None
+        )
+
+        if hint_decision == "NEW_IMPLEMENTATION":
+            # AI judges the template is not a meaningful base → build from scratch.
+            # Respect even if similarity was high (behavior/architecture mismatch).
+            return ImplementationStrategy.PURE_AI_GENERATION, None
+
+        if hint_decision == "USE_TEMPLATE":
+            # AI confirms behavior + architecture match. Treat as at least a
+            # compatible base; if similarity is also high, use exact template.
+            if compatibility >= 0.8:
+                return ImplementationStrategy.EXACT_TEMPLATE, best
+            # Even with lower similarity, the semantic match wins as a base.
+            return ImplementationStrategy.HYBRID_TEMPLATE_AI, best
+
+        if hint_decision == "PATCH_TEMPLATE":
+            # AI says the template is a sound base needing a safe patch.
+            # Only honor it when the template is a non-trivial match; otherwise
+            # fall back to the confidence path below.
+            if compatibility >= 0.5:
+                return ImplementationStrategy.HYBRID_TEMPLATE_AI, best
+            # Below 0.5 similarity the template is too weak even for a patch base;
+            # defer to the legacy compatibility rule.
+
         if compatibility >= 0.8:
             return ImplementationStrategy.EXACT_TEMPLATE, best
         if compatibility >= 0.5:
             # Use template as baseline, AI fills gaps
             return ImplementationStrategy.HYBRID_TEMPLATE_AI, best
-        # Template exists but is a poor match — still try hybrid
-        # before giving up entirely (prompt: "NO execution path may terminate
-        # simply because no template exists")
-        return ImplementationStrategy.HYBRID_TEMPLATE_AI, best
+        # Poor match (< 0.5): do NOT force a bad template as the baseline.
+        # Per design principle, when the template is not a meaningful match the
+        # agent must write from scratch rather than stay pinned to the template.
+        return ImplementationStrategy.PURE_AI_GENERATION, None
 
 
 # --------------------------------------------------------------------- #
@@ -546,6 +687,8 @@ class ImplementationIntelligence:
         *,
         available_capabilities: dict[str, Any] | None = None,
         model: str | None = None,
+        server_id: str | None = None,
+        user_id: str | None = None,
     ) -> ImplementationReport:
         """
         The main entry point.
@@ -563,14 +706,69 @@ class ImplementationIntelligence:
         # Step 2 — Rank them
         if discoveries:
             from services.capability_service import detect_capabilities
-            caps = available_capabilities or await detect_capabilities()
+
+            # Resolve capabilities from the real server when not injected.
+            # detect_capabilities(server: dict) requires a server object; we
+            # obtain it from server_id so the call always matches the signature.
+            if available_capabilities is not None:
+                caps = available_capabilities
+            elif server_id is not None:
+                try:
+                    from services.server_service import ServerService
+
+                    server = ServerService.get_server(server_id=server_id, user_id=user_id)
+                    caps = await detect_capabilities(server)
+                except Exception as exc:
+                    logger.warning(
+                        "[impl-intel] capability detection failed: %s — ranking without capabilities",
+                        exc,
+                    )
+                    caps = None
+            else:
+                caps = None
+
             discoveries = TemplateRankingEngine.rank(
-                objective, discoveries, available_dependencies=caps.get("available_libraries") or []
+                objective, discoveries, available_dependencies=caps.get("available_libraries") or [] if caps else []
             )
 
-        # Step 3 — Resolve strategy
+        # Step 2.5 — Semantic review (AI reviewer, NOT executor).
+        # Only runs when at least one candidate template exists. The AI returns
+        # a structured recommendation; the backend (resolve) makes the final call.
+        semantic_hint: dict[str, Any] | None = None
+        if discoveries:
+            top_template = discoveries[0]
+            template_summary = (
+                top_template.get("summary")
+                or top_template.get("description")
+                or top_template.get("name")
+                or ""
+            )
+            confidence_score = float(
+                top_template.get("compatibility")
+                or top_template.get("score")
+                or 0.0
+            )
+            try:
+                semantic_hint = await SemanticTemplateReviewer.review(
+                    requirement=objective,
+                    projection=specification,
+                    top_template=top_template,
+                    template_summary=template_summary,
+                    confidence_score=confidence_score,
+                    model=model,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block the pipeline
+                logger.warning(
+                    "[impl-intel] semantic review step failed: %s — using confidence path",
+                    exc,
+                )
+                semantic_hint = None
+
+        # Step 3 — Resolve strategy (backend applies the final decision, folding
+        # in the semantic hint together with the existing compatibility score).
         strategy, template_info = ImplementationStrategyResolver.resolve(
-            discoveries, specification, available_capabilities=available_capabilities
+            discoveries, specification, available_capabilities=available_capabilities,
+            semantic_hint=semantic_hint,
         )
 
         # Step 4 — Generate implementation

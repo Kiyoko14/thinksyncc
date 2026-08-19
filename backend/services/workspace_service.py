@@ -13,8 +13,10 @@ from fastapi import HTTPException, status
 from postgrest.exceptions import APIError
 
 from core.config import get_settings
-from core.database import get_supabase
+from core.database import get_supabase, get_supabase_async
 from models.workspace import WorkspaceResponse
+from models.github import GitHubCloneRequest
+from models.github_app import GitHubAppCloneRequest
 from services.port_allocator import (
     allocate_port as _allocate_port,
     check_port_consistency as _check_consistency,
@@ -23,6 +25,7 @@ from services.port_allocator import (
 from services.redis_service import RedisService
 from services.server_service import ServerService
 from services.ssh_service import SSHService
+from services.workspace_lifecycle import CompensationLedger, CompensationStep
 
 logger = logging.getLogger(__name__)
 
@@ -180,11 +183,12 @@ class WorkspaceService:
 
     @staticmethod
     async def create_workspace_from_prompt(
-        *, user_id: str, server_id: str, user_input: str
+        *, user_id: str, server_id: str, user_input: str, display_name: str | None = None
     ) -> dict[str, Any]:
         name = WorkspaceService._sanitize_workspace_name(user_input)
         workspace = await WorkspaceService.resolve_workspace(
-            user_id=user_id, server_id=server_id, name=name
+            user_id=user_id, server_id=server_id, name=name,
+            display_name=display_name or user_input,
         )
         slug = str(workspace.get("slug") or name).strip().lower() or "workspace"
         workspace_path = f"{WorkspaceService._workspaces_root()}/{slug}"
@@ -206,8 +210,8 @@ class WorkspaceService:
             pass
 
         try:
-            supabase = get_supabase()
-            supabase.table("workspaces").update({"path": workspace_path}).eq(
+            supabase = await get_supabase_async()
+            await supabase.table("workspaces").update({"path": workspace_path}).eq(
                 "id", str(workspace.get("id") or "")
             ).execute()
         except Exception:
@@ -300,7 +304,7 @@ class WorkspaceService:
 
     @staticmethod
     async def resolve_workspace(
-        *, user_id: str, server_id: str, name: str
+        *, user_id: str, server_id: str, name: str, display_name: str | None = None
     ) -> dict[str, Any]:
         WorkspaceService._validate_uuid(user_id, "user_id")
         WorkspaceService._validate_uuid(server_id, "server_id")
@@ -329,7 +333,8 @@ class WorkspaceService:
             return existing
 
         created = await WorkspaceService.create_workspace(
-            user_id=user_id, server_id=server_id, name=cleaned_name
+            user_id=user_id, server_id=server_id, name=cleaned_name,
+            display_name=display_name or cleaned_name,
         )
         return created.model_dump(mode="python")
 
@@ -403,7 +408,15 @@ class WorkspaceService:
 
     @staticmethod
     async def create_workspace(
-        user_id: str, server_id: str, name: str
+        user_id: str,
+        server_id: str,
+        name: str,
+        github_connection_id: str | None = None,
+        github_clone: "GitHubCloneRequest | None" = None,
+        app_clone: "GitHubAppCloneRequest | None" = None,
+        # Original, human-readable workspace name. Kept separate from the
+        # sanitized `name`/`slug`. Falls back to `name` when None.
+        display_name: str | None = None,
     ) -> WorkspaceResponse:
         WorkspaceService._validate_uuid(user_id, "user_id")
         WorkspaceService._validate_uuid(server_id, "server_id")
@@ -416,7 +429,23 @@ class WorkspaceService:
             )
 
         server = ServerService.get_server(server_id=server_id, user_id=user_id)
-        supabase = get_supabase()
+        supabase = await get_supabase_async()
+
+        # Resolve the GitHub linkage. Exactly one transport may be selected:
+        #   * SSH connection + clone request  -> GitHubService.clone_into_workspace
+        #   * App installation clone request   -> GitHubAppService.clone (token)
+        # ThinkSync (plain) workspaces have neither.
+        github_link_id: str | None = None
+        is_app_workspace = False
+        if app_clone is not None:
+            # GitHub App workspace: we create a github_connections row with
+            # auth_method='app' (no SSH keys) so the existing discriminator
+            # (github_connection_id IS NULL -> ThinkSync) keeps working and the
+            # workspace can later be re-identified as an App workspace.
+            is_app_workspace = True
+        elif github_connection_id and github_clone is not None:
+            WorkspaceService._validate_uuid(github_connection_id, "github_connection_id")
+            github_link_id = github_connection_id
 
         base_slug = generate_slug_from_name(cleaned_name)
 
@@ -424,14 +453,19 @@ class WorkspaceService:
             user_id=user_id, server_id=server_id, slug=base_slug
         )
         if existing:
-            existing["url"] = WorkspaceService._workspace_url(
-                str(existing.get("domain") or "")
+            # Duplicate policy: a workspace with this name already exists on the
+            # server -> 409 Conflict (do NOT silently return the existing one).
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "WORKSPACE_NAME_CONFLICT",
+                    "message": "A workspace with this name already exists on this server.",
+                },
             )
-            return WorkspaceResponse(**existing)
 
         try:
             by_name = (
-                supabase.table("workspaces")
+                await supabase.table("workspaces")
                 .select("*")
                 .eq("user_id", user_id)
                 .eq("server_id", server_id)
@@ -442,11 +476,16 @@ class WorkspaceService:
                 .execute()
             )
             if by_name and by_name.data:
-                row = WorkspaceService._ensure_workspace_fields(
-                    dict(by_name.data), supabase=supabase, user_id=user_id
+                # Duplicate policy: same name on same server -> 409 Conflict.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "WORKSPACE_NAME_CONFLICT",
+                        "message": "A workspace with this name already exists on this server.",
+                    },
                 )
-                row["url"] = WorkspaceService._workspace_url(str(row.get("domain") or ""))
-                return WorkspaceResponse(**row)
+        except HTTPException:
+            raise
         except Exception:
             pass
 
@@ -459,49 +498,248 @@ class WorkspaceService:
         domain = f"{subdomain}.{WorkspaceService._base_domain()}"
         workspace_path = WorkspaceService._workspace_path(slug)
 
-        mkdir_command = f"mkdir -p {shlex.quote(workspace_path)}"
-        await SSHService.execute(server=server, command=mkdir_command)
-
+        # ── CREATE Saga (Part 5) ────────────────────────────────────────────
+        # Steps with external side effects run through the Part 4
+        # CompensationLedger (the single rollback mechanism — no new mechanism
+        # is introduced). On any step failure, completed steps compensate in
+        # reverse order and the ORIGINAL error is re-raised, leaving NO
+        # half-created object. Saga boundary (approved):
+        #     remote_mkdir -> create_app_connection -> create_workspace_row
+        #     -> clone_repository
+        # allocate_port / assign_domain remain OUTSIDE the saga (post-commit,
+        # best-effort; Redis is not a source of truth).
         record = {
             "id": workspace_id,
             "user_id": user_id,
             "server_id": server_id,
             "name": cleaned_name,
+            # Preserve the user's original name exactly. Never sanitize/slugify.
+            "display_name": display_name or cleaned_name,
             "path": workspace_path,
             "slug": slug,
             "domain": domain,
+            "github_connection_id": github_link_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        # Mutable holders so step closures can publish results to the outer scope.
+        insert_holder: dict[str, Any] = {}
+        conn_id_holder: dict[str, str] = {}
 
-        try:
-            result = supabase.table("workspaces").insert(record).execute()
-        except APIError as exc:
-            code = WorkspaceService._api_error_code(exc)
-            if code == "23505":
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Workspace slug already exists on this server",
+        ledger = CompensationLedger()
+
+        # ---- Step 1: remote_mkdir (compensate: rm -rf, path-guarded) --------
+        async def _exec_mkdir() -> Any:
+            await SSHService.execute(
+                server=server, command=f"mkdir -p {shlex.quote(workspace_path)}"
+            )
+            return {"path": workspace_path}
+
+        async def _comp_mkdir() -> Any:
+            from services.workspace_lifecycle import _assert_safe_workspace_path
+
+            _assert_safe_workspace_path(workspace_path)
+            await SSHService.execute(
+                server=server, command=f"rm -rf {shlex.quote(workspace_path)}"
+            )
+            return {"removed": workspace_path}
+
+        await ledger.run(
+            CompensationStep(
+                name="remote_mkdir",
+                execute=_exec_mkdir,
+                compensate=_comp_mkdir,
+                metadata={"workspace_id": workspace_id, "path": workspace_path},
+            )
+        )
+
+        # ---- Step 2: create_app_connection (App only) ----------------------
+        if is_app_workspace:
+            conn_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            conn_record = {
+                "id": conn_id,
+                "user_id": user_id,
+                "name": f"app:{app_clone.installation_id}",
+                "auth_method": "app",
+                "host": "github.com",
+                "ssh_public_key": None,
+                "ssh_private_key": None,
+                "ssh_key_type": None,
+                # installation_id is the production source of truth (dedicated
+                # column). The name prefix is retained only as a human-readable
+                # label; credential resolution reads this column, never the name.
+                "installation_id": app_clone.installation_id,
+                # Canonical (immutable) repo id + mutable full_name so webhook
+                # events (repository.renamed / deleted / transfer) map back here.
+                "repo_id": app_clone.repo_id,
+                "repo_full_name": app_clone.repo,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+            async def _exec_app_conn() -> Any:
+                try:
+                    await supabase.table("github_connections").insert(conn_record).execute()
+                except HTTPException:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("[workspace] app_connection_insert_failed | ws=%s", workspace_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail={"code": "GITHUB_APP_CONNECTION_FAILED", "message": str(exc)},
+                    )
+                conn_id_holder["id"] = conn_id
+                record["github_connection_id"] = conn_id
+                return {"connection_id": conn_id}
+
+            async def _comp_app_conn() -> Any:
+                await supabase.table("github_connections").delete().eq("id", conn_id).execute()
+                return {"deleted_connection": conn_id}
+
+            await ledger.run(
+                CompensationStep(
+                    name="create_app_connection",
+                    execute=_exec_app_conn,
+                    compensate=_comp_app_conn,
+                    metadata={"workspace_id": workspace_id, "connection_id": conn_id},
                 )
-            if code == "23503":
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Server not found or access denied",
-                )
-            if code == "22P02":
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid request data",
-                )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create workspace",
             )
 
-        if not result or not result.data:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create workspace",
+        # ---- Step 3: create_workspace_row ----------------------------------
+        async def _exec_ws_row() -> Any:
+            try:
+                result = await supabase.table("workspaces").insert(record).execute()
+            except APIError as exc:
+                code = WorkspaceService._api_error_code(exc)
+                if code == "23505":
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": "WORKSPACE_NAME_CONFLICT",
+                            "message": "A workspace with this name already exists on this server.",
+                        },
+                    )
+                if code == "23503":
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Server not found or access denied",
+                    )
+                if code == "22P02":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid request data",
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to create workspace",
+                )
+            if not result or not result.data:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to create workspace",
+                )
+            insert_holder["result"] = result
+            return {"workspace_id": workspace_id}
+
+        async def _comp_ws_row() -> Any:
+            await supabase.table("workspaces").delete().eq("id", workspace_id).execute()
+            return {"deleted_workspace": workspace_id}
+
+        await ledger.run(
+            CompensationStep(
+                name="create_workspace_row",
+                execute=_exec_ws_row,
+                compensate=_comp_ws_row,
+                metadata={"workspace_id": workspace_id},
             )
+        )
+
+        # ---- Step 4: clone_repository (compensate=None; Step 1 rm -rf covers) 
+        async def _exec_clone() -> Any:
+            # The agent NEVER clones. When a connection + clone request are
+            # present, the backend clones the repo directly into the workspace
+            # path so it is a real git checkout for later agent git_* ops.
+            if is_app_workspace and app_clone is not None:
+                try:
+                    from services.github_app_service import GitHubAppService
+
+                    clone_res = await GitHubAppService.clone(
+                        installation_id=app_clone.installation_id,
+                        repo=app_clone.repo,
+                        branch=app_clone.branch,
+                        depth=app_clone.depth,
+                        workspace_path=workspace_path,
+                        server=server,
+                    )
+                    if not clone_res.get("ok"):
+                        logger.error(
+                            "[workspace] github_app_clone_failed | ws=%s | code=%s | stderr=%s",
+                            workspace_id,
+                            clone_res.get("code"),
+                            clone_res.get("stderr", "")[:400],
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail={
+                                "code": "GITHUB_CLONE_FAILED",
+                                "message": (clone_res.get("stderr") or "GitHub clone failed")[:400],
+                            },
+                        )
+                except HTTPException:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("[workspace] github_app_clone_error | ws=%s", workspace_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail={"code": "GITHUB_CLONE_ERROR", "message": str(exc)[:400]},
+                    )
+            elif github_link_id and github_clone is not None:
+                try:
+                    from services.github_service import GitHubService
+
+                    clone_res = await GitHubService.clone_into_workspace(
+                        user_id=user_id,
+                        connection_id=github_link_id,
+                        request=github_clone,
+                        workspace_path=workspace_path,
+                        server=server,
+                    )
+                    if not clone_res.get("ok"):
+                        logger.error(
+                            "[workspace] github_clone_failed | ws=%s | code=%s | stderr=%s",
+                            workspace_id,
+                            clone_res.get("code"),
+                            clone_res.get("stderr", "")[:400],
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail={
+                                "code": "GITHUB_CLONE_FAILED",
+                                "message": (clone_res.get("stderr") or "GitHub clone failed")[:400],
+                            },
+                        )
+                except HTTPException:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("[workspace] github_clone_error | ws=%s", workspace_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail={"code": "GITHUB_CLONE_ERROR", "message": str(exc)[:400]},
+                    )
+            return {"cloned": is_app_workspace or bool(github_link_id and github_clone)}
+
+        # compensate=None: clone artefacts live inside workspace_path, which the
+        # remote_mkdir compensation (rm -rf) removes. No separate clone rollback.
+        await ledger.run(
+            CompensationStep(
+                name="clone_repository",
+                execute=_exec_clone,
+                compensate=None,
+                metadata={"workspace_id": workspace_id},
+            )
+        )
+
+        result = insert_holder["result"]
 
         payload = dict(result.data[0])
         payload["url"] = WorkspaceService._workspace_url(
@@ -590,6 +828,52 @@ class WorkspaceService:
         return WorkspaceService._ensure_workspace_fields(
             row, supabase=supabase, user_id=user_id
         )
+
+    @staticmethod
+    async def delete_workspace(*, workspace_id: str, user_id: str) -> dict[str, Any]:
+        """Delete a workspace via the lifecycle orchestrator (Part 4).
+
+        Thin adapter: all business logic (validation, remote cleanup, orphan
+        connection cleanup, audit, cache invalidation, compensation) lives in
+        WorkspaceLifecycleOrchestrator — the single entry point for lifecycle
+        transitions. This method exists only to keep the router surface stable.
+        """
+        from services.workspace_lifecycle import (
+            LifecycleAction,
+            LifecycleContext,
+            WorkspaceLifecycleOrchestrator,
+        )
+
+        result = await WorkspaceLifecycleOrchestrator.transition(
+            ctx=LifecycleContext(
+                action=LifecycleAction.DELETE,
+                workspace_id=workspace_id,
+                user_id=user_id,
+            )
+        )
+        return {"action": result.action, "workspace_id": result.workspace_id, "success": result.success}
+
+    @staticmethod
+    async def disconnect_repository(*, workspace_id: str, user_id: str) -> dict[str, Any]:
+        """Disconnect a GitHub repo from a workspace via the orchestrator (Part 4).
+
+        The workspace remains (reverts to a ThinkSync workspace); an orphaned
+        App connection is cleaned up. Delegates to the lifecycle orchestrator.
+        """
+        from services.workspace_lifecycle import (
+            LifecycleAction,
+            LifecycleContext,
+            WorkspaceLifecycleOrchestrator,
+        )
+
+        result = await WorkspaceLifecycleOrchestrator.transition(
+            ctx=LifecycleContext(
+                action=LifecycleAction.DISCONNECT,
+                workspace_id=workspace_id,
+                user_id=user_id,
+            )
+        )
+        return {"action": result.action, "workspace_id": result.workspace_id, "success": result.success}
 
     @staticmethod
     def ensure_workspace_domain(
@@ -683,6 +967,11 @@ class WorkspaceService:
         slug = (row.get("slug") or "").strip()
         domain = (row.get("domain") or "").strip()
         path = (row.get("path") or "").strip()
+
+        # Ensure display_name always exists (fall back to sanitized name for
+        # legacy rows that predate the display_name column).
+        if not row.get("display_name"):
+            row["display_name"] = row.get("name") or "workspace"
 
         if slug and domain and path:
             if not path.startswith("/root/workspaces"):

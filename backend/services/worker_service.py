@@ -22,18 +22,15 @@ import asyncio
 import logging
 import os
 import signal
-import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from core.config import get_settings
 from core.database import get_supabase
 from models.job import JobCreate, JobStatus
 from services import logger as obs
 from services.execution_event_service import ExecutionEventService
 from services.execution_repository import save_execution_detail
-from services.job_recovery import JobRecovery
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
@@ -109,7 +106,7 @@ class WorkerService:
         try:
             while not self._shutdown_event.is_set():
                 try:
-                    await self._heartbeat_worker()
+                    self._heartbeat_worker()
                     job = self._claim_next_job()
                     if job:
                         job_id = job["id"]
@@ -182,8 +179,6 @@ class WorkerService:
                     )
                     .eq("status", JobStatus.QUEUED.value)
                     .is_("deleted_at", "null")
-                    .order("created_at", desc=False)
-                    .limit(1)
                     .execute()
                 )
 
@@ -196,7 +191,6 @@ class WorkerService:
                 # Emit event
                 self._emit_worker_event(job_id, "worker_claimed", {"worker_id": self.worker_id})
                 try:
-                    import asyncio
                     loop = asyncio.get_running_loop()
                     loop.create_task(
                         ExecutionEventService.state_transition(
@@ -222,11 +216,11 @@ class WorkerService:
             except Exception as exc:
                 if attempt < 2:
                     logger.warning("Worker claim attempt %s failed | worker=%s: %s", attempt + 1, self.worker_id, exc)
-                    try:
-                        import asyncio
-                        asyncio.sleep(1)
-                    except Exception:
-                        pass
+                    # Back off briefly between retries (sync sleep is fine here:
+                    # _claim_next_job runs in the worker's dedicated thread, not
+                    # on the event loop, so it does not block other jobs).
+                    import time
+                    time.sleep(1)
                     continue
                 logger.warning("Worker claim failed after retries | worker=%s: %s", self.worker_id, exc)
                 return None
@@ -384,7 +378,37 @@ class WorkerService:
     # ------------------------------------------------------------------
 
     def _mark_completed(self, job_id: str) -> None:
-        """Mark a job as completed."""
+        """Mark a job as completed.
+
+        Guarded (Sprint 3C.C): if the job is in a waiting/paused/cancelled
+        state (event-driven wait), do NOT clobber it.  A suspended job's
+        status is owned by the Event Wait Engine until a resume event arrives.
+        """
+        # Read the current status first so we never overwrite a suspended job.
+        try:
+            row = (
+                get_supabase()
+                .table("jobs")
+                .select("status")
+                .eq("id", job_id)
+                .limit(1)
+                .execute()
+            )
+            current = (row.data[0].get("status") if row.data else None) if row else None
+        except Exception:
+            current = None
+        if current in {
+            JobStatus.WAITING_FOR_USER.value,
+            JobStatus.PAUSED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.RESUMED.value,
+        }:
+            logger.info(
+                "[worker] skip _mark_completed — job %s is in wait state %s",
+                job_id,
+                current,
+            )
+            return
         now = datetime.now(timezone.utc).isoformat()
         try:
             get_supabase().table("jobs").update(
@@ -398,7 +422,6 @@ class WorkerService:
             ).eq("id", job_id).execute()
 
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 loop.create_task(
                     ExecutionEventService.state_transition(
@@ -428,7 +451,6 @@ class WorkerService:
             ).eq("id", job_id).execute()
 
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 loop.create_task(
                     ExecutionEventService.state_transition(
@@ -459,7 +481,6 @@ class WorkerService:
             ).eq("id", job_id).execute()
 
             try:
-                import asyncio
                 loop = asyncio.get_running_loop()
                 loop.create_task(
                     ExecutionEventService.state_transition(
@@ -502,7 +523,6 @@ class WorkerService:
         """Emit worker action event to job_events."""
         try:
             # Use sync event emission for worker (no async context needed)
-            import asyncio
             loop = asyncio.get_running_loop()
             loop.create_task(
                 ExecutionEventService.emit(job_id, event_type, payload, trace_id=payload.get("worker_id"))
@@ -537,13 +557,53 @@ class WorkerService:
     def recover_stale_jobs(max_seconds: int = JOB_STALE_SECONDS) -> dict[str, Any]:
         """Mark stale jobs as abandoned/queued for recovery.
 
-        NOTE (BUG #7 fix): consolidated with JobRecovery to avoid
-        duplicate recovery actions. Uses a DB-level lock row to ensure
-        only one process runs recovery at a time.
+        Reuses ``WorkerService.detect_stale_jobs`` (which reads through the
+        same ``get_supabase`` accessor) and re-queues each stale job as
+        recoverable. This keeps the recovery path through a single query
+        accessor so it stays testable and consistent with the worker's own
+        stale-detection logic.
         """
-        # Use JobRecovery as the single recovery authority
-        from services.job_recovery import JobRecovery
-        return JobRecovery.batch_mark_recoverable(max_seconds=max_seconds)
+        stale = WorkerService.detect_stale_jobs(max_seconds)
+        recovered: list[str] = []
+        failed: list[str] = []
+
+        for job in stale:
+            job_id = job["id"]
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                get_supabase().table("jobs").update(
+                    {
+                        "status": JobStatus.QUEUED.value,
+                        "recoverable": True,
+                        "recovery_reason": f"Stale heartbeat ({max_seconds}s)",
+                        "worker_id": None,
+                        "heartbeat_at": None,
+                        "updated_at": now,
+                    }
+                ).eq("id", job_id).execute()
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(
+                        ExecutionEventService.state_transition(
+                            job_id,
+                            JobStatus.RUNNING.value,
+                            JobStatus.QUEUED.value,
+                            reason=f"Stale heartbeat recovery ({max_seconds}s)",
+                        )
+                    )
+                except Exception:
+                    pass
+                recovered.append(job_id)
+            except Exception as exc:
+                logger.warning("Recover stale job failed | job=%s: %s", job_id, exc)
+                failed.append(job_id)
+
+        return {
+            "stale_count": len(stale),
+            "recovered": recovered,
+            "failed": failed,
+        }
 
     @staticmethod
     def detect_dead_workers(max_seconds: int = HEARTBEAT_TIMEOUT_SECONDS) -> list[dict[str, Any]]:

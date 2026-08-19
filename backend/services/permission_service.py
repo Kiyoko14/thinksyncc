@@ -22,6 +22,7 @@ from typing import Any
 
 from core.config import get_settings
 from core.database import get_supabase
+from core.authorization import assert_owns
 from models.job import JobStatus
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,10 @@ class PermissionService:
                 )
                 if not ws or not ws.data:
                     return False, f"Workspace {workspace_id} not found."
-                if ws.data.get("user_id") != user_id:
+                # Centralized, fail-closed ownership check (D5).
+                try:
+                    assert_owns(ws.data.get("user_id"), user_id, "Workspace")
+                except Exception:
                     return False, "Workspace does not belong to the calling user."
                 if server_id and ws.data.get("server_id") != server_id:
                     return False, "Workspace server_id does not match requested server_id."
@@ -112,7 +116,10 @@ class PermissionService:
                 )
                 if not srv or not srv.data:
                     return False, f"Server {server_id} not found."
-                if srv.data.get("user_id") != user_id:
+                # Centralized, fail-closed ownership check (D5).
+                try:
+                    assert_owns(srv.data.get("user_id"), user_id, "Server")
+                except Exception:
                     return False, "Server does not belong to the calling user."
             except Exception as exc:
                 logger.warning("[permission] server check failed: %s", exc)
@@ -147,13 +154,17 @@ class PermissionService:
         """
         import asyncio
         loop = asyncio.get_running_loop()
+        # `run_in_executor` forwards positional args only, and the sync
+        # `PermissionService.check` is keyword-only. Bind the kwargs with a
+        # lambda so the DB call still runs off the event loop in a thread pool.
         return await loop.run_in_executor(
             None,
-            PermissionService.check,
-            intent=intent,
-            action=action,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            server_id=server_id,
-            job_id=job_id,
+            lambda: PermissionService.check(
+                intent=intent,
+                action=action,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                server_id=server_id,
+                job_id=job_id,
+            ),
         )

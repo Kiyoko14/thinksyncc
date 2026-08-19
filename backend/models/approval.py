@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class ApprovalConfigurationError(Exception):
@@ -159,6 +162,11 @@ class ApprovalRequest(BaseModel):
     resolved_at: datetime | None = None
     resolved_by: str = ""  # user ID or "system"
 
+    # Schema parity (db/schema.sql approval_requests.updated_at). Written by
+    # ApprovalEngine._persist (services/approval_engine.py:297) and persisted via
+    # model_dump_json(); the column is added by migration 20260715_schema_drift_fix.sql.
+    updated_at: datetime | None = None
+
     # Reliability (Sprint 3B.1)
     request_version: int = 0  # optimistic locking (Objective 2)
     decision: ApprovalDecision | None = None
@@ -287,7 +295,7 @@ class ResumeTokenStore:
         The entire rotation sequence happens atomically inside this
         method — no caller needs to revoke manually.
         """
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
         import json as _json
         try:
             # Step 1: load existing token (if any)
@@ -295,7 +303,7 @@ class ResumeTokenStore:
             # Step 2+3: if exists and is active, revoke it
             if existing is not None and not existing.revoked and not existing.consumed:
                 existing.revoke("replaced_by_new_token")
-                get_supabase().table("approval_requests").update(
+                await (await get_supabase_async()).table("approval_requests").update(
                     {"resume_token": _json.loads(existing.model_dump_json())}
                 ).eq("approval_id", approval_id).execute()
                 logger.info(
@@ -303,7 +311,7 @@ class ResumeTokenStore:
                     approval_id,
                 )
             # Step 4+5: persist the new token
-            get_supabase().table("approval_requests").update(
+            await (await get_supabase_async()).table("approval_requests").update(
                 {"resume_token": _json.loads(token.model_dump_json())}
             ).eq("approval_id", approval_id).execute()
             logger.info(
@@ -316,10 +324,10 @@ class ResumeTokenStore:
 
     @staticmethod
     async def load(approval_id: str) -> ResumeToken | None:
-        from core.database import get_supabase
+        from core.database import get_supabase_async
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("approval_requests")
                 .select("resume_token")
                 .eq("approval_id", approval_id)
@@ -335,13 +343,13 @@ class ResumeTokenStore:
     @staticmethod
     async def consume(approval_id: str) -> None:
         """Mark the stored token as consumed (single-use)."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
         import json as _json
         try:
             tok = await ResumeTokenStore.load(approval_id)
             if tok is not None:
                 tok.consume()
-                get_supabase().table("approval_requests").update(
+                await (await get_supabase_async()).table("approval_requests").update(
                     {"resume_token": _json.loads(tok.model_dump_json())}
                 ).eq("approval_id", approval_id).execute()
         except Exception as exc:
@@ -352,13 +360,13 @@ class ResumeTokenStore:
     @staticmethod
     async def revoke(approval_id: str, reason: str = "") -> None:
         """Revoke (invalidate) the stored token for ``approval_id``."""
-        from core.database import get_supabase
+        from core.database import get_supabase_async
         import json as _json
         try:
             tok = await ResumeTokenStore.load(approval_id)
             if tok is not None:
                 tok.revoke(reason)
-                get_supabase().table("approval_requests").update(
+                await (await get_supabase_async()).table("approval_requests").update(
                     {"resume_token": _json.loads(tok.model_dump_json())}
                 ).eq("approval_id", approval_id).execute()
                 logger.info(
@@ -504,6 +512,12 @@ class JobInteractionState(BaseModel):
 
     # Resume context
     execution_cursor: ExecutionCursor | None = None
+
+    # Structured clarification submission (new generic form contract).
+    # When the user answers a structured ClarificationForm, the authoritative
+    # submission is stored here.  ``None`` for legacy free-text clarifications,
+    # so old jobs keep working unchanged.
+    clarification_submission: dict[str, Any] | None = None
 
     # Timestamps
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -281,6 +281,16 @@ export default function ChatPage() {
               {messages.map((msg) => (
                 <ChatMessageItem key={msg.id} {...msg} />
               ))}
+              <div {pendingForm && clarificationJobId ? (
+                <ClarificationForm
+                  form={pendingForm}
+                  jobId={clarificationJobId]
+                  conversationId={workspaceId}
+                  onSubmit={handleClarificationSubmit}
+                  submitting={clarificationSubmitting}
+                  error={clarificationError}
+                />
+              ) : null}
               <div ref={bottomRef} />
             </div>
           </div>

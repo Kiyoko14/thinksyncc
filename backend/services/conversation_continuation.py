@@ -5,6 +5,7 @@ Deterministic continuation: the system always knows exactly where execution stop
 """
 
 from __future__ import annotations
+from enum import Enum
 
 import logging
 from datetime import datetime, timezone
@@ -125,10 +126,10 @@ class ConversationContinuationEngine:
             pass
 
         # 4. Load spec version
-        from core.database import get_supabase
+        from core.database import get_supabase, get_supabase_async
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table("jobs")
                 .select("spec")
                 .eq("id", job_id)
@@ -145,21 +146,71 @@ class ConversationContinuationEngine:
         return context
 
     @classmethod
+    def _infer_intent(
+        cls,
+        reply: str | None,
+        structured_reply: dict[str, Any] | None,
+    ) -> ContinuationIntent:
+        """Infer the continuation intent from a free-text / structured reply.
+
+        The /reply endpoint does not carry an explicit intent; the intent is
+        derived from the user's words.  Anything that is not an explicit
+        approve / reject / cancel / restart / modify / clarify keyword is
+        treated as CONTINUE (resume with this answer) — the safe default.
+        """
+        text = (reply or "").strip().lower()
+        if not text and not structured_reply:
+            return ContinuationIntent.CONTINUE
+
+        # Explicit keywords take precedence.
+        if text.startswith("approve") or text == "approved" or text == "yes":
+            return ContinuationIntent.APPROVE
+        if text.startswith("reject") or text == "rejected" or text == "no":
+            return ContinuationIntent.REJECT
+        if text.startswith("cancel") or text == "abort":
+            return ContinuationIntent.CANCEL
+        if text.startswith("restart") or text.startswith("reset"):
+            return ContinuationIntent.RESTART
+        if text.startswith("change") or text.startswith("modify") or text.startswith("update") or "instead of" in text or "not " in text or "emas" in text:
+            return ContinuationIntent.MODIFY
+        if text.startswith("clarify") or text.startswith("explain") or "what do you mean" in text:
+            return ContinuationIntent.CLARIFY
+
+        # Structured replies that carry a patch are modifications.
+        if structured_reply and structured_reply.get("patch"):
+            return ContinuationIntent.MODIFY
+
+        return ContinuationIntent.CONTINUE
+
+    @classmethod
     async def continue_conversation(
         cls,
         job_id: str,
         conversation_id: str,
         *,
-        intent: ContinuationIntent,
+        intent: ContinuationIntent | None = None,
         reply: str | None = None,
         structured_reply: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Continue the conversation based on user intent.
 
+        If ``intent`` is not supplied it is inferred from the user's ``reply``
+        (the /reply endpoint does not carry an explicit intent).  The inferred
+        default is CONTINUE — i.e. "resume with this answer".
+
+        All resume paths funnel through ``EventWaitEngine.signal(...)`` so the
+        single resume orchestrator (verify_resume_safety -> InteractiveWaitEngine
+        .resume -> run_job re-dispatch) is always used.  This engine never calls
+        ``InteractiveWaitEngine.resume()`` directly except as a defensive
+        fallback when no wait is registered.
+
         Returns:
           - ``next_action``: str ("resume" | "pause" | "cancel" | "restart")
           - ``message``: str
         """
+        if intent is None:
+            intent = cls._infer_intent(reply, structured_reply)
+
         context = await cls.get_continuation_context(
             job_id, conversation_id,
         )
@@ -169,17 +220,37 @@ class ConversationContinuationEngine:
                 raise ConversationContinuationError(
                     "Job is not waiting for user input"
                 )
-            # Delegate to InteractiveWaitEngine.resume()
-            from services.interactive_wait import InteractiveWaitEngine
-            state = await InteractiveWaitEngine.resume(
-                job_id, conversation_id,
-                reply=reply,
-                structured_reply=structured_reply,
+            # Delegate the wake to the EventWaitEngine orchestrator, which owns
+            # the full resume chain: verify_resume_safety() -> InteractiveWaitEngine
+            # .resume() (single-use ResumeToken + state transition) -> AgentService
+            # .run_job() re-dispatch from the persisted cursor.  This engine must
+            # NOT call InteractiveWaitEngine.resume() directly — doing so would
+            # bypass the safety verification layer.
+            from services.event_wait_engine import EventWaitEngine, USER_REPLY
+
+            woke = EventWaitEngine.signal(
+                job_id,
+                USER_REPLY,
+                conversation_id=conversation_id,
+                payload={"reply": reply, "structured_reply": structured_reply},
             )
+            if not woke:
+                # No active wait registered (defensive): fall back to the
+                # low-level resume primitive so the job is not stranded.
+                from services.interactive_wait import InteractiveWaitEngine
+
+                state = await InteractiveWaitEngine.resume(
+                    job_id, conversation_id,
+                    reply=reply, structured_reply=structured_reply,
+                )
+                return {
+                    "next_action": "resume",
+                    "message": "Execution resuming",
+                    "state": state.current_state.value,
+                }
             return {
                 "next_action": "resume",
                 "message": "Execution resuming",
-                "state": state.current_state.value,
             }
 
         if intent == ContinuationIntent.APPROVE:
@@ -196,6 +267,19 @@ class ConversationContinuationEngine:
                 ApprovalDecision.APPROVED,
                 reason=reply or "User approved",
                 user="user",
+            )
+            # Wake the EventWaitEngine orchestrator so it runs the full resume
+            # chain (safety verify -> InteractiveWaitEngine.resume -> re-dispatch).
+            from services.event_wait_engine import (
+                EventWaitEngine,
+                APPROVAL_RECEIVED,
+            )
+
+            EventWaitEngine.signal(
+                job_id,
+                APPROVAL_RECEIVED,
+                conversation_id=conversation_id,
+                payload={"reply": reply, "approval_id": approval_id},
             )
             return {
                 "next_action": "resume",
@@ -217,6 +301,17 @@ class ConversationContinuationEngine:
                 reason=reply or "User rejected",
                 user="user",
             )
+            from services.event_wait_engine import (
+                EventWaitEngine,
+                APPROVAL_RECEIVED,
+            )
+
+            EventWaitEngine.signal(
+                job_id,
+                APPROVAL_RECEIVED,
+                conversation_id=conversation_id,
+                payload={"reply": reply, "approval_id": approval_id},
+            )
             return {
                 "next_action": "cancelled",
                 "message": "Rejected. Execution cancelled.",
@@ -224,6 +319,13 @@ class ConversationContinuationEngine:
             }
 
         if intent == ContinuationIntent.CANCEL:
+            # Tear down the waiting state via the orchestrator (clears the
+            # event wait + timeout task so no orphaned wait remains).
+            from services.event_wait_engine import EventWaitEngine, CANCEL
+
+            EventWaitEngine.signal(
+                job_id, CANCEL, conversation_id=conversation_id,
+            )
             return {
                 "next_action": "cancel",
                 "message": "Conversation cancelled.",
@@ -237,12 +339,140 @@ class ConversationContinuationEngine:
             if session:
                 session.transition_to(SessionState.ARCHIVED)
                 await OptimisticLockGuard.save_session_atomic(session)
+            # Tear down any waiting state so the restart starts clean.
+            from services.event_wait_engine import EventWaitEngine, CANCEL
+
+            EventWaitEngine.signal(
+                job_id, CANCEL, conversation_id=conversation_id,
+            )
             return {
                 "next_action": "restart",
                 "message": "Conversation restarted.",
             }
 
-        # MODIFY / CLARIFY → delegate to RequirementPatchEngine
+        if intent == ContinuationIntent.CLARIFY:
+            # CLARIFY is an ANSWER-RECORDING flow, NOT a spec mutation.
+            # Record the clarification answer through the low-level reliability
+            # primitive, then wake the EventWaitEngine orchestrator with a
+            # CLARIFICATION_REPLY signal.  The orchestrator runs the full
+            # resume chain (verify_resume_safety -> InteractiveWaitEngine.resume
+            # -> run_job re-dispatch).  RequirementPatchEngine is NOT used here.
+            answer = reply
+            raw = reply
+            structured_submission = None
+            if structured_reply and structured_reply.get("submission"):
+                structured_submission = structured_reply["submission"]
+
+            from services.interactive_wait import InteractiveWaitEngine
+
+            await InteractiveWaitEngine.record_clarification_answer(
+                job_id,
+                conversation_id,
+                answer=answer,
+                raw=raw,
+                structured_submission=structured_submission,
+            )
+
+            from services.event_wait_engine import (
+                EventWaitEngine,
+                CLARIFICATION_REPLY,
+            )
+
+            EventWaitEngine.signal(
+                job_id,
+                CLARIFICATION_REPLY,
+                conversation_id=conversation_id,
+                payload={
+                    "reply": reply,
+                    "structured_reply": structured_reply,
+                    "answer": answer,
+                },
+            )
+            return {
+                "next_action": "resume",
+                "message": "Clarification recorded. Resuming execution.",
+            }
+
+        # MODIFY → delegate to RequirementPatchEngine (specification mutation).
+        # RequirementPatchEngine enforces frozen-spec immutability, idempotency,
+        # and the max-patch-per-session limit.  record_clarification_answer()
+        # is NOT used here.
+        if intent in (ContinuationIntent.MODIFY,):
+            from services.requirement_patch import (
+                RequirementPatch,
+                RequirementPatchEngine,
+            )
+            from models.agent import ProjectSpecification
+
+            # Load current spec (frozen) from the jobs table.
+            spec_dict = None
+            try:
+                from core.database import get_supabase_async
+                result = (
+                    await (await get_supabase_async())
+                    .table("jobs")
+                    .select("spec")
+                    .eq("id", job_id)
+                    .limit(1)
+                    .execute()
+                )
+                if result.data and result.data[0].get("spec"):
+                    spec_dict = result.data[0]["spec"]
+            except Exception:
+                spec_dict = None
+            if not spec_dict:
+                raise ConversationContinuationError(
+                    "No specification found to patch"
+                )
+            spec = ProjectSpecification(**spec_dict)
+
+            # Build the patch from the structured reply (frontend-parsed) or a
+            # single-field update derived from the free-text reply.
+            if structured_reply and structured_reply.get("patch"):
+                patch = RequirementPatch(**structured_reply["patch"])
+            else:
+                # Minimal default: a single free-text modification note. The
+                # caller (or a future parser) supplies the concrete field path.
+                patch = RequirementPatch(
+                    patch_type="update_field",
+                    target_path="notes",
+                    new_value=reply or "",
+                )
+
+            patched_spec = await RequirementPatchEngine.apply_patch(
+                job_id,
+                conversation_id,
+                spec=spec,
+                patch=patch,
+            )
+            # Persist the patched spec back to the jobs table.
+            try:
+                from core.database import get_supabase_async
+                await (await get_supabase_async()) \
+                    .table("jobs") \
+                    .update({"spec": patched_spec.model_dump(mode="json")}) \
+                    .eq("id", job_id) \
+                    .execute()
+            except Exception as exc:
+                logger.warning("[continuation] spec persist failed: %s", exc)
+
+            # Wake the EventWaitEngine orchestrator to resume with the patched
+            # specification (full safety verify -> resume -> re-dispatch).
+            from services.event_wait_engine import EventWaitEngine, USER_REPLY
+
+            EventWaitEngine.signal(
+                job_id,
+                USER_REPLY,
+                conversation_id=conversation_id,
+                payload={"reply": reply, "structured_reply": structured_reply},
+            )
+            return {
+                "next_action": "resume",
+                "message": "Specification patched. Resuming execution.",
+                "patch_id": patch.patch_id,
+            }
+
+        # Fallback (should not be reached)
         return {
             "next_action": "clarify",
             "message": "Please clarify your modification.",

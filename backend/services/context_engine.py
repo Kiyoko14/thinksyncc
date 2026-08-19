@@ -16,7 +16,7 @@ from typing import Any
 from postgrest.exceptions import APIError
 
 from core.config import get_settings
-from core.database import get_supabase
+from core.database import get_supabase, get_supabase_async
 from services.redis_service import RedisService
 from services.tools import exec_in_workspace, read_workspace_file
 
@@ -108,6 +108,13 @@ class ContextEngine:
         task: str,
         server: dict[str, Any],
         workspace_path: str,
+        # Human-readable workspace name (user-facing). Injected into the agent
+        # context so the agent refers to the workspace by its real name, never
+        # by the internal slug. Optional for backward compatibility.
+        display_name: str | None = None,
+        # Structured last-execution state (template/strategy/recent files/status).
+        # Lets future turns know prior work without re-running Requirement Discovery.
+        execution_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         task_hash = hashlib.sha256((task or "").strip().encode("utf-8")).hexdigest()
         cache_key = f"context:{workspace_id}:{task_hash}"
@@ -129,7 +136,14 @@ class ContextEngine:
             workspace_path=workspace_path,
         )
         mode = ContextEngine._detect_mode(task=task, indexed_files=indexed_files, selected_files=selected)
-        payload = ContextEngine._build_payload(task=task, mode=mode, selected_files=selected, snippets=snippets)
+        payload = ContextEngine._build_payload(
+            task=task,
+            mode=mode,
+            selected_files=selected,
+            snippets=snippets,
+            display_name=display_name,
+            execution_state=execution_state,
+        )
         await ContextEngine._cache_set(cache_key, payload)
         await ContextEngine._log_context(workspace_id=workspace_id, task=task, payload=payload, source="fresh")
         return payload
@@ -202,7 +216,7 @@ class ContextEngine:
     async def _load_index_from_supabase(workspace_id: str) -> list[dict[str, Any]]:
         try:
             result = (
-                get_supabase()
+                await (await get_supabase_async())
                 .table(_INDEX_TABLE)
                 .select("workspace_id,path,size,last_modified,language")
                 .eq("workspace_id", workspace_id)
@@ -219,7 +233,7 @@ class ContextEngine:
         if not rows:
             return
         try:
-            get_supabase().table(_INDEX_TABLE).upsert(rows, on_conflict="workspace_id,path").execute()
+            await (await get_supabase_async()).table(_INDEX_TABLE).upsert(rows, on_conflict="workspace_id,path").execute()
         except APIError as exc:
             logger.warning("Failed to persist workspace index: %s", exc)
 
@@ -432,19 +446,32 @@ class ContextEngine:
         mode: str,
         selected_files: list[dict[str, Any]],
         snippets: list[dict[str, Any]],
+        display_name: str | None = None,
+        execution_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         file_list = [str(row.get("path") or "") for row in selected_files]
         code_snippets = {item["path"]: item["snippet"] for item in snippets if item.get("path") and item.get("snippet")}
+        prompt_payload = {
+            "MODE": mode,
+            "FILE_LIST": file_list,
+            "CODE_SNIPPETS": code_snippets,
+            "USER_TASK": task,
+        }
+        # Inject the human-readable workspace name so the agent refers to the
+        # workspace by its real name (never by the internal slug).
+        if display_name:
+            prompt_payload["WORKSPACE_DISPLAY_NAME"] = display_name
+        # Surface prior-execution context to future turns without re-running
+        # Requirement Discovery.
+        if execution_state:
+            prompt_payload["LAST_EXECUTION"] = execution_state
         return {
             "mode": mode,
             "selected_files": file_list,
             "snippets": snippets,
-            "prompt_payload": {
-                "MODE": mode,
-                "FILE_LIST": file_list,
-                "CODE_SNIPPETS": code_snippets,
-                "USER_TASK": task,
-            },
+            "prompt_payload": prompt_payload,
+            "workspace_display_name": display_name,
+            "execution_state": execution_state,
         }
 
     @staticmethod
@@ -475,7 +502,7 @@ class ContextEngine:
     @staticmethod
     async def _log_context(*, workspace_id: str, task: str, payload: dict[str, Any], source: str) -> None:
         try:
-            get_supabase().table(_LOG_TABLE).insert(
+            await (await get_supabase_async()).table(_LOG_TABLE).insert(
                 {
                     "workspace_id": workspace_id,
                     "task": task,

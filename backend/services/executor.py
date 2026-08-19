@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable
 from fastapi import HTTPException, status
 
 from core.value_coercion import value_to_str
-from models.agent import AgentDecision, AgentPlan, AgentStep, DecisionAction, StepResult, ToolCallingLoopResult, ToolName
+from models.agent import AgentDecision, AgentPlan, AgentStep, ApprovalSuspendSignal, DecisionAction, StepResult, ToolCallingLoopResult, ToolName
 from services import agent_llm
 from services.redis_service import RedisService
 from services.server_service import WorkspaceContext
@@ -160,15 +160,58 @@ def _command_for_step(step: AgentStep) -> str:
         return f"systemctl restart {str(args.get('service_name') or '').strip()}"
     if tool_name == ToolName.DEPLOY_APP.value:
         return str(args.get("deploy_command") or "")
+    if tool_name == ToolName.READ_FILE.value:
+        return f"cat {str(args.get('path') or '')}"
+    if tool_name == ToolName.WRITE_FILE.value:
+        return f"write {str(args.get('path') or '')}"
+    if tool_name == ToolName.LIST_FILES.value:
+        return f"ls -la {str(args.get('path') or '.')}"
+    if tool_name == ToolName.LIST_PROCESSES.value:
+        return "ps (workspace-scoped)"
+    if tool_name == ToolName.PATCH_FILE.value:
+        return f"patch {str(args.get('path') or '')}"
+    if tool_name in {ToolName.CONFIG_SET.value, ToolName.WRITE_SECRET.value}:
+        key = str(args.get('key') or '')
+        return f"set {key}=***" if key else "set env"
+    if tool_name == ToolName.GIT_STATUS.value:
+        return "git status"
+    if tool_name == ToolName.GIT_DIFF.value:
+        return "git diff" + (" --cached" if args.get("staged") else "")
+    if tool_name == ToolName.GIT_BRANCH.value:
+        return "git branch -a"
+    if tool_name == ToolName.GIT_COMMIT.value:
+        return f"git commit -m {str(args.get('message') or 'agent commit')[:40]!r}"
+    if tool_name == ToolName.GIT_RESTORE.value:
+        return "git restore --worktree"
+    if tool_name == ToolName.GIT_RESET.value:
+        return f"git reset --{str(args.get('mode') or 'mixed')} {str(args.get('target') or 'HEAD')}"
+    if tool_name == ToolName.GIT_CLEAN.value:
+        return "git clean -fdx" if args.get("force") else "git clean -ndx"
+    if tool_name == ToolName.GITHUB_PULL.value:
+        return f"git pull {str(args.get('remote') or 'origin')}/{str(args.get('branch') or 'HEAD')} ({str(args.get('strategy') or 'ff_only')})"
+    if tool_name == ToolName.GITHUB_PUSH.value:
+        return f"git push {str(args.get('remote') or 'origin')} {str(args.get('branch') or 'HEAD')}" + (" --force-with-lease" if args.get("force") else "")
     return tool_name
 
 
 def _step_command_type(step: AgentStep) -> str:
     tool_name = value_to_str(getattr(step, "tool", None))
-    if tool_name in {ToolName.CHECK_DISK.value, ToolName.CHECK_MEMORY.value, ToolName.READ_LOGS.value}:
-        return "CHECK"
-    if tool_name == ToolName.RUN_COMMAND.value:
+    if tool_name in {ToolName.RUN_COMMAND.value}:
         return classify_command(_command_for_step(step))
+    if tool_name in {
+        ToolName.READ_FILE.value,
+        ToolName.LIST_FILES.value,
+        ToolName.LIST_PROCESSES.value,
+    }:
+        return "CHECK"
+    if tool_name in {ToolName.WRITE_FILE.value, ToolName.PATCH_FILE.value}:
+        return "ACTION"
+    if tool_name in {ToolName.CONFIG_SET.value, ToolName.WRITE_SECRET.value}:
+        # Env writes are actions — they mutate workspace state.
+        return "ACTION"
+    if tool_name.startswith("git_"):
+        # git_reset/git_clean are destructive → handled by _assess_risk; here treat as ACTION.
+        return "ACTION"
     return "ACTION"
 
 
@@ -191,9 +234,43 @@ def _action_validator_command(step: AgentStep, result: StepResult) -> str | None
         service_name = str((step.args or {}).get("service_name") or "").strip()
         return f"systemctl is-active --quiet {service_name}" if service_name else None
 
+    if tool_name == ToolName.WRITE_FILE.value:
+        # Validate the file actually landed on disk.
+        path = str((step.args or {}).get("path") or "").strip()
+        return f"test -f {path}" if path else None
+
+    if tool_name == ToolName.PATCH_FILE.value:
+        # Validate the patched file still exists and is non-empty.
+        path = str((step.args or {}).get("path") or "").strip()
+        return f"test -s {path}" if path else None
+
+    if tool_name in {ToolName.CONFIG_SET.value, ToolName.WRITE_SECRET.value}:
+        # Validate the .env file landed on disk.
+        return "test -f .env"
+
+    if tool_name in {
+        ToolName.GIT_STATUS.value,
+        ToolName.GIT_DIFF.value,
+        ToolName.GIT_BRANCH.value,
+    }:
+        # Read-only git ops need no post-action validator.
+        return None
+
+    if tool_name in {
+        ToolName.GIT_COMMIT.value,
+        ToolName.GIT_RESTORE.value,
+        ToolName.GIT_RESET.value,
+        ToolName.GIT_CLEAN.value,
+    }:
+        # Destructive / state-changing git ops: verify the repo is still sane.
+        return "git status --porcelain | head -n 20"
+
+    if tool_name in {ToolName.LIST_FILES.value, ToolName.READ_FILE.value}:
+        # Read-only ops need no post-action validator.
+        return None
+
     # File/package operations do not need runtime validators.
     if any(token in lowered for token in (
-        "mkdir ",
         "touch ",
         "cat >",
         "echo ",
@@ -277,6 +354,7 @@ async def run_server_execution(
     on_log_chunk: OnLogChunk | None = None,
     config: ExecutionConfig | None = None,
     workspace_context: Any | None = None,
+    constitution_engine: ConstitutionEngine | None = None,
 ) -> ToolCallingLoopResult:
     """
     Autonomous server executor with self-healing:
@@ -374,7 +452,28 @@ async def _execute_with_lock(
     constitution_engine: ConstitutionEngine,
 ) -> ToolCallingLoopResult:
     requires_validation = _requires_real_server_validation(objective)
-    supported_tools = [ "run_command", "check_disk", "check_memory", "read_logs", "restart_service", "deploy_app" ]
+    supported_tools = [
+        "run_command",
+        "check_disk",
+        "check_memory",
+        "read_logs",
+        "restart_service",
+        "deploy_app",
+        "read_file",
+        "write_file",
+        "list_files",
+        "list_processes",
+        "patch_file",
+        "config_set",
+        "write_secret",
+        "git_status",
+        "git_diff",
+        "git_branch",
+        "git_commit",
+        "git_restore",
+        "git_reset",
+        "git_clean",
+    ]
     normalized_intent = (intent or "").strip().lower()
     if normalized_intent != "server":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "INTENT_NOT_SERVER", "intent": normalized_intent})
@@ -417,12 +516,25 @@ async def _execute_with_lock(
         nonlocal workspace_context
         logger.info("[executor] context_refresh_start | workspace_id=%s | old_version=%s", workspace_id, getattr(workspace_context, 'version', 'N/A'))
         try:
-            # Re-fetch minimal workspace data in case it changed (e.g., domain)
+            # Re-fetch minimal workspace data in case it changed (e.g., domain).
+            # Guarded: when external persistence is unreachable (offline test
+            # runners, transient outages) we still build context via the
+            # platform loader rather than failing the whole run. If the caller
+            # already supplied an authoritative context, prefer that over the
+            # loader entirely.
             _ws_minimal: dict[str, Any] = {}
-            from core.database import get_supabase
-            _db = get_supabase()
-            _ws_res = _db.table("workspaces").select("name,slug,domain").eq("id", workspace_id).limit(1).execute()
-            _ws_minimal = (_ws_res.data or [{}])[0]
+            try:
+                from core.database import get_supabase, get_supabase_async
+                _db = await get_supabase_async()
+                _ws_res = await _db.table("workspaces").select("name,slug,domain").eq("id", workspace_id).limit(1).execute()
+                _ws_minimal = (_ws_res.data or [{}])[0]
+            except Exception as _fetch_exc:
+                logger.warning(
+                    "[executor] context_refresh_fetch_failed_falling_back | workspace_id=%s | error=%s",
+                    workspace_id, _fetch_exc,
+                )
+                if workspace_context is not None:
+                    return workspace_context
 
             refreshed = await load_workspace_context(
                 workspace_id=workspace_id, workspace=_ws_minimal, server=server, capabilities=capabilities
@@ -562,7 +674,7 @@ async def _execute_with_lock(
         except Exception:
             pass
 
-    async def _exec_step(step: AgentStep) -> StepResult:
+    async def _exec_step(step: AgentStep, user_id: str | None = None) -> StepResult:
         tool_name = value_to_str(getattr(step, "tool", None))
         command = _command_for_step(step)
         
@@ -573,8 +685,12 @@ async def _execute_with_lock(
         if on_step_start:
             try:
                 await on_step_start(step.step, tool_name, step.args)
-            except Exception:
-                pass
+            except ApprovalSuspendSignal:
+                # Approval pause must propagate to the orchestrator so the job
+                # can suspend (event-driven wait).  Do NOT swallow it.
+                raise
+            except Exception as exc:
+                logger.error("[executor] on_step_start hook failed: %s", exc)
         
         # Reliability Sprint: emit step_started event
         await _emit_event(
@@ -598,6 +714,7 @@ async def _execute_with_lock(
             allow_write=allow_write,
             timeout=step_timeout,
             step_number=step.step,
+            user_id=user_id,
             on_output_chunk=(
                 None if on_log_chunk is None else
                 lambda stream, chunk: on_log_chunk(step.step, tool_name, stream, chunk)
@@ -718,13 +835,13 @@ async def _execute_with_lock(
             agent_reasoning=reason,
         )
 
-    async def _run_validated_step(step: AgentStep, retry_count: int = 0, job_id: str | None = None) -> StepResult:
+    async def _run_validated_step(step: AgentStep, retry_count: int = 0, job_id: str | None = None, user_id: str | None = None) -> StepResult:
         start_time = _now()
         tool_name = value_to_str(getattr(step, "tool", None))
         command = _command_for_step(step)
         
         try:
-            result = await _exec_step(step)
+            result = await _exec_step(step, user_id=user_id)
             result = await _validate_result(step, result)
             await _record_result(result)
             
@@ -916,6 +1033,7 @@ async def _execute_with_lock(
 
     success = all(r.success for r in results)
     validation_url = ""
+    deployment: dict[str, Any] | None = None
 
     # NOTE: execution_started is emitted once in agent_service.py run_agent_pipeline
     # NOT here — this is the success contract section, not the start of execution.
@@ -973,14 +1091,16 @@ async def _execute_with_lock(
         # Stage 1: port is listening.
         port_step = AgentStep(step=len(results) + 1, tool=ToolName.RUN_COMMAND.value, args={"command": f"ss -tulnp | grep :{port}"}, reason=f"Verify port {port} is listening.", risk_level="safe")
         port_result = await _run_validated_step(port_step, 0, job_id)
-        if not port_result.validation_passed:
-            logger.warning("[deploy_contract] stage1_port_not_listening | port=%s", port)
+        # The port-listen probe must REQUIRE exit 0 (a non-listening port is a
+        # deployment failure, not a "condition false but valid" CHECK result).
+        if port_result.exit_code != 0:
+            logger.warning("[deploy_contract] stage1_port_not_listening | port=%s | exit=%s", port, port_result.exit_code)
             return False, ""
 
         # Stage 2: local HTTP response.
         curl_step = AgentStep(step=len(results) + 1, tool=ToolName.RUN_COMMAND.value, args={"command": f"curl -f --max-time 10 {local_url}"}, reason=f"Verify HTTP response on port {port}.", risk_level="safe")
         curl_result = await _run_validated_step(curl_step, 0, job_id)
-        if not curl_result.validation_passed:
+        if curl_result.exit_code != 0:
             errors.append({
                 "step": curl_result.step, "tool": ToolName.RUN_COMMAND.value, "command": curl_result.command,
                 "exit_code": curl_result.exit_code, "stderr": curl_result.stderr[:1500],
@@ -1022,6 +1142,8 @@ async def _execute_with_lock(
 
     if requires_validation and _is_deployment_objective(objective) and success:
         success, validation_url = await _run_deployment_contract()
+        if success and validation_url:
+            deployment = {"url": validation_url, "verified": True}
     elif requires_validation and success:
         await _refresh_context()
         port = workspace_context.port if workspace_context else None
@@ -1031,9 +1153,12 @@ async def _execute_with_lock(
             v_result = await _run_validated_step(v_step, 0, job_id)
             success = v_result.validation_passed
             validation_url = (workspace_context.base_url or local_url) if success else ""
+            if success and validation_url:
+                deployment = {"url": validation_url, "verified": True}
 
     if not success:
         validation_url = ""
+        deployment = None
 
     public_summary_url = (workspace_context.base_url or validation_url) if success else ""
     status_label = "SUCCESS" if success else "FAILED"
@@ -1051,4 +1176,5 @@ async def _execute_with_lock(
         summary=summary,
         success=success,
         steps_taken=len(results),
+        deployment=deployment,
     )

@@ -69,7 +69,7 @@ class AIService:
 
         try:
             response = await client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
+                model=settings.resolve_model("chat"),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": cleaned_message},
